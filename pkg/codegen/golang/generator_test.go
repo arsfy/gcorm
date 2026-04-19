@@ -328,6 +328,39 @@ func TestGenerateClientContent(t *testing.T) {
 	if !strings.Contains(clientContent, "FindMany") {
 		t.Error("client.go should contain FindMany")
 	}
+	if !strings.Contains(clientContent, "func (a UserActions) Query() UserQueryBuilder") {
+		t.Error("client.go should contain a staged query entry point")
+	}
+	if !strings.Contains(clientContent, "func (b UserQueryBuilder) Do(ctx context.Context) ([]model.User, error)") {
+		t.Error("client.go should contain a Do method for staged queries")
+	}
+	if !strings.Contains(clientContent, "func (b UserQueryBuilder) Where(clauses ...query.UserWhereClause) UserQueryBuilder") {
+		t.Error("client.go should contain staged Where chaining")
+	}
+	if !strings.Contains(clientContent, "func (a UserActions) Create() UserCreateBuilder") {
+		t.Error("client.go should contain a staged create entry point")
+	}
+	if !strings.Contains(clientContent, "func (b UserCreateBuilder) Do(ctx context.Context) (*model.User, error)") {
+		t.Error("client.go should contain a Do method for staged create")
+	}
+	if !strings.Contains(clientContent, "func (a UserActions) Update() UserUpdateBuilder") {
+		t.Error("client.go should contain a staged update entry point")
+	}
+	if !strings.Contains(clientContent, "func (b UserUpdateBuilder) Do(ctx context.Context) (*model.User, error)") {
+		t.Error("client.go should contain a Do method for staged update")
+	}
+	if !strings.Contains(clientContent, "func (b UserUpdateBuilder) DoMany(ctx context.Context) (int64, error)") {
+		t.Error("client.go should contain a DoMany method for staged update")
+	}
+	if !strings.Contains(clientContent, "func (a UserActions) Delete() UserDeleteBuilder") {
+		t.Error("client.go should contain a staged delete entry point")
+	}
+	if !strings.Contains(clientContent, "func (b UserDeleteBuilder) Do(ctx context.Context) (*model.User, error)") {
+		t.Error("client.go should contain a Do method for staged delete")
+	}
+	if !strings.Contains(clientContent, "func (b UserDeleteBuilder) DoMany(ctx context.Context) (int64, error)") {
+		t.Error("client.go should contain a DoMany method for staged delete")
+	}
 	if !strings.Contains(clientContent, "CreateOne") {
 		t.Error("client.go should contain CreateOne")
 	}

@@ -41,31 +41,33 @@ func main() {
 	//   defer c.Close()
 	//
 	//   // Create a user
-	//   user, err := c.User.CreateOne(
-	//       query.User.Email.Set("alice@example.com"),
-	//       query.User.Name.Set("Alice"),
-	//   )
+	//   user, err := c.User.Create().
+	//       Set(
+	//           query.User.Email.Set("alice@example.com"),
+	//           query.User.Name.Set("Alice"),
+	//       ).
+	//       Do(ctx)
 	//
 	//   // Find users
-	//   users, err := c.User.FindMany(
-	//       query.User.Where(
-	//           query.User.Email.Contains("@example.com"),
-	//       ),
-	//       query.User.OrderBy(query.User.CreatedAt.Desc()),
-	//   )
+	//   users, err := c.User.Query().
+	//       Where(query.User.Email.Contains("@example.com")).
+	//       OrderBy(query.User.CreatedAt.Desc()).
+	//       Do(ctx)
 	//
 	//   // Transaction
 	//   err = c.Tx(ctx, func(tx *client.Client) error {
-	//       _, err := tx.User.CreateOne(
-	//           query.User.Email.Set("bob@example.com"),
-	//       )
+	//       _, err := tx.User.Create().
+	//           Set(query.User.Email.Set("bob@example.com")).
+	//           Do(ctx)
 	//       if err != nil {
 	//           return err
 	//       }
-	//       _, err = tx.Post.CreateOne(
-	//           query.Post.Title.Set("Hello World"),
-	//           query.Post.AuthorId.Set(user.ID),
-	//       )
+	//       _, err = tx.Post.Create().
+	//           Set(
+	//               query.Post.Title.Set("Hello World"),
+	//               query.Post.AuthorId.Set(user.ID),
+	//           ).
+	//           Do(ctx)
 	//       return err
 	//   })
 

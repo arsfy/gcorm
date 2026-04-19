@@ -618,6 +618,209 @@ type {{$model.Name}}Actions struct {
 	client *Client
 }
 
+// {{$model.Name}}CreateBuilder builds a {{$model.Name}} create operation incrementally.
+type {{$model.Name}}CreateBuilder struct {
+	action {{$model.Name}}Actions
+	sets   []query.{{$model.Name}}SetClause
+}
+
+// Create starts a staged {{$model.Name}} create operation.
+func (a {{$model.Name}}Actions) Create() {{$model.Name}}CreateBuilder {
+	return {{$model.Name}}CreateBuilder{action: a}
+}
+
+// Set appends field assignments to the staged create operation.
+func (b {{$model.Name}}CreateBuilder) Set(sets ...query.{{$model.Name}}SetClause) {{$model.Name}}CreateBuilder {
+	next := {{$model.Name}}CreateBuilder{
+		action: b.action,
+		sets:   make([]query.{{$model.Name}}SetClause, 0, len(b.sets)+len(sets)),
+	}
+	next.sets = append(next.sets, b.sets...)
+	next.sets = append(next.sets, sets...)
+	return next
+}
+
+// Do executes the staged create operation.
+func (b {{$model.Name}}CreateBuilder) Do(ctx context.Context) (*model.{{$model.Name}}, error) {
+	return b.action.CreateOne(ctx, b.sets...)
+}
+
+// {{$model.Name}}QueryBuilder builds a {{$model.Name}} query incrementally.
+type {{$model.Name}}QueryBuilder struct {
+	action {{$model.Name}}Actions
+	opts   []query.{{$model.Name}}QueryOption
+}
+
+// Query starts a staged {{$model.Name}} query.
+func (a {{$model.Name}}Actions) Query() {{$model.Name}}QueryBuilder {
+	return {{$model.Name}}QueryBuilder{action: a}
+}
+
+func (b {{$model.Name}}QueryBuilder) withOptions(opts ...query.{{$model.Name}}QueryOption) {{$model.Name}}QueryBuilder {
+	next := {{$model.Name}}QueryBuilder{
+		action: b.action,
+		opts:   make([]query.{{$model.Name}}QueryOption, 0, len(b.opts)+len(opts)),
+	}
+	next.opts = append(next.opts, b.opts...)
+	next.opts = append(next.opts, opts...)
+	return next
+}
+
+// Where appends WHERE clauses to the staged query.
+func (b {{$model.Name}}QueryBuilder) Where(clauses ...query.{{$model.Name}}WhereClause) {{$model.Name}}QueryBuilder {
+	opts := make([]query.{{$model.Name}}QueryOption, len(clauses))
+	for i, clause := range clauses {
+		opts[i] = clause
+	}
+	return b.withOptions(opts...)
+}
+
+// OrderBy appends an ORDER BY clause to the staged query.
+func (b {{$model.Name}}QueryBuilder) OrderBy(clause query.{{$model.Name}}OrderByClause) {{$model.Name}}QueryBuilder {
+	return b.withOptions(clause)
+}
+
+// Include appends include clauses to the staged query.
+func (b {{$model.Name}}QueryBuilder) Include(clauses ...query.{{$model.Name}}IncludeClause) {{$model.Name}}QueryBuilder {
+	opts := make([]query.{{$model.Name}}QueryOption, len(clauses))
+	for i, clause := range clauses {
+		opts[i] = clause
+	}
+	return b.withOptions(opts...)
+}
+
+// Take applies a LIMIT to the staged query.
+func (b {{$model.Name}}QueryBuilder) Take(n int) {{$model.Name}}QueryBuilder {
+	return b.withOptions(query.{{$model.Name}}TakeOption{N: n})
+}
+
+// Skip applies an OFFSET to the staged query.
+func (b {{$model.Name}}QueryBuilder) Skip(n int) {{$model.Name}}QueryBuilder {
+	return b.withOptions(query.{{$model.Name}}SkipOption{N: n})
+}
+
+// Do executes the staged query and returns all matching rows.
+func (b {{$model.Name}}QueryBuilder) Do(ctx context.Context) ([]model.{{$model.Name}}, error) {
+	return b.action.FindMany(ctx, b.opts...)
+}
+
+// First executes the staged query and returns the first matching row.
+func (b {{$model.Name}}QueryBuilder) First(ctx context.Context) (*model.{{$model.Name}}, error) {
+	return b.action.FindFirst(ctx, b.opts...)
+}
+
+// Count executes the staged query as a COUNT over its WHERE clauses.
+func (b {{$model.Name}}QueryBuilder) Count(ctx context.Context) (int64, error) {
+	cfg := query.Apply{{$model.Name}}Options(b.opts)
+	return b.action.Count(ctx, cfg.Wheres...)
+}
+
+// {{$model.Name}}UpdateBuilder builds a {{$model.Name}} update operation incrementally.
+type {{$model.Name}}UpdateBuilder struct {
+	action {{$model.Name}}Actions
+	wheres []query.{{$model.Name}}WhereClause
+	sets   []query.{{$model.Name}}SetClause
+}
+
+// Update starts a staged {{$model.Name}} update operation.
+func (a {{$model.Name}}Actions) Update() {{$model.Name}}UpdateBuilder {
+	return {{$model.Name}}UpdateBuilder{action: a}
+}
+
+// Where appends WHERE clauses to the staged update operation.
+func (b {{$model.Name}}UpdateBuilder) Where(clauses ...query.{{$model.Name}}WhereClause) {{$model.Name}}UpdateBuilder {
+	next := {{$model.Name}}UpdateBuilder{
+		action: b.action,
+		wheres: make([]query.{{$model.Name}}WhereClause, 0, len(b.wheres)+len(clauses)),
+		sets:   append([]query.{{$model.Name}}SetClause(nil), b.sets...),
+	}
+	next.wheres = append(next.wheres, b.wheres...)
+	next.wheres = append(next.wheres, clauses...)
+	return next
+}
+
+// Set appends field assignments to the staged update operation.
+func (b {{$model.Name}}UpdateBuilder) Set(sets ...query.{{$model.Name}}SetClause) {{$model.Name}}UpdateBuilder {
+	next := {{$model.Name}}UpdateBuilder{
+		action: b.action,
+		wheres: append([]query.{{$model.Name}}WhereClause(nil), b.wheres...),
+		sets:   make([]query.{{$model.Name}}SetClause, 0, len(b.sets)+len(sets)),
+	}
+	next.sets = append(next.sets, b.sets...)
+	next.sets = append(next.sets, sets...)
+	return next
+}
+
+func (b {{$model.Name}}UpdateBuilder) combinedWhere() (query.{{$model.Name}}WhereClause, error) {
+	if len(b.wheres) == 0 {
+		return query.{{$model.Name}}WhereClause{}, fmt.Errorf("{{$model.Name}}.Update.Do: no where clause provided")
+	}
+	if len(b.wheres) == 1 {
+		return b.wheres[0], nil
+	}
+	return query.{{$model.Name}}.AND(b.wheres...), nil
+}
+
+// Do executes the staged update as a single-row update.
+func (b {{$model.Name}}UpdateBuilder) Do(ctx context.Context) (*model.{{$model.Name}}, error) {
+	where, err := b.combinedWhere()
+	if err != nil {
+		return nil, err
+	}
+	return b.action.UpdateOne(ctx, where, b.sets...)
+}
+
+// DoMany executes the staged update as a multi-row update.
+func (b {{$model.Name}}UpdateBuilder) DoMany(ctx context.Context) (int64, error) {
+	return b.action.UpdateMany(ctx, b.wheres, b.sets...)
+}
+
+// {{$model.Name}}DeleteBuilder builds a {{$model.Name}} delete operation incrementally.
+type {{$model.Name}}DeleteBuilder struct {
+	action {{$model.Name}}Actions
+	wheres []query.{{$model.Name}}WhereClause
+}
+
+// Delete starts a staged {{$model.Name}} delete operation.
+func (a {{$model.Name}}Actions) Delete() {{$model.Name}}DeleteBuilder {
+	return {{$model.Name}}DeleteBuilder{action: a}
+}
+
+// Where appends WHERE clauses to the staged delete operation.
+func (b {{$model.Name}}DeleteBuilder) Where(clauses ...query.{{$model.Name}}WhereClause) {{$model.Name}}DeleteBuilder {
+	next := {{$model.Name}}DeleteBuilder{
+		action: b.action,
+		wheres: make([]query.{{$model.Name}}WhereClause, 0, len(b.wheres)+len(clauses)),
+	}
+	next.wheres = append(next.wheres, b.wheres...)
+	next.wheres = append(next.wheres, clauses...)
+	return next
+}
+
+func (b {{$model.Name}}DeleteBuilder) combinedWhere() (query.{{$model.Name}}WhereClause, error) {
+	if len(b.wheres) == 0 {
+		return query.{{$model.Name}}WhereClause{}, fmt.Errorf("{{$model.Name}}.Delete.Do: no where clause provided")
+	}
+	if len(b.wheres) == 1 {
+		return b.wheres[0], nil
+	}
+	return query.{{$model.Name}}.AND(b.wheres...), nil
+}
+
+// Do executes the staged delete as a single-row delete.
+func (b {{$model.Name}}DeleteBuilder) Do(ctx context.Context) (*model.{{$model.Name}}, error) {
+	where, err := b.combinedWhere()
+	if err != nil {
+		return nil, err
+	}
+	return b.action.DeleteOne(ctx, where)
+}
+
+// DoMany executes the staged delete as a multi-row delete.
+func (b {{$model.Name}}DeleteBuilder) DoMany(ctx context.Context) (int64, error) {
+	return b.action.DeleteMany(ctx, b.wheres...)
+}
+
 // FindMany retrieves multiple {{$model.Name}} records.
 func (a {{$model.Name}}Actions) FindMany(ctx context.Context, opts ...query.{{$model.Name}}QueryOption) ([]model.{{$model.Name}}, error) {
 	cfg := query.Apply{{$model.Name}}Options(opts)
