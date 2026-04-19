@@ -95,13 +95,16 @@ package query
 {{- if and (eq .Type 0) (eq .ScalarType "Json")}}{{$needsJSON = true}}{{end}}
 {{- end}}
 
-{{if or $needsTime $needsJSON}}
+{{if or $needsTime $needsJSON (hasEnumFields .Model)}}
 import (
 {{- if $needsTime}}
 	"time"
 {{- end}}
 {{- if $needsJSON}}
 	"encoding/json"
+{{- end}}
+{{- if hasEnumFields .Model}}
+	"{{.ModelImport}}"
 {{- end}}
 )
 {{end}}
@@ -232,17 +235,17 @@ var {{$.Model.Name}}{{upper $field.Name}} = {{lower $.Model.Name}}{{upper $field
 type {{lower $.Model.Name}}{{upper $field.Name}}Field struct{}
 
 // Equals creates an equality condition.
-func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Equals(v {{goType $field}}) {{$.Model.Name}}WhereClause {
+func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Equals(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {
 	return {{$.Model.Name}}WhereClause{Field: "{{snakeCase $field.Name}}", Operator: "=", Value: v}
 }
 
 // Not creates a not-equal condition.
-func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Not(v {{goType $field}}) {{$.Model.Name}}WhereClause {
+func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Not(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {
 	return {{$.Model.Name}}WhereClause{Field: "{{snakeCase $field.Name}}", Operator: "!=", Value: v}
 }
 
 // In creates an IN condition.
-func ({{lower $.Model.Name}}{{upper $field.Name}}Field) In(vals ...{{goType $field}}) {{$.Model.Name}}WhereClause {
+func ({{lower $.Model.Name}}{{upper $field.Name}}Field) In(vals ...{{queryGoType $field}}) {{$.Model.Name}}WhereClause {
 	iVals := make([]any, len(vals))
 	for i, v := range vals {
 		iVals[i] = v
@@ -251,7 +254,7 @@ func ({{lower $.Model.Name}}{{upper $field.Name}}Field) In(vals ...{{goType $fie
 }
 
 // NotIn creates a NOT IN condition.
-func ({{lower $.Model.Name}}{{upper $field.Name}}Field) NotIn(vals ...{{goType $field}}) {{$.Model.Name}}WhereClause {
+func ({{lower $.Model.Name}}{{upper $field.Name}}Field) NotIn(vals ...{{queryGoType $field}}) {{$.Model.Name}}WhereClause {
 	iVals := make([]any, len(vals))
 	for i, v := range vals {
 		iVals[i] = v
@@ -262,22 +265,22 @@ func ({{lower $.Model.Name}}{{upper $field.Name}}Field) NotIn(vals ...{{goType $
 {{- if or (eq $field.ScalarType "Int") (eq $field.ScalarType "BigInt") (eq $field.ScalarType "Float") (eq $field.ScalarType "Decimal") (eq $field.ScalarType "DateTime")}}
 
 // Lt creates a less-than condition.
-func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Lt(v {{goType $field}}) {{$.Model.Name}}WhereClause {
+func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Lt(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {
 	return {{$.Model.Name}}WhereClause{Field: "{{snakeCase $field.Name}}", Operator: "<", Value: v}
 }
 
 // Lte creates a less-than-or-equal condition.
-func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Lte(v {{goType $field}}) {{$.Model.Name}}WhereClause {
+func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Lte(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {
 	return {{$.Model.Name}}WhereClause{Field: "{{snakeCase $field.Name}}", Operator: "<=", Value: v}
 }
 
 // Gt creates a greater-than condition.
-func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Gt(v {{goType $field}}) {{$.Model.Name}}WhereClause {
+func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Gt(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {
 	return {{$.Model.Name}}WhereClause{Field: "{{snakeCase $field.Name}}", Operator: ">", Value: v}
 }
 
 // Gte creates a greater-than-or-equal condition.
-func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Gte(v {{goType $field}}) {{$.Model.Name}}WhereClause {
+func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Gte(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {
 	return {{$.Model.Name}}WhereClause{Field: "{{snakeCase $field.Name}}", Operator: ">=", Value: v}
 }
 {{end}}
@@ -309,7 +312,7 @@ func ({{lower $.Model.Name}}{{upper $field.Name}}Field) IsNull() {{$.Model.Name}
 {{end}}
 
 // Set creates a set operation for create/update.
-func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Set(v {{goType $field}}) {{$.Model.Name}}SetClause {
+func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Set(v {{queryGoType $field}}) {{$.Model.Name}}SetClause {
 	return {{$.Model.Name}}SetClause{Field: "{{snakeCase $field.Name}}", Value: v}
 }
 
@@ -370,7 +373,7 @@ type {{.Model.Name}}GroupByResult struct {
 // {{.Model.Name}}CreateInput holds data for creating a {{.Model.Name}} record.
 type {{.Model.Name}}CreateInput struct {
 {{- range scalarCols .Model}}
-	{{upper .Name}} {{if .IsOptional}}*{{end}}{{goType .}}
+	{{upper .Name}} {{if .IsOptional}}*{{end}}{{queryGoType .}}
 {{- end}}
 {{- range .Model.Fields}}
 {{- if eq .Type 2}}
@@ -394,7 +397,7 @@ type {{.Model.Name}}CreateNestedInput struct {
 type {{.Model.Name}}WhereUniqueInput struct {
 {{- range scalarCols .Model}}
 {{- if or .IsID .IsUnique}}
-	{{upper .Name}} *{{goType .}}
+	{{upper .Name}} *{{queryGoType .}}
 {{- end}}
 {{- end}}
 }

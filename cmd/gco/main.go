@@ -8,6 +8,7 @@ import (
 	"github.com/arsfy/gco-orm/internal/config"
 	"github.com/arsfy/gco-orm/pkg/schema/compiler"
 	"github.com/arsfy/gco-orm/pkg/schema/parser"
+	"github.com/arsfy/gco-orm/pkg/tooling/dbpush"
 	gcofmt "github.com/arsfy/gco-orm/pkg/tooling/fmt"
 	"github.com/arsfy/gco-orm/pkg/tooling/generate"
 	"github.com/arsfy/gco-orm/pkg/tooling/introspect"
@@ -166,81 +167,5 @@ func runValidate(args []string) error {
 }
 
 func runDBPush(args []string) error {
-	schemaPath := ""
-	configPath := ""
-	force := false
-
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--schema":
-			if i+1 < len(args) {
-				schemaPath = args[i+1]
-				i++
-			}
-		case "--config":
-			if i+1 < len(args) {
-				configPath = args[i+1]
-				i++
-			}
-		case "--force":
-			force = true
-		}
-	}
-
-	cfg, _, err := config.Load(configPath)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-
-	cwd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-
-	var roots []string
-	if schemaPath != "" {
-		roots = []string{schemaPath}
-	} else {
-		roots, err = config.DiscoverSchemaRoots(cfg, cwd)
-		if err != nil {
-			return err
-		}
-	}
-
-	files, err := config.DiscoverSchemaFiles(roots)
-	if err != nil {
-		return err
-	}
-
-	if len(files) == 0 {
-		return fmt.Errorf("no .gco schema files found in %v", roots)
-	}
-
-	fileContents := make(map[string][]byte)
-	for _, f := range files {
-		data, readErr := os.ReadFile(f)
-		if readErr != nil {
-			return fmt.Errorf("read %s: %w", f, readErr)
-		}
-		fileContents[f] = data
-	}
-
-	ds, parseErr := parser.ParseMulti(fileContents)
-	if parseErr != nil {
-		return fmt.Errorf("parse error: %w", parseErr)
-	}
-
-	result := compiler.Compile(ds)
-	if len(result.Errors) > 0 {
-		return fmt.Errorf("schema compilation failed with %d error(s)", len(result.Errors))
-	}
-
-	if result.Schema == nil {
-		return fmt.Errorf("no schema produced")
-	}
-
-	_ = force
-	fmt.Printf("db push: schema compiled with %d model(s). Push to database requires a connection URL.\n", len(result.Schema.Models))
-	fmt.Println("Set datasource url in your .gco schema or provide --url flag.")
-	return nil
+	return dbpush.Run(args)
 }

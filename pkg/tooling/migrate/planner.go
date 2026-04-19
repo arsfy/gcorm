@@ -95,7 +95,7 @@ func Diff(old, new *ir.Schema) *Changeset {
 		case inOld && !inNew:
 			cs.add(Change{Type: DropTable, Model: name})
 		default:
-			compareModels(cs, oldM, newM)
+			compareModels(cs, old, new, oldM, newM)
 		}
 	}
 
@@ -111,13 +111,13 @@ func (cs *Changeset) add(c Change) {
 // Model comparison
 // ---------------------------------------------------------------------------
 
-func compareModels(cs *Changeset, oldM, newM *ir.Model) {
-	name := newM.Name
-	compareFields(cs, name, oldM.ScalarFields(), newM.ScalarFields())
-	compareIndexes(cs, name, oldM.Indexes, newM.Indexes)
-	compareUniques(cs, name, oldM.UniqueConstraints, newM.UniqueConstraints)
-	comparePrimaryKey(cs, name, oldM.PrimaryKey, newM.PrimaryKey)
-	compareForeignKeys(cs, name, oldM.Relations, newM.Relations)
+func compareModels(cs *Changeset, oldSchema, newSchema *ir.Schema, oldM, newM *ir.Model) {
+	tableName := newM.TableName()
+	compareFields(cs, tableName, oldM.ScalarFields(), newM.ScalarFields())
+	compareIndexes(cs, tableName, oldM, newM)
+	compareUniques(cs, tableName, oldM, newM)
+	comparePrimaryKey(cs, tableName, oldM, newM)
+	compareForeignKeys(cs, tableName, oldSchema, newSchema, oldM, newM)
 }
 
 // ---------------------------------------------------------------------------
@@ -147,14 +147,14 @@ func compareFields(cs *Changeset, model string, oldFields, newFields []*ir.Field
 func compareField(cs *Changeset, model string, of, nf *ir.Field) {
 	if of.ScalarType != nf.ScalarType {
 		cs.add(Change{
-			Type: AlterType, Model: model, Field: nf.Name,
+			Type: AlterType, Model: model, Field: columnName(nf),
 			OldValue: of.ScalarType, NewValue: nf.ScalarType,
 		})
 	}
 
 	if of.IsOptional != nf.IsOptional {
 		cs.add(Change{
-			Type: AlterNull, Model: model, Field: nf.Name,
+			Type: AlterNull, Model: model, Field: columnName(nf),
 			OldValue: nullLabel(of.IsOptional), NewValue: nullLabel(nf.IsOptional),
 		})
 	}
@@ -163,8 +163,22 @@ func compareField(cs *Changeset, model string, of, nf *ir.Field) {
 	nd := formatDefault(nf.Default)
 	if od != nd {
 		cs.add(Change{
-			Type: AlterDefault, Model: model, Field: nf.Name,
+			Type: AlterDefault, Model: model, Field: columnName(nf),
 			OldValue: od, NewValue: nd,
+		})
+	}
+
+	if of.IsUnique != nf.IsUnique {
+		changeType := AddUnique
+		if !nf.IsUnique {
+			changeType = DropUnique
+		}
+		cs.add(Change{
+			Type:  changeType,
+			Model: model,
+			Details: map[string]string{
+				"fields": columnName(coalesceField(nf, of)),
+			},
 		})
 	}
 }
@@ -193,9 +207,9 @@ func formatDefault(d *ir.DefaultValue) string {
 // Indexes
 // ---------------------------------------------------------------------------
 
-func compareIndexes(cs *Changeset, model string, oldIdxs, newIdxs []*ir.Index) {
-	oldMap := mapIndexes(oldIdxs)
-	newMap := mapIndexes(newIdxs)
+func compareIndexes(cs *Changeset, model string, oldM, newM *ir.Model) {
+	oldMap := mapIndexes(oldM, oldM.Indexes)
+	newMap := mapIndexes(newM, newM.Indexes)
 	allKeys := mergedSortedKeys(oldMap, newMap)
 
 	for _, k := range allKeys {
@@ -240,33 +254,35 @@ func compareIndexes(cs *Changeset, model string, oldIdxs, newIdxs []*ir.Index) {
 	}
 }
 
-func mapIndexes(idxs []*ir.Index) map[string]*ir.Index {
+func mapIndexes(model *ir.Model, idxs []*ir.Index) map[string]*ir.Index {
 	m := make(map[string]*ir.Index, len(idxs))
 	for _, idx := range idxs {
-		m[idxKey(idx)] = idx
+		m[idxKey(model, idx)] = normalizedIndex(model, idx)
 	}
 	return m
 }
 
-func idxKey(idx *ir.Index) string {
+func idxKey(model *ir.Model, idx *ir.Index) string {
 	if idx.Name != "" {
 		return idx.Name
 	}
-	return strings.Join(idx.Fields, ",")
+	return strings.Join(normalizeFieldNames(model, idx.Fields), ",")
 }
 
 // ---------------------------------------------------------------------------
 // Unique constraints
 // ---------------------------------------------------------------------------
 
-func compareUniques(cs *Changeset, model string, oldUCs, newUCs []*ir.UniqueConstraint) {
-	oldMap := make(map[string]*ir.UniqueConstraint, len(oldUCs))
-	for _, uc := range oldUCs {
-		oldMap[ucKey(uc)] = uc
+func compareUniques(cs *Changeset, model string, oldM, newM *ir.Model) {
+	oldMap := make(map[string]*ir.UniqueConstraint, len(oldM.UniqueConstraints))
+	for _, uc := range oldM.UniqueConstraints {
+		normalized := normalizedUnique(oldM, uc)
+		oldMap[ucKey(normalized)] = normalized
 	}
-	newMap := make(map[string]*ir.UniqueConstraint, len(newUCs))
-	for _, uc := range newUCs {
-		newMap[ucKey(uc)] = uc
+	newMap := make(map[string]*ir.UniqueConstraint, len(newM.UniqueConstraints))
+	for _, uc := range newM.UniqueConstraints {
+		normalized := normalizedUnique(newM, uc)
+		newMap[ucKey(normalized)] = normalized
 	}
 	allKeys := mergedSortedKeys(oldMap, newMap)
 
@@ -300,28 +316,28 @@ func ucKey(uc *ir.UniqueConstraint) string {
 // Primary key
 // ---------------------------------------------------------------------------
 
-func comparePrimaryKey(cs *Changeset, model string, oldPK, newPK *ir.PrimaryKey) {
-	oldCols := pkString(oldPK)
-	newCols := pkString(newPK)
+func comparePrimaryKey(cs *Changeset, model string, oldM, newM *ir.Model) {
+	oldCols := pkString(oldM, oldM.PrimaryKey)
+	newCols := pkString(newM, newM.PrimaryKey)
 	if oldCols != newCols {
 		cs.add(Change{Type: ChangePK, Model: model, OldValue: oldCols, NewValue: newCols})
 	}
 }
 
-func pkString(pk *ir.PrimaryKey) string {
+func pkString(model *ir.Model, pk *ir.PrimaryKey) string {
 	if pk == nil {
 		return ""
 	}
-	return strings.Join(pk.Fields, ",")
+	return strings.Join(normalizeFieldNames(model, pk.Fields), ",")
 }
 
 // ---------------------------------------------------------------------------
 // Foreign keys (derived from relations with fields/references)
 // ---------------------------------------------------------------------------
 
-func compareForeignKeys(cs *Changeset, model string, oldRels, newRels []*ir.Relation) {
-	oldMap := mapFKRelations(oldRels)
-	newMap := mapFKRelations(newRels)
+func compareForeignKeys(cs *Changeset, model string, oldSchema, newSchema *ir.Schema, oldM, newM *ir.Model) {
+	oldMap := mapFKRelations(oldSchema, oldM, oldM.Relations)
+	newMap := mapFKRelations(newSchema, newM, newM.Relations)
 	allKeys := mergedSortedKeys(oldMap, newMap)
 
 	for _, k := range allKeys {
@@ -351,11 +367,12 @@ func compareForeignKeys(cs *Changeset, model string, oldRels, newRels []*ir.Rela
 	}
 }
 
-func mapFKRelations(rels []*ir.Relation) map[string]*ir.Relation {
+func mapFKRelations(schema *ir.Schema, model *ir.Model, rels []*ir.Relation) map[string]*ir.Relation {
 	m := make(map[string]*ir.Relation)
 	for _, r := range rels {
 		if len(r.Fields) > 0 && len(r.References) > 0 {
-			m[fkKey(r)] = r
+			normalized := normalizedRelation(schema, model, r)
+			m[fkKey(normalized)] = normalized
 		}
 	}
 	return m
@@ -372,7 +389,7 @@ func fkKey(r *ir.Relation) string {
 func indexModels(models []*ir.Model) map[string]*ir.Model {
 	m := make(map[string]*ir.Model, len(models))
 	for _, model := range models {
-		m[model.Name] = model
+		m[model.TableName()] = model
 	}
 	return m
 }
@@ -380,7 +397,7 @@ func indexModels(models []*ir.Model) map[string]*ir.Model {
 func indexFields(fields []*ir.Field) map[string]*ir.Field {
 	m := make(map[string]*ir.Field, len(fields))
 	for _, f := range fields {
-		m[f.Name] = f
+		m[columnName(f)] = f
 	}
 	return m
 }
@@ -423,7 +440,7 @@ func findModel(schema *ir.Schema, name string) *ir.Model {
 		return nil
 	}
 	for _, m := range schema.Models {
-		if m.Name == name {
+		if m.Name == name || m.TableName() == name {
 			return m
 		}
 	}
@@ -437,7 +454,7 @@ func findField(schema *ir.Schema, modelName, fieldName string) *ir.Field {
 		return nil
 	}
 	for _, f := range m.Fields {
-		if f.Name == fieldName {
+		if f.Name == fieldName || columnName(f) == fieldName {
 			return f
 		}
 	}
@@ -450,4 +467,65 @@ func columnName(f *ir.Field) string {
 		return f.DBName
 	}
 	return f.Name
+}
+
+func coalesceField(values ...*ir.Field) *ir.Field {
+	for _, v := range values {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
+}
+
+func normalizeFieldNames(model *ir.Model, names []string) []string {
+	out := make([]string, len(names))
+	for i, name := range names {
+		out[i] = resolveColumnName(model, name)
+	}
+	return out
+}
+
+func resolveColumnName(model *ir.Model, name string) string {
+	if model == nil {
+		return name
+	}
+	for _, f := range model.Fields {
+		if f.Name == name || columnName(f) == name {
+			return columnName(f)
+		}
+	}
+	return name
+}
+
+func normalizedIndex(model *ir.Model, idx *ir.Index) *ir.Index {
+	if idx == nil {
+		return nil
+	}
+	clone := *idx
+	clone.Fields = normalizeFieldNames(model, idx.Fields)
+	return &clone
+}
+
+func normalizedUnique(model *ir.Model, uc *ir.UniqueConstraint) *ir.UniqueConstraint {
+	if uc == nil {
+		return nil
+	}
+	clone := *uc
+	clone.Fields = normalizeFieldNames(model, uc.Fields)
+	return &clone
+}
+
+func normalizedRelation(schema *ir.Schema, model *ir.Model, rel *ir.Relation) *ir.Relation {
+	if rel == nil {
+		return nil
+	}
+	clone := *rel
+	clone.Fields = normalizeFieldNames(model, rel.Fields)
+	targetModel := findModel(schema, rel.ToModel)
+	clone.References = normalizeFieldNames(targetModel, rel.References)
+	if targetModel != nil {
+		clone.ToModel = targetModel.TableName()
+	}
+	return &clone
 }

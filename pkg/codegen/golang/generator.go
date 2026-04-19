@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"go/format"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -53,11 +54,10 @@ func NewGenerator(schema *ir.Schema, opts ...GenOption) *Generator {
 	}
 
 	gen := &Generator{
-		schema:     schema,
-		pkg:        pkg,
-		output:     output,
-		dialect:    dialect,
-		modulePath: "generated",
+		schema:  schema,
+		pkg:     pkg,
+		output:  output,
+		dialect: dialect,
 	}
 	for _, opt := range opts {
 		opt(gen)
@@ -167,10 +167,11 @@ func (g *Generator) generateQueries() ([]*GeneratedFile, error) {
 
 	for _, model := range models {
 		content, err := g.renderTemplate("query_"+model.Name, queryTmpl, map[string]any{
-			"Package": g.pkg,
-			"Model":   model,
-			"GoType":  goTypeForField,
-			"Lower":   toLowerFirst,
+			"Package":     g.pkg,
+			"Model":       model,
+			"GoType":      queryGoTypeForField,
+			"Lower":       toLowerFirst,
+			"ModelImport": g.baseImportPath() + "/model",
 		})
 		if err != nil {
 			return nil, err
@@ -193,7 +194,7 @@ func (g *Generator) generateClient() (*GeneratedFile, error) {
 	content, err := g.renderTemplate("client", clientTmpl, map[string]any{
 		"Package":    g.pkg,
 		"Models":     models,
-		"BaseImport": g.modulePath,
+		"BaseImport": g.baseImportPath(),
 		"Dialect":    g.dialect,
 	})
 	if err != nil {
@@ -208,11 +209,13 @@ func (g *Generator) generateClient() (*GeneratedFile, error) {
 func (g *Generator) renderTemplate(name, tmplSrc string, data any) ([]byte, error) {
 	funcMap := template.FuncMap{
 		"goType":            goTypeForField,
+		"queryGoType":       queryGoTypeForField,
 		"lower":             toLowerFirst,
 		"upper":             toUpperFirst,
 		"snakeCase":         toSnakeCase,
 		"pluralize":         simplePluralize,
 		"scalarCols":        scalarColumns,
+		"hasEnumFields":     hasEnumFields,
 		"quote":             func(s string) string { return fmt.Sprintf("%q", s) },
 		"tableName":         func(m *ir.Model) string { return m.TableName() },
 		"columnCSV":         columnCSV,
@@ -270,6 +273,69 @@ func goTypeForField(f *ir.Field) string {
 		return "*" + base
 	}
 	return base
+}
+
+func queryGoTypeForField(f *ir.Field) string {
+	if f.Type == ir.FieldKindEnum {
+		return "model." + f.EnumType
+	}
+	return goTypeForField(f)
+}
+
+func hasEnumFields(m *ir.Model) bool {
+	for _, f := range m.Fields {
+		if f.Type == ir.FieldKindEnum {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *Generator) baseImportPath() string {
+	if g.modulePath != "" {
+		return strings.TrimSuffix(g.modulePath, "/")
+	}
+
+	modulePath := findModulePath()
+	if modulePath == "" {
+		return ""
+	}
+
+	output := strings.TrimSpace(filepath.ToSlash(filepath.Clean(g.output)))
+	output = strings.TrimPrefix(output, "./")
+	output = strings.TrimPrefix(output, "/")
+	if output == "" || output == "." {
+		return modulePath
+	}
+	return modulePath + "/" + output
+}
+
+func findModulePath() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+
+	for {
+		data, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+		if err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "module ") {
+					fields := strings.Fields(line)
+					if len(fields) >= 2 {
+						return fields[1]
+					}
+				}
+			}
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
 }
 
 // scalarGoType maps schema scalar types to Go types.

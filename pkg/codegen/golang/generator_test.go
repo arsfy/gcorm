@@ -49,6 +49,11 @@ func testSchema() *ir.Schema {
 						IsOptional: true,
 					},
 					{
+						Name:     "role",
+						Type:     ir.FieldKindEnum,
+						EnumType: "Role",
+					},
+					{
 						Name:       "age",
 						Type:       ir.FieldKindScalar,
 						ScalarType: "Int",
@@ -269,6 +274,9 @@ func TestGenerateQueryContent(t *testing.T) {
 	}
 	if !strings.Contains(userQueryContent, "WhereClause") {
 		t.Error("user.go should contain WhereClause type")
+	}
+	if !strings.Contains(userQueryContent, "model.Role") {
+		t.Error("user.go should reference model.Role for enum fields")
 	}
 }
 

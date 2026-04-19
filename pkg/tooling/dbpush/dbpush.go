@@ -1,0 +1,627 @@
+package dbpush
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/arsfy/gco-orm/internal/config"
+	"github.com/arsfy/gco-orm/pkg/schema/compiler"
+	"github.com/arsfy/gco-orm/pkg/schema/ir"
+	"github.com/arsfy/gco-orm/pkg/schema/parser"
+	"github.com/arsfy/gco-orm/pkg/tooling/migrate"
+)
+
+// Run executes `gco db push`.
+func Run(args []string) error {
+	schemaPath := ""
+	configPath := ""
+	explicitURL := ""
+	force := false
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--schema":
+			if i+1 < len(args) {
+				schemaPath = args[i+1]
+				i++
+			}
+		case "--config":
+			if i+1 < len(args) {
+				configPath = args[i+1]
+				i++
+			}
+		case "--url":
+			if i+1 < len(args) {
+				explicitURL = args[i+1]
+				i++
+			}
+		case "--force":
+			force = true
+		}
+	}
+
+	targetSchema, err := loadTargetSchema(schemaPath, configPath)
+	if err != nil {
+		return err
+	}
+
+	dsn, source, err := resolveURL(explicitURL, targetSchema)
+	if err != nil {
+		return err
+	}
+
+	provider := "postgresql"
+	if targetSchema.Datasource != nil && targetSchema.Datasource.Provider != "" {
+		provider = targetSchema.Datasource.Provider
+	}
+	if provider != "postgresql" {
+		return fmt.Errorf("db push currently supports only postgresql, got %q", provider)
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("ping database: %w", err)
+	}
+
+	currentSchemaName := "public"
+	if targetSchema.Datasource != nil && targetSchema.Datasource.Schema != "" {
+		currentSchemaName = targetSchema.Datasource.Schema
+	}
+
+	currentSchema, err := introspectPostgres(ctx, db, currentSchemaName)
+	if err != nil {
+		return fmt.Errorf("introspect database: %w", err)
+	}
+
+	cs := migrate.Diff(currentSchema, targetSchema)
+	if len(cs.Changes) == 0 {
+		fmt.Printf("db push: schema compiled with %d model(s). No database changes detected.\n", len(targetSchema.Models))
+		return nil
+	}
+
+	risky := riskyChanges(cs)
+	if len(risky) > 0 && !force {
+		return fmt.Errorf("db push refused to apply %d potentially destructive change(s) without --force:\n%s", len(risky), strings.Join(risky, "\n"))
+	}
+
+	gen := migrate.DDLGenerator{Dialect: provider, Schema: targetSchema}
+	sqlText := gen.GenerateUp(cs)
+	stmts, unsupported := splitStatements(sqlText)
+	if len(unsupported) > 0 {
+		return fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
+	}
+	if len(stmts) == 0 {
+		fmt.Printf("db push: schema compiled with %d model(s). No executable SQL generated.\n", len(targetSchema.Models))
+		return nil
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("execute SQL %q: %w", stmt, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+
+	fmt.Printf("db push: schema compiled with %d model(s). Applied %d change(s) using connection URL from %s.\n", len(targetSchema.Models), len(cs.Changes), source)
+	return nil
+}
+
+func loadTargetSchema(schemaPath, configPath string) (*ir.Schema, error) {
+	cfg, _, err := config.Load(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("load config: %w", err)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+
+	var roots []string
+	if schemaPath != "" {
+		roots = []string{schemaPath}
+	} else {
+		roots, err = config.DiscoverSchemaRoots(cfg, cwd)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	files, err := config.DiscoverSchemaFiles(roots)
+	if err != nil {
+		return nil, err
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no .gco schema files found in %v", roots)
+	}
+
+	fileContents := make(map[string][]byte, len(files))
+	for _, f := range files {
+		data, readErr := os.ReadFile(f)
+		if readErr != nil {
+			return nil, fmt.Errorf("read %s: %w", f, readErr)
+		}
+		fileContents[f] = data
+	}
+
+	ds, parseErr := parser.ParseMulti(fileContents)
+	if parseErr != nil {
+		return nil, fmt.Errorf("parse error: %w", parseErr)
+	}
+
+	result := compiler.Compile(ds)
+	if len(result.Errors) > 0 {
+		return nil, fmt.Errorf("schema compilation failed with %d error(s)", len(result.Errors))
+	}
+	if result.Schema == nil {
+		return nil, fmt.Errorf("no schema produced")
+	}
+	return result.Schema, nil
+}
+
+func resolveURL(explicitURL string, schema *ir.Schema) (string, string, error) {
+	if explicitURL != "" {
+		return explicitURL, "--url", nil
+	}
+	if schema != nil && schema.Datasource != nil {
+		ds := schema.Datasource
+		if ds.URLIsEnv {
+			if ds.EnvVar == "" {
+				return "", "", fmt.Errorf("datasource url uses env() but no variable name was provided")
+			}
+			value := os.Getenv(ds.EnvVar)
+			if value == "" {
+				return "", "", fmt.Errorf("datasource url uses env(%q), but %s is not set", ds.EnvVar, ds.EnvVar)
+			}
+			return value, fmt.Sprintf("datasource env(%q)", ds.EnvVar), nil
+		}
+		if ds.URL != "" {
+			return ds.URL, "schema datasource", nil
+		}
+	}
+	modelCount := 0
+	if schema != nil {
+		modelCount = len(schema.Models)
+	}
+	return "", "", fmt.Errorf("db push: schema compiled with %d model(s). Push to database requires a connection URL.\nSet datasource url in your .gco schema or provide --url flag.", modelCount)
+}
+
+func riskyChanges(cs *migrate.Changeset) []string {
+	var out []string
+	for _, c := range cs.Changes {
+		if c.Rollback == migrate.SafeRollback {
+			continue
+		}
+		label := fmt.Sprintf("  - %s %s", c.Type, c.Model)
+		if c.Field != "" {
+			label += "." + c.Field
+		}
+		label += fmt.Sprintf(" [%s]", c.Rollback)
+		out = append(out, label)
+	}
+	return out
+}
+
+func splitStatements(sqlText string) ([]string, []string) {
+	parts := strings.Split(sqlText, ";")
+	stmts := make([]string, 0, len(parts))
+	var unsupported []string
+
+	for _, part := range parts {
+		lines := strings.Split(part, "\n")
+		var kept []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if strings.HasPrefix(trimmed, "--") {
+				unsupported = append(unsupported, trimmed)
+				continue
+			}
+			kept = append(kept, line)
+		}
+		stmt := strings.TrimSpace(strings.Join(kept, "\n"))
+		if stmt != "" {
+			stmts = append(stmts, stmt)
+		}
+	}
+
+	return stmts, unsupported
+}
+
+func introspectPostgres(ctx context.Context, db *sql.DB, schemaName string) (*ir.Schema, error) {
+	schema := &ir.Schema{
+		Datasource: &ir.Datasource{
+			Provider: "postgresql",
+			Schema:   schemaName,
+		},
+	}
+
+	models, err := loadPostgresTables(ctx, db, schemaName)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadPostgresColumns(ctx, db, schemaName, models); err != nil {
+		return nil, err
+	}
+	if err := loadPostgresPrimaryKeys(ctx, db, schemaName, models); err != nil {
+		return nil, err
+	}
+	if err := loadPostgresUniqueConstraints(ctx, db, schemaName, models); err != nil {
+		return nil, err
+	}
+	if err := loadPostgresIndexes(ctx, db, schemaName, models); err != nil {
+		return nil, err
+	}
+	if err := loadPostgresForeignKeys(ctx, db, schemaName, models); err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(models))
+	for name := range models {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		schema.Models = append(schema.Models, models[name])
+	}
+	return schema, nil
+}
+
+func loadPostgresTables(ctx context.Context, db *sql.DB, schemaName string) (map[string]*ir.Model, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+ORDER BY table_name`, schemaName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	models := make(map[string]*ir.Model)
+	for rows.Next() {
+		var tableName string
+		if err := rows.Scan(&tableName); err != nil {
+			return nil, err
+		}
+		models[tableName] = &ir.Model{
+			Name:   tableName,
+			DBName: tableName,
+			Schema: schemaName,
+		}
+	}
+	return models, rows.Err()
+}
+
+func loadPostgresColumns(ctx context.Context, db *sql.DB, schemaName string, models map[string]*ir.Model) error {
+	rows, err := db.QueryContext(ctx, `
+SELECT table_name, column_name, is_nullable, data_type, udt_name, column_default
+FROM information_schema.columns
+WHERE table_schema = $1
+ORDER BY table_name, ordinal_position`, schemaName)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var tableName, columnName, isNullable, dataType, udtName string
+		var columnDefault sql.NullString
+		if err := rows.Scan(&tableName, &columnName, &isNullable, &dataType, &udtName, &columnDefault); err != nil {
+			return err
+		}
+		model := models[tableName]
+		if model == nil {
+			continue
+		}
+		field := &ir.Field{
+			Name:       columnName,
+			DBName:     columnName,
+			Type:       ir.FieldKindScalar,
+			ScalarType: postgresScalarType(dataType, udtName),
+			IsOptional: isNullable == "YES",
+			Default:    postgresDefaultValue(columnDefault.String),
+		}
+		model.Fields = append(model.Fields, field)
+	}
+	return rows.Err()
+}
+
+func loadPostgresPrimaryKeys(ctx context.Context, db *sql.DB, schemaName string, models map[string]*ir.Model) error {
+	rows, err := db.QueryContext(ctx, `
+SELECT tc.table_name, kcu.column_name
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON tc.constraint_name = kcu.constraint_name
+ AND tc.table_schema = kcu.table_schema
+ AND tc.table_name = kcu.table_name
+WHERE tc.table_schema = $1
+  AND tc.constraint_type = 'PRIMARY KEY'
+ORDER BY tc.table_name, kcu.ordinal_position`, schemaName)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	grouped := map[string][]string{}
+	for rows.Next() {
+		var tableName, columnName string
+		if err := rows.Scan(&tableName, &columnName); err != nil {
+			return err
+		}
+		grouped[tableName] = append(grouped[tableName], columnName)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for tableName, fields := range grouped {
+		model := models[tableName]
+		if model == nil {
+			continue
+		}
+		model.PrimaryKey = &ir.PrimaryKey{
+			Fields:      fields,
+			IsComposite: len(fields) > 1,
+		}
+		if len(fields) == 1 {
+			if field := findFieldByColumn(model, fields[0]); field != nil {
+				field.IsID = true
+			}
+		}
+	}
+	return nil
+}
+
+func loadPostgresUniqueConstraints(ctx context.Context, db *sql.DB, schemaName string, models map[string]*ir.Model) error {
+	rows, err := db.QueryContext(ctx, `
+SELECT tc.table_name, tc.constraint_name, kcu.column_name
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON tc.constraint_name = kcu.constraint_name
+ AND tc.table_schema = kcu.table_schema
+ AND tc.table_name = kcu.table_name
+WHERE tc.table_schema = $1
+  AND tc.constraint_type = 'UNIQUE'
+ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`, schemaName)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type uniqueKey struct {
+		table string
+		name  string
+	}
+	grouped := map[uniqueKey][]string{}
+	for rows.Next() {
+		var tableName, constraintName, columnName string
+		if err := rows.Scan(&tableName, &constraintName, &columnName); err != nil {
+			return err
+		}
+		grouped[uniqueKey{table: tableName, name: constraintName}] = append(grouped[uniqueKey{table: tableName, name: constraintName}], columnName)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for key, fields := range grouped {
+		model := models[key.table]
+		if model == nil {
+			continue
+		}
+		if len(fields) == 1 {
+			if field := findFieldByColumn(model, fields[0]); field != nil {
+				field.IsUnique = true
+				continue
+			}
+		}
+		model.UniqueConstraints = append(model.UniqueConstraints, &ir.UniqueConstraint{
+			Name:   key.name,
+			Fields: fields,
+		})
+	}
+	return nil
+}
+
+func loadPostgresIndexes(ctx context.Context, db *sql.DB, schemaName string, models map[string]*ir.Model) error {
+	rows, err := db.QueryContext(ctx, `
+SELECT
+  t.relname AS table_name,
+  i.relname AS index_name,
+  ix.indisunique,
+  array_agg(a.attname ORDER BY keys.ord) AS columns
+FROM pg_class t
+JOIN pg_namespace ns ON ns.oid = t.relnamespace
+JOIN pg_index ix ON t.oid = ix.indrelid
+JOIN pg_class i ON i.oid = ix.indexrelid
+JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS keys(attnum, ord) ON true
+JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = keys.attnum
+LEFT JOIN pg_constraint c ON c.conindid = ix.indexrelid
+WHERE ns.nspname = $1
+  AND t.relkind = 'r'
+  AND NOT ix.indisprimary
+  AND c.oid IS NULL
+GROUP BY t.relname, i.relname, ix.indisunique
+ORDER BY t.relname, i.relname`, schemaName)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var tableName, indexName string
+		var isUnique bool
+		var columns []byte
+		if err := rows.Scan(&tableName, &indexName, &isUnique, &columns); err != nil {
+			return err
+		}
+		model := models[tableName]
+		if model == nil {
+			continue
+		}
+		model.Indexes = append(model.Indexes, &ir.Index{
+			Name:     indexName,
+			Fields:   parsePostgresTextArray(string(columns)),
+			IsUnique: isUnique,
+		})
+	}
+	return rows.Err()
+}
+
+func loadPostgresForeignKeys(ctx context.Context, db *sql.DB, schemaName string, models map[string]*ir.Model) error {
+	rows, err := db.QueryContext(ctx, `
+SELECT
+  tc.table_name,
+  tc.constraint_name,
+  kcu.column_name,
+  ccu.table_name AS foreign_table_name,
+  ccu.column_name AS foreign_column_name,
+  rc.delete_rule,
+  rc.update_rule
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON tc.constraint_name = kcu.constraint_name
+ AND tc.table_schema = kcu.table_schema
+ AND tc.table_name = kcu.table_name
+JOIN information_schema.constraint_column_usage ccu
+  ON tc.constraint_name = ccu.constraint_name
+ AND tc.table_schema = ccu.constraint_schema
+JOIN information_schema.referential_constraints rc
+  ON tc.constraint_name = rc.constraint_name
+ AND tc.table_schema = rc.constraint_schema
+WHERE tc.table_schema = $1
+  AND tc.constraint_type = 'FOREIGN KEY'
+ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`, schemaName)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type fkKey struct {
+		table string
+		name  string
+	}
+	grouped := map[fkKey]*ir.Relation{}
+	for rows.Next() {
+		var tableName, constraintName, columnName, foreignTable, foreignColumn, onDelete, onUpdate string
+		if err := rows.Scan(&tableName, &constraintName, &columnName, &foreignTable, &foreignColumn, &onDelete, &onUpdate); err != nil {
+			return err
+		}
+		key := fkKey{table: tableName, name: constraintName}
+		rel := grouped[key]
+		if rel == nil {
+			rel = &ir.Relation{
+				Name:      constraintName,
+				FromModel: tableName,
+				ToModel:   foreignTable,
+				OnDelete:  onDelete,
+				OnUpdate:  onUpdate,
+			}
+			grouped[key] = rel
+		}
+		rel.Fields = append(rel.Fields, columnName)
+		rel.References = append(rel.References, foreignColumn)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for key, rel := range grouped {
+		model := models[key.table]
+		if model == nil {
+			continue
+		}
+		model.Relations = append(model.Relations, rel)
+	}
+	return nil
+}
+
+func postgresScalarType(dataType, udtName string) string {
+	upperType := strings.ToUpper(dataType)
+	upperUDT := strings.ToUpper(udtName)
+	switch {
+	case upperUDT == "UUID":
+		return "UUID"
+	case strings.Contains(upperType, "BIGINT"), upperType == "INT8":
+		return "BigInt"
+	case strings.Contains(upperType, "INTEGER"), strings.Contains(upperType, "SMALLINT"), upperType == "INT4", upperType == "INT2":
+		return "Int"
+	case strings.Contains(upperType, "DOUBLE"), strings.Contains(upperType, "REAL"):
+		return "Float"
+	case strings.Contains(upperType, "NUMERIC"), strings.Contains(upperType, "DECIMAL"):
+		return "Decimal"
+	case strings.Contains(upperType, "BOOLEAN"):
+		return "Boolean"
+	case strings.Contains(upperType, "TIMESTAMP"), strings.Contains(upperType, "DATE"), strings.Contains(upperType, "TIME"):
+		return "DateTime"
+	case strings.Contains(upperType, "BYTEA"):
+		return "Bytes"
+	case strings.Contains(upperType, "JSON"):
+		return "Json"
+	default:
+		return "String"
+	}
+}
+
+func postgresDefaultValue(def string) *ir.DefaultValue {
+	def = strings.TrimSpace(def)
+	if def == "" {
+		return nil
+	}
+	lower := strings.ToLower(def)
+	switch {
+	case strings.Contains(lower, "nextval("):
+		return &ir.DefaultValue{IsFunction: true, FuncName: "autoincrement"}
+	case strings.Contains(lower, "uuid"):
+		return &ir.DefaultValue{IsFunction: true, FuncName: "uuid"}
+	case strings.Contains(lower, "now()"), strings.Contains(lower, "current_timestamp"):
+		return &ir.DefaultValue{IsFunction: true, FuncName: "now"}
+	default:
+		return &ir.DefaultValue{Value: strings.Trim(def, "'"), IsString: true}
+	}
+}
+
+func parsePostgresTextArray(input string) []string {
+	input = strings.TrimSpace(strings.Trim(input, "{}"))
+	if input == "" {
+		return nil
+	}
+	parts := strings.Split(input, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		out = append(out, strings.Trim(part, `"`))
+	}
+	return out
+}
+
+func findFieldByColumn(model *ir.Model, column string) *ir.Field {
+	for _, field := range model.Fields {
+		if field.DBName == column || field.Name == column {
+			return field
+		}
+	}
+	return nil
+}

@@ -1,1 +1,1 @@
--- WARNING: destructive — cannot recreate User without original schema
+-- WARNING: destructive — cannot recreate users without original schema

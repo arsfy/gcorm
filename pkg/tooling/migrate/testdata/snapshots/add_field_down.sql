@@ -1,1 +1,1 @@
-ALTER TABLE "User" DROP COLUMN "bio";
+ALTER TABLE "users" DROP COLUMN "bio";

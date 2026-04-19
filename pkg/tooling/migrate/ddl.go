@@ -96,12 +96,53 @@ func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
 	}
 
 	if model.PrimaryKey != nil && len(model.PrimaryKey.Fields) > 0 {
-		quoted := g.quoteIDs(model.PrimaryKey.Fields)
+		quoted := g.quoteIDs(normalizeFieldNames(model, model.PrimaryKey.Fields))
 		cols = append(cols, fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(quoted, ", ")))
+	}
+
+	for _, uc := range model.UniqueConstraints {
+		fields := g.quoteIDs(normalizeFieldNames(model, uc.Fields))
+		if uc.Name != "" {
+			cols = append(cols, fmt.Sprintf("  CONSTRAINT %s UNIQUE (%s)", g.quoteID(uc.Name), strings.Join(fields, ", ")))
+			continue
+		}
+		cols = append(cols, fmt.Sprintf("  UNIQUE (%s)", strings.Join(fields, ", ")))
+	}
+
+	for _, rel := range model.Relations {
+		if len(rel.Fields) == 0 || len(rel.References) == 0 {
+			continue
+		}
+		targetModel := findModel(g.Schema, rel.ToModel)
+		refTable := rel.ToModel
+		if targetModel != nil {
+			refTable = targetModel.TableName()
+		}
+		localFields := g.quoteIDs(normalizeFieldNames(model, rel.Fields))
+		refFields := g.quoteIDs(normalizeFieldNames(targetModel, rel.References))
+		cols = append(cols, fmt.Sprintf("  CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
+			g.quoteID(fmt.Sprintf("fk_%s_%s", model.TableName(), strings.Join(normalizeFieldNames(model, rel.Fields), "_"))),
+			strings.Join(localFields, ", "),
+			g.quoteID(refTable),
+			strings.Join(refFields, ", ")))
 	}
 
 	b.WriteString(strings.Join(cols, ",\n"))
 	b.WriteString("\n);")
+
+	for _, idx := range model.Indexes {
+		fields := g.quoteIDs(normalizeFieldNames(model, idx.Fields))
+		name := idx.Name
+		if name == "" {
+			name = fmt.Sprintf("idx_%s_%s", model.TableName(), strings.Join(normalizeFieldNames(model, idx.Fields), "_"))
+		}
+		unique := ""
+		if idx.IsUnique {
+			unique = "UNIQUE "
+		}
+		b.WriteString(fmt.Sprintf("\nCREATE %sINDEX %s ON %s (%s);",
+			unique, g.quoteID(name), g.quoteID(model.TableName()), strings.Join(fields, ", ")))
+	}
 	return b.String()
 }
 
@@ -430,6 +471,10 @@ func (g DDLGenerator) columnDef(f *ir.Field) string {
 
 	if !f.IsOptional {
 		parts = append(parts, "NOT NULL")
+	}
+
+	if f.IsUnique && !f.IsID {
+		parts = append(parts, "UNIQUE")
 	}
 
 	if f.Default != nil {
