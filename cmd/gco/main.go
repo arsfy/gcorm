@@ -11,6 +11,7 @@ import (
 	"github.com/arsfy/gco-orm/pkg/tooling/dbpush"
 	gcofmt "github.com/arsfy/gco-orm/pkg/tooling/fmt"
 	"github.com/arsfy/gco-orm/pkg/tooling/generate"
+	"github.com/arsfy/gco-orm/pkg/tooling/initcmd"
 	"github.com/arsfy/gco-orm/pkg/tooling/introspect"
 	"github.com/arsfy/gco-orm/pkg/tooling/migrate"
 )
@@ -25,6 +26,8 @@ func main() {
 
 	var err error
 	switch os.Args[1] {
+	case "init":
+		err = initcmd.Run(os.Args[2:])
 	case "generate":
 		err = generate.Run(os.Args[2:])
 	case "fmt":
@@ -65,6 +68,7 @@ Usage:
   gco <command> [flags]
 
 Commands:
+	init         Initialize a new GCO ORM schema interactively
   generate     Generate Go client code from schema
   fmt          Format schema files
   validate     Validate schema files

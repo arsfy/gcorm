@@ -3,6 +3,7 @@ package generate
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -97,6 +98,7 @@ func TestRunGenerateFromSchemaFiles(t *testing.T) {
 		filepath.Join("model", "enums.go"),
 		filepath.Join("query", "user.go"),
 		filepath.Join("client", "client.go"),
+		"AI_USAGE.md",
 	}
 	for _, rel := range expected {
 		path := filepath.Join(outputDir, rel)
@@ -112,6 +114,21 @@ func TestRunGenerateFromSchemaFiles(t *testing.T) {
 		if info.Size() == 0 {
 			t.Errorf("file %s is empty", rel)
 		}
+	}
+
+	aiDoc, err := os.ReadFile(filepath.Join(outputDir, "AI_USAGE.md"))
+	if err != nil {
+		t.Fatalf("read AI usage doc: %v", err)
+	}
+	aiText := string(aiDoc)
+	if !strings.Contains(aiText, "# AI Usage Guide for Generated GCO Client") {
+		t.Fatalf("AI usage doc missing title: %s", aiText)
+	}
+	if !strings.Contains(aiText, "## CRUD Builder Pattern") {
+		t.Fatalf("AI usage doc missing CRUD section: %s", aiText)
+	}
+	if !strings.Contains(aiText, "query.User.Email") {
+		t.Fatalf("AI usage doc missing model-specific query example: %s", aiText)
 	}
 }
 
