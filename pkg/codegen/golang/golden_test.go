@@ -2,6 +2,7 @@ package golang
 
 import (
 	"bytes"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -171,6 +172,7 @@ func TestGoldenQueryOutput(t *testing.T) {
 	newQueryChecks := []string{
 		"UserQueryOption",
 		"UserQueryConfig",
+		"var User = UserQuery{",
 		"ApplyUserOptions",
 		"UserTakeOption",
 		"UserSkipOption",
@@ -191,6 +193,21 @@ func TestGoldenQueryOutput(t *testing.T) {
 			t.Errorf("query/user.go missing %q", check)
 		}
 	}
+	if !regexp.MustCompile(`(?m)\bEmail\s+userEmailField\b`).MatchString(userQuery) {
+		t.Error("query/user.go should scope Email under UserQuery")
+	}
+	if !regexp.MustCompile(`(?m)\bCreatedAt\s+userCreatedAtField\b`).MatchString(userQuery) {
+		t.Error("query/user.go should scope CreatedAt under UserQuery")
+	}
+	if !strings.Contains(userQuery, "func (userNameField) Set(v string) UserSetClause") {
+		t.Error("query/user.go should allow plain values in Set for optional string fields")
+	}
+	if !strings.Contains(userQuery, "func (userNameField) SetNull() UserSetClause") {
+		t.Error("query/user.go should generate SetNull for optional string fields")
+	}
+	if strings.Contains(userQuery, "var UserEmail =") {
+		t.Error("query/user.go should not generate flattened UserEmail helper vars")
+	}
 
 	// In method should convert to []any for type-safe SQL building.
 	if !strings.Contains(userQuery, "iVals := make([]any, len(vals))") {
@@ -206,6 +223,7 @@ func TestGoldenQueryOutput(t *testing.T) {
 		"Set(",
 		"Asc()",
 		"Desc()",
+		"var Post = PostQuery{",
 		"PostQueryOption",
 		"PostCreateInput",
 	}
@@ -213,6 +231,9 @@ func TestGoldenQueryOutput(t *testing.T) {
 		if !strings.Contains(postQuery, check) {
 			t.Errorf("query/post.go missing %q", check)
 		}
+	}
+	if !regexp.MustCompile(`(?m)\bAuthor\s+postAuthorRelation\b`).MatchString(postQuery) {
+		t.Error("query/post.go should scope Author under PostQuery")
 	}
 }
 

@@ -142,7 +142,7 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 		}
 
 		if t.Schema != "" {
-			b.WriteString(fmt.Sprintf("\n  @@schema(%q)\n", t.Schema))
+			fmt.Fprintf(&b, "\n  @@schema(%q)\n", t.Schema)
 		}
 
 		b.WriteString("}\n")

@@ -132,11 +132,24 @@ func Apply{{.Model.Name}}Options(opts []{{.Model.Name}}QueryOption) {{.Model.Nam
 	return cfg
 }
 
-// {{.Model.Name}}Query provides query building methods for the {{.Model.Name}} model.
-var {{.Model.Name}} = {{.Model.Name}}Query{}
-
 // {{.Model.Name}}Query is the namespace for {{.Model.Name}} query operations.
-type {{.Model.Name}}Query struct{}
+type {{.Model.Name}}Query struct {
+{{- range $field := .Model.Fields}}
+{{- if ne $field.Type 2}}
+	{{upper $field.Name}} {{lower $.Model.Name}}{{upper $field.Name}}Field
+{{- end}}
+{{- if eq $field.Type 2}}
+	{{upper $field.Name}} {{lower $.Model.Name}}{{upper $field.Name}}Relation
+{{- end}}
+{{- end}}
+}
+
+// {{.Model.Name}}Query provides query building methods for the {{.Model.Name}} model.
+var {{.Model.Name}} = {{.Model.Name}}Query{
+{{- range $field := .Model.Fields}}
+	{{upper $field.Name}}: {{lower $.Model.Name}}{{upper $field.Name}}{{if eq $field.Type 2}}Relation{{else}}Field{{end}}{},
+{{- end}}
+}
 
 // {{.Model.Name}}WhereClause represents a WHERE condition for {{.Model.Name}}.
 type {{.Model.Name}}WhereClause struct {
@@ -230,8 +243,6 @@ func ({{.Model.Name}}Query) Cursor(field string, value any) {{.Model.Name}}Where
 {{range $field := .Model.Fields}}
 {{- if ne $field.Type 2}}
 // {{upper $field.Name}}Field provides query operations for the {{$field.Name}} field.
-var {{$.Model.Name}}{{upper $field.Name}} = {{lower $.Model.Name}}{{upper $field.Name}}Field{}
-
 type {{lower $.Model.Name}}{{upper $field.Name}}Field struct{}
 
 // Equals creates an equality condition.
@@ -312,9 +323,17 @@ func ({{lower $.Model.Name}}{{upper $field.Name}}Field) IsNull() {{$.Model.Name}
 {{end}}
 
 // Set creates a set operation for create/update.
-func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Set(v {{queryGoType $field}}) {{$.Model.Name}}SetClause {
+func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Set(v {{if $field.IsOptional}}{{setGoType $field}}{{else}}{{queryGoType $field}}{{end}}) {{$.Model.Name}}SetClause {
 	return {{$.Model.Name}}SetClause{Field: "{{snakeCase $field.Name}}", Value: v}
 }
+
+{{- if $field.IsOptional}}
+
+// SetNull sets the field to NULL.
+func ({{lower $.Model.Name}}{{upper $field.Name}}Field) SetNull() {{$.Model.Name}}SetClause {
+	return {{$.Model.Name}}SetClause{Field: "{{snakeCase $field.Name}}", Value: nil}
+}
+{{end}}
 
 // Asc returns an ascending order clause for this field.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Asc() {{$.Model.Name}}OrderByClause {
@@ -328,8 +347,6 @@ func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Desc() {{$.Model.Name}}O
 {{end}}
 {{- if eq $field.Type 2}}
 // {{upper $field.Name}}Relation provides relation query helpers for {{$field.Name}}.
-var {{$.Model.Name}}{{upper $field.Name}} = {{lower $.Model.Name}}{{upper $field.Name}}Relation{}
-
 type {{lower $.Model.Name}}{{upper $field.Name}}Relation struct{}
 
 // Fetch creates an include clause to fetch related {{$field.Name}}.

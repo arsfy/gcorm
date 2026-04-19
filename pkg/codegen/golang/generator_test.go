@@ -1,6 +1,7 @@
 package golang
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
@@ -267,6 +268,21 @@ func TestGenerateQueryContent(t *testing.T) {
 	// Check query builder namespace.
 	if !strings.Contains(userQueryContent, "UserQuery") {
 		t.Error("user.go should contain UserQuery type")
+	}
+	if !strings.Contains(userQueryContent, "var User = UserQuery{") {
+		t.Error("user.go should expose a User query namespace value")
+	}
+	if !regexp.MustCompile(`(?m)\bEmail\s+userEmailField\b`).MatchString(userQueryContent) {
+		t.Error("user.go should scope field helpers under UserQuery")
+	}
+	if !strings.Contains(userQueryContent, "func (userNameField) Set(v string) UserSetClause") {
+		t.Error("user.go should allow plain values in Set for optional string fields")
+	}
+	if !strings.Contains(userQueryContent, "func (userNameField) SetNull() UserSetClause") {
+		t.Error("user.go should generate SetNull for optional fields")
+	}
+	if strings.Contains(userQueryContent, "var UserEmail =") {
+		t.Error("user.go should not generate flattened UserEmail helper vars")
 	}
 	// Check field query helpers exist.
 	if !strings.Contains(userQueryContent, "Equals") {

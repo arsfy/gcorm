@@ -170,6 +170,7 @@ func (g *Generator) generateQueries() ([]*GeneratedFile, error) {
 			"Package":     g.pkg,
 			"Model":       model,
 			"GoType":      queryGoTypeForField,
+			"SetGoType":   setGoTypeForField,
 			"Lower":       toLowerFirst,
 			"ModelImport": g.baseImportPath() + "/model",
 		})
@@ -210,6 +211,7 @@ func (g *Generator) renderTemplate(name, tmplSrc string, data any) ([]byte, erro
 	funcMap := template.FuncMap{
 		"goType":            goTypeForField,
 		"queryGoType":       queryGoTypeForField,
+		"setGoType":         setGoTypeForField,
 		"lower":             toLowerFirst,
 		"upper":             toUpperFirst,
 		"snakeCase":         toSnakeCase,
@@ -280,6 +282,18 @@ func queryGoTypeForField(f *ir.Field) string {
 		return "model." + f.EnumType
 	}
 	return goTypeForField(f)
+}
+
+func setGoTypeForField(f *ir.Field) string {
+	if f == nil {
+		return "any"
+	}
+	if f.Type == ir.FieldKindEnum {
+		return "model." + f.EnumType
+	}
+	clone := *f
+	clone.IsOptional = false
+	return goTypeForField(&clone)
 }
 
 func hasEnumFields(m *ir.Model) bool {
