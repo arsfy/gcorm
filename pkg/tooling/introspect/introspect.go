@@ -38,12 +38,12 @@ type IndexInfo struct {
 
 // ForeignKeyInfo describes a foreign key relationship.
 type ForeignKeyInfo struct {
-	Name            string
-	Columns         []string
-	RefTable        string
-	RefColumns      []string
-	OnDelete        string
-	OnUpdate        string
+	Name       string
+	Columns    []string
+	RefTable   string
+	RefColumns []string
+	OnDelete   string
+	OnUpdate   string
 }
 
 // Run executes the introspect command.
@@ -136,10 +136,8 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 		for _, idx := range t.Indexes {
 			if !idx.IsUnique {
 				cols := make([]string, len(idx.Columns))
-				for i, c := range idx.Columns {
-					cols[i] = c
-				}
-				b.WriteString(fmt.Sprintf("\n  @@index([%s])\n", strings.Join(cols, ", ")))
+				copy(cols, idx.Columns)
+				fmt.Fprintf(&b, "\n  @@index([%s])\n", strings.Join(cols, ", "))
 			}
 		}
 

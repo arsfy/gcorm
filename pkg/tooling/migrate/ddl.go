@@ -3,8 +3,11 @@ package migrate
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
+	runtimepkg "github.com/arsfy/gco-orm/pkg/runtime"
+	runtimedialect "github.com/arsfy/gco-orm/pkg/runtime/dialect"
 	"github.com/arsfy/gco-orm/pkg/schema/ir"
 )
 
@@ -17,7 +20,7 @@ type DDLGenerator struct {
 // GenerateUp produces the up migration SQL.
 func (g DDLGenerator) GenerateUp(cs *Changeset) string {
 	var b strings.Builder
-	for _, c := range cs.Changes {
+	for _, c := range g.orderedChanges(cs) {
 		sql := g.changeToUp(c, cs)
 		if sql != "" {
 			b.WriteString(sql)
@@ -30,9 +33,9 @@ func (g DDLGenerator) GenerateUp(cs *Changeset) string {
 // GenerateDown produces the best-effort down migration SQL.
 func (g DDLGenerator) GenerateDown(cs *Changeset) string {
 	var b strings.Builder
-	// Reverse order for down migration.
-	for i := len(cs.Changes) - 1; i >= 0; i-- {
-		c := cs.Changes[i]
+	ordered := g.orderedChanges(cs)
+	for i := len(ordered) - 1; i >= 0; i-- {
+		c := ordered[i]
 		sql := g.changeToDown(c, cs)
 		if sql != "" {
 			b.WriteString(sql)
@@ -107,24 +110,6 @@ func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
 			continue
 		}
 		cols = append(cols, fmt.Sprintf("  UNIQUE (%s)", strings.Join(fields, ", ")))
-	}
-
-	for _, rel := range model.Relations {
-		if len(rel.Fields) == 0 || len(rel.References) == 0 {
-			continue
-		}
-		targetModel := findModel(g.Schema, rel.ToModel)
-		refTable := rel.ToModel
-		if targetModel != nil {
-			refTable = targetModel.TableName()
-		}
-		localFields := g.quoteIDs(normalizeFieldNames(model, rel.Fields))
-		refFields := g.quoteIDs(normalizeFieldNames(targetModel, rel.References))
-		cols = append(cols, fmt.Sprintf("  CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
-			g.quoteID(fmt.Sprintf("fk_%s_%s", model.TableName(), strings.Join(normalizeFieldNames(model, rel.Fields), "_"))),
-			strings.Join(localFields, ", "),
-			g.quoteID(refTable),
-			strings.Join(refFields, ", ")))
 	}
 
 	b.WriteString(strings.Join(cols, ",\n"))
@@ -309,6 +294,153 @@ func (g DDLGenerator) addFKSQL(c Change) string {
 		refTable, strings.Join(refFields, ", "))
 }
 
+func (g DDLGenerator) orderedChanges(cs *Changeset) []Change {
+	if cs == nil || len(cs.Changes) == 0 {
+		return nil
+	}
+
+	dropFKs := make([]Change, 0)
+	others := make([]Change, 0)
+	createTables := make([]Change, 0)
+	addFKs := make([]Change, 0)
+	dropTables := make([]Change, 0)
+
+	for _, c := range cs.Changes {
+		switch c.Type {
+		case DropFK:
+			dropFKs = append(dropFKs, c)
+		case CreateTable:
+			createTables = append(createTables, c)
+		case AddFK:
+			addFKs = append(addFKs, c)
+		case DropTable:
+			dropTables = append(dropTables, c)
+		default:
+			others = append(others, c)
+		}
+	}
+
+	ordered := make([]Change, 0, len(cs.Changes))
+	ordered = append(ordered, dropFKs...)
+	ordered = append(ordered, others...)
+	ordered = append(ordered, g.sortTableChanges(createTables, cs.New, false)...)
+	ordered = append(ordered, addFKs...)
+	ordered = append(ordered, g.sortTableChanges(dropTables, cs.Old, true)...)
+	return ordered
+}
+
+func (g DDLGenerator) sortTableChanges(changes []Change, schema *ir.Schema, reverse bool) []Change {
+	if len(changes) < 2 {
+		return changes
+	}
+
+	changeByTable := make(map[string]Change, len(changes))
+	tables := make([]string, 0, len(changes))
+	for _, c := range changes {
+		changeByTable[c.Model] = c
+		tables = append(tables, c.Model)
+	}
+
+	orderedTables := topoSortTables(schema, tables)
+	if reverse {
+		for i, j := 0, len(orderedTables)-1; i < j; i, j = i+1, j-1 {
+			orderedTables[i], orderedTables[j] = orderedTables[j], orderedTables[i]
+		}
+	}
+
+	ordered := make([]Change, 0, len(changes))
+	for _, tableName := range orderedTables {
+		ordered = append(ordered, changeByTable[tableName])
+	}
+	return ordered
+}
+
+func topoSortTables(schema *ir.Schema, tables []string) []string {
+	if len(tables) == 0 {
+		return nil
+	}
+
+	tableSet := make(map[string]struct{}, len(tables))
+	for _, tableName := range tables {
+		tableSet[tableName] = struct{}{}
+	}
+
+	dependents := make(map[string][]string, len(tables))
+	indegree := make(map[string]int, len(tables))
+	for _, tableName := range tables {
+		indegree[tableName] = 0
+	}
+
+	if schema != nil {
+		for _, model := range schema.Models {
+			fromTable := model.TableName()
+			if _, ok := tableSet[fromTable]; !ok {
+				continue
+			}
+			for _, rel := range model.Relations {
+				if len(rel.Fields) == 0 || len(rel.References) == 0 {
+					continue
+				}
+				targetModel := findModel(schema, rel.ToModel)
+				if targetModel == nil {
+					continue
+				}
+				toTable := targetModel.TableName()
+				if toTable == fromTable {
+					continue
+				}
+				if _, ok := tableSet[toTable]; !ok {
+					continue
+				}
+				dependents[toTable] = append(dependents[toTable], fromTable)
+				indegree[fromTable]++
+			}
+		}
+	}
+
+	queue := make([]string, 0, len(tables))
+	for tableName, degree := range indegree {
+		if degree == 0 {
+			queue = append(queue, tableName)
+		}
+	}
+	sort.Strings(queue)
+
+	ordered := make([]string, 0, len(tables))
+	for len(queue) > 0 {
+		tableName := queue[0]
+		queue = queue[1:]
+		ordered = append(ordered, tableName)
+
+		nextTables := dependents[tableName]
+		sort.Strings(nextTables)
+		for _, dependent := range nextTables {
+			indegree[dependent]--
+			if indegree[dependent] == 0 {
+				queue = append(queue, dependent)
+				sort.Strings(queue)
+			}
+		}
+	}
+
+	if len(ordered) == len(tables) {
+		return ordered
+	}
+
+	remaining := make([]string, 0, len(tables)-len(ordered))
+	seen := make(map[string]struct{}, len(ordered))
+	for _, tableName := range ordered {
+		seen[tableName] = struct{}{}
+	}
+	for _, tableName := range tables {
+		if _, ok := seen[tableName]; !ok {
+			remaining = append(remaining, tableName)
+		}
+	}
+	sort.Strings(remaining)
+	return append(ordered, remaining...)
+}
+
 func (g DDLGenerator) dropFKSQL(c Change) string {
 	tbl := g.quoteID(c.Model)
 	constraintName := g.quoteID(fmt.Sprintf("fk_%s_%s", c.Model, c.Details["fields"]))
@@ -489,8 +621,11 @@ func (g DDLGenerator) defaultExpr(val string) string {
 	if val == "" {
 		return "''"
 	}
-	// Function-style defaults → use as-is.
-	if strings.Contains(val, "(") {
+	if expr, ok := g.mappedDefaultFunction(val); ok {
+		return expr
+	}
+	// Function-style defaults without a dialect-specific rewrite pass through.
+	if isFunctionDefault(val) {
 		return val
 	}
 	// Bare booleans and numbers pass through.
@@ -503,4 +638,63 @@ func (g DDLGenerator) defaultExpr(val string) string {
 		}
 	}
 	return val
+}
+
+func (g DDLGenerator) mappedDefaultFunction(val string) (string, bool) {
+	funcName, args, ok := parseDefaultFunction(val)
+	if !ok {
+		return "", false
+	}
+	if d := g.sqlDialect(); d != nil {
+		return d.DefaultValueExpression(funcName, args), true
+	}
+	return val, true
+}
+
+func (g DDLGenerator) sqlDialect() runtimepkg.Dialect {
+	switch g.Dialect {
+	case "postgresql":
+		return runtimedialect.PostgreSQL{}
+	case "mysql":
+		return runtimedialect.MySQL{}
+	case "sqlite":
+		return runtimedialect.SQLite{}
+	default:
+		return nil
+	}
+}
+
+func parseDefaultFunction(val string) (string, []string, bool) {
+	trimmed := strings.TrimSpace(val)
+	if !isFunctionDefault(trimmed) {
+		return "", nil, false
+	}
+
+	openIdx := strings.IndexByte(trimmed, '(')
+	funcName := strings.TrimSpace(trimmed[:openIdx])
+	argsText := strings.TrimSpace(trimmed[openIdx+1 : len(trimmed)-1])
+	if funcName == "" {
+		return "", nil, false
+	}
+	for _, r := range funcName {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '_' {
+			return "", nil, false
+		}
+	}
+	if argsText == "" {
+		return funcName, nil, true
+	}
+
+	rawArgs := strings.Split(argsText, ",")
+	args := make([]string, 0, len(rawArgs))
+	for _, arg := range rawArgs {
+		args = append(args, strings.TrimSpace(arg))
+	}
+	return funcName, args, true
+}
+
+func isFunctionDefault(val string) bool {
+	trimmed := strings.TrimSpace(val)
+	openIdx := strings.IndexByte(trimmed, '(')
+	return openIdx > 0 && strings.HasSuffix(trimmed, ")")
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -75,10 +77,7 @@ func Run(args []string) error {
 		return fmt.Errorf("ping database: %w", err)
 	}
 
-	currentSchemaName := "public"
-	if targetSchema.Datasource != nil && targetSchema.Datasource.Schema != "" {
-		currentSchemaName = targetSchema.Datasource.Schema
-	}
+	currentSchemaName := resolveSchemaName(targetSchema, dsn)
 
 	currentSchema, err := introspectPostgres(ctx, db, currentSchemaName)
 	if err != nil {
@@ -180,8 +179,17 @@ func loadTargetSchema(schemaPath, configPath string) (*ir.Schema, error) {
 }
 
 func resolveURL(explicitURL string, schema *ir.Schema) (string, string, error) {
+	provider := ""
+	if schema != nil && schema.Datasource != nil {
+		provider = schema.Datasource.Provider
+	}
+
 	if explicitURL != "" {
-		return explicitURL, "--url", nil
+		normalizedURL, err := normalizeConnectionURL(explicitURL, provider)
+		if err != nil {
+			return "", "", err
+		}
+		return normalizedURL, "--url", nil
 	}
 	if schema != nil && schema.Datasource != nil {
 		ds := schema.Datasource
@@ -193,10 +201,18 @@ func resolveURL(explicitURL string, schema *ir.Schema) (string, string, error) {
 			if value == "" {
 				return "", "", fmt.Errorf("datasource url uses env(%q), but %s is not set", ds.EnvVar, ds.EnvVar)
 			}
-			return value, fmt.Sprintf("datasource env(%q)", ds.EnvVar), nil
+			normalizedURL, err := normalizeConnectionURL(value, ds.Provider)
+			if err != nil {
+				return "", "", err
+			}
+			return normalizedURL, fmt.Sprintf("datasource env(%q)", ds.EnvVar), nil
 		}
 		if ds.URL != "" {
-			return ds.URL, "schema datasource", nil
+			normalizedURL, err := normalizeConnectionURL(ds.URL, ds.Provider)
+			if err != nil {
+				return "", "", err
+			}
+			return normalizedURL, "schema datasource", nil
 		}
 	}
 	modelCount := 0
@@ -204,6 +220,83 @@ func resolveURL(explicitURL string, schema *ir.Schema) (string, string, error) {
 		modelCount = len(schema.Models)
 	}
 	return "", "", fmt.Errorf("db push: schema compiled with %d model(s). Push to database requires a connection URL.\nSet datasource url in your .gco schema or provide --url flag.", modelCount)
+}
+
+func normalizeConnectionURL(rawURL, provider string) (string, error) {
+	if provider != "postgresql" && !isPostgresURL(rawURL) {
+		return rawURL, nil
+	}
+	return normalizePostgresURL(rawURL)
+}
+
+func normalizePostgresURL(rawURL string) (string, error) {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parse postgresql connection URL: %w", err)
+	}
+	if parsedURL.Scheme == "" {
+		return rawURL, nil
+	}
+
+	query := parsedURL.Query()
+	if schemaName := strings.TrimSpace(query.Get("schema")); schemaName != "" {
+		query.Del("schema")
+		if strings.TrimSpace(query.Get("search_path")) == "" {
+			query.Set("search_path", schemaName)
+		}
+	}
+	if strings.TrimSpace(query.Get("sslmode")) == "" && isLocalPostgresHost(parsedURL.Hostname()) {
+		query.Set("sslmode", "disable")
+	}
+	parsedURL.RawQuery = query.Encode()
+	return parsedURL.String(), nil
+}
+
+func resolveSchemaName(schema *ir.Schema, dsn string) string {
+	if schema != nil && schema.Datasource != nil && schema.Datasource.Schema != "" {
+		return schema.Datasource.Schema
+	}
+	if schemaName := postgresSchemaFromURL(dsn); schemaName != "" {
+		return schemaName
+	}
+	return "public"
+}
+
+func postgresSchemaFromURL(rawURL string) string {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+
+	query := parsedURL.Query()
+	if schemaName := strings.TrimSpace(query.Get("schema")); schemaName != "" {
+		return schemaName
+	}
+
+	searchPath := strings.TrimSpace(query.Get("search_path"))
+	if searchPath == "" {
+		return ""
+	}
+	parts := strings.Split(searchPath, ",")
+	first := strings.TrimSpace(parts[0])
+	return strings.Trim(first, `"`)
+}
+
+func isPostgresURL(rawURL string) bool {
+	lower := strings.ToLower(rawURL)
+	return strings.HasPrefix(lower, "postgresql://") || strings.HasPrefix(lower, "postgres://")
+}
+
+func isLocalPostgresHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	lower := strings.ToLower(host)
+	if lower == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func riskyChanges(cs *migrate.Changeset) []string {

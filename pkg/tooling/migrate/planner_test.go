@@ -54,6 +54,15 @@ func testSchema(models ...*ir.Model) *ir.Schema {
 	return &ir.Schema{Models: models}
 }
 
+func testRelation(fromModel, toModel string, fields, references []string) *ir.Relation {
+	return &ir.Relation{
+		FromModel:  fromModel,
+		ToModel:    toModel,
+		Fields:     fields,
+		References: references,
+	}
+}
+
 // hasChange returns true if the changeset contains a change matching the given
 // type and model (and optionally field, if non-empty).
 func hasChange(cs *Changeset, ct ChangeType, model, field string) bool {
@@ -287,6 +296,129 @@ func TestDDLGenerateUp_PostgreSQL(t *testing.T) {
 	}
 	if !strings.Contains(sql, "ADD COLUMN") {
 		t.Error("expected ADD COLUMN for name")
+	}
+}
+
+func TestDDLGenerateUp_PostgreSQLDefaultFunctions(t *testing.T) {
+	user := testModel("users",
+		testFieldWithDefault("id", "String", &ir.DefaultValue{IsFunction: true, FuncName: "uuid"}),
+		testFieldWithDefault("createdAt", "DateTime", &ir.DefaultValue{IsFunction: true, FuncName: "now"}),
+	)
+	cs := &Changeset{
+		Changes: []Change{{Type: CreateTable, Model: "users", Rollback: SafeRollback}},
+		New:     testSchema(user),
+	}
+	gen := DDLGenerator{Dialect: "postgresql", Schema: cs.New}
+
+	sql := gen.GenerateUp(cs)
+
+	if !strings.Contains(sql, "DEFAULT gen_random_uuid()") {
+		t.Fatalf("expected PostgreSQL UUID default mapping, got:\n%s", sql)
+	}
+	if !strings.Contains(sql, "DEFAULT NOW()") {
+		t.Fatalf("expected PostgreSQL now() default mapping, got:\n%s", sql)
+	}
+	if strings.Contains(sql, "DEFAULT uuid()") {
+		t.Fatalf("unexpected raw uuid() default in PostgreSQL DDL:\n%s", sql)
+	}
+	if strings.Contains(sql, "DEFAULT now()") {
+		t.Fatalf("unexpected raw now() default in PostgreSQL DDL:\n%s", sql)
+	}
+}
+
+func TestDDLAlterDefaultUsesDialectMapping(t *testing.T) {
+	gen := DDLGenerator{Dialect: "postgresql"}
+	sql := gen.alterDefaultSQL(Change{Type: AlterDefault, Model: "users", Field: "id", NewValue: "uuid()"})
+
+	if !strings.Contains(sql, "SET DEFAULT gen_random_uuid()") {
+		t.Fatalf("expected PostgreSQL UUID default mapping in ALTER DEFAULT, got:\n%s", sql)
+	}
+}
+
+func TestDiffAddsForeignKeysForNewTables(t *testing.T) {
+	user := testModel("User", testField("id", "String"))
+	user.DBName = "users"
+	post := testModel(
+		"Post",
+		testField("id", "String"),
+		testField("authorId", "String"),
+	)
+	post.DBName = "posts"
+	post.Relations = []*ir.Relation{testRelation("Post", "User", []string{"authorId"}, []string{"id"})}
+
+	cs := Diff(&ir.Schema{}, testSchema(post, user))
+
+	if !hasChange(cs, CreateTable, "posts", "") {
+		t.Fatal("expected CreateTable for posts")
+	}
+	if !hasChange(cs, CreateTable, "users", "") {
+		t.Fatal("expected CreateTable for users")
+	}
+	if !hasChange(cs, AddFK, "posts", "") {
+		t.Fatal("expected AddFK for posts in initial schema")
+	}
+}
+
+func TestDDLGenerateUpOrdersForeignKeysAfterTables(t *testing.T) {
+	user := testModel("User", testField("id", "String"))
+	user.DBName = "users"
+	post := testModel(
+		"Post",
+		testFieldWithDefault("id", "String", &ir.DefaultValue{IsFunction: true, FuncName: "uuid"}),
+		testField("authorId", "String"),
+	)
+	post.DBName = "posts"
+	post.Relations = []*ir.Relation{testRelation("Post", "User", []string{"authorId"}, []string{"id"})}
+
+	newSchema := testSchema(post, user)
+	cs := Diff(&ir.Schema{}, newSchema)
+	gen := DDLGenerator{Dialect: "postgresql", Schema: newSchema}
+
+	sql := gen.GenerateUp(cs)
+
+	usersIdx := strings.Index(sql, `CREATE TABLE "users"`)
+	postsIdx := strings.Index(sql, `CREATE TABLE "posts"`)
+	fkIdx := strings.Index(sql, `ALTER TABLE "posts" ADD CONSTRAINT "fk_posts_authorId" FOREIGN KEY ("authorId") REFERENCES "users" ("id")`)
+	if usersIdx == -1 || postsIdx == -1 || fkIdx == -1 {
+		t.Fatalf("expected users table, posts table, and FK statement in SQL:\n%s", sql)
+	}
+	if fkIdx < usersIdx || fkIdx < postsIdx {
+		t.Fatalf("expected FK statement after both CREATE TABLE statements:\n%s", sql)
+	}
+	postsCreateEnd := strings.Index(sql[postsIdx:], `);`)
+	if postsCreateEnd == -1 {
+		t.Fatalf("could not locate end of posts CREATE TABLE statement:\n%s", sql)
+	}
+	postsCreateSQL := sql[postsIdx : postsIdx+postsCreateEnd+2]
+	if strings.Contains(postsCreateSQL, `FOREIGN KEY`) {
+		t.Fatalf("expected CREATE TABLE posts without inline foreign key:\n%s", postsCreateSQL)
+	}
+}
+
+func TestDDLGenerateUpDropsTablesByDependency(t *testing.T) {
+	user := testModel("User", testField("id", "String"))
+	user.DBName = "users"
+	post := testModel(
+		"Post",
+		testField("id", "String"),
+		testField("authorId", "String"),
+	)
+	post.DBName = "posts"
+	post.Relations = []*ir.Relation{testRelation("Post", "User", []string{"authorId"}, []string{"id"})}
+
+	oldSchema := testSchema(user, post)
+	cs := Diff(oldSchema, &ir.Schema{})
+	gen := DDLGenerator{Dialect: "postgresql", Schema: &ir.Schema{}}
+
+	sql := gen.GenerateUp(cs)
+
+	postsIdx := strings.Index(sql, `DROP TABLE "posts";`)
+	usersIdx := strings.Index(sql, `DROP TABLE "users";`)
+	if postsIdx == -1 || usersIdx == -1 {
+		t.Fatalf("expected drop statements for posts and users:\n%s", sql)
+	}
+	if postsIdx > usersIdx {
+		t.Fatalf("expected dependent table to drop before referenced table:\n%s", sql)
 	}
 }
 

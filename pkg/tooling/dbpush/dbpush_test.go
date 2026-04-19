@@ -1,6 +1,7 @@
 package dbpush
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 
@@ -23,6 +24,19 @@ func TestResolveURLUsesSchemaDatasourceURL(t *testing.T) {
 	}
 	if got == "" {
 		t.Fatal("resolveURL() returned empty URL")
+	}
+	parsedURL, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("url.Parse() error = %v", err)
+	}
+	if parsedURL.Query().Get("schema") != "" {
+		t.Fatalf("resolveURL() kept schema query param: %q", got)
+	}
+	if parsedURL.Query().Get("search_path") != "public" {
+		t.Fatalf("resolveURL() search_path = %q, want %q", parsedURL.Query().Get("search_path"), "public")
+	}
+	if parsedURL.Query().Get("sslmode") != "disable" {
+		t.Fatalf("resolveURL() sslmode = %q, want %q", parsedURL.Query().Get("sslmode"), "disable")
 	}
 	if source != "schema datasource" {
 		t.Fatalf("resolveURL() source = %q, want %q", source, "schema datasource")
@@ -47,8 +61,60 @@ func TestResolveURLUsesDatasourceEnvURL(t *testing.T) {
 	if got == "" {
 		t.Fatal("resolveURL() returned empty URL")
 	}
+	parsedURL, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("url.Parse() error = %v", err)
+	}
+	if parsedURL.Query().Get("search_path") != "public" {
+		t.Fatalf("resolveURL() search_path = %q, want %q", parsedURL.Query().Get("search_path"), "public")
+	}
 	if !strings.Contains(source, `env("DATABASE_URL")`) {
 		t.Fatalf("resolveURL() source = %q", source)
+	}
+}
+
+func TestResolveURLPreservesExistingSearchPathAndSSLMode(t *testing.T) {
+	schema := &ir.Schema{
+		Datasource: &ir.Datasource{
+			Provider: "postgresql",
+			URL:      "postgresql://postgres:secret@db.example.com:5432/postgres?schema=tenant&search_path=custom&sslmode=require",
+		},
+	}
+
+	got, _, err := resolveURL("", schema)
+	if err != nil {
+		t.Fatalf("resolveURL() error = %v", err)
+	}
+	parsedURL, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("url.Parse() error = %v", err)
+	}
+	if parsedURL.Query().Get("schema") != "" {
+		t.Fatalf("resolveURL() kept schema query param: %q", got)
+	}
+	if parsedURL.Query().Get("search_path") != "custom" {
+		t.Fatalf("resolveURL() search_path = %q, want %q", parsedURL.Query().Get("search_path"), "custom")
+	}
+	if parsedURL.Query().Get("sslmode") != "require" {
+		t.Fatalf("resolveURL() sslmode = %q, want %q", parsedURL.Query().Get("sslmode"), "require")
+	}
+}
+
+func TestResolveSchemaNameUsesDatasourceSchemaFirst(t *testing.T) {
+	schema := &ir.Schema{
+		Datasource: &ir.Datasource{Schema: "app"},
+	}
+
+	got := resolveSchemaName(schema, "postgresql://postgres:secret@localhost:15432/postgres?search_path=public")
+	if got != "app" {
+		t.Fatalf("resolveSchemaName() = %q, want %q", got, "app")
+	}
+}
+
+func TestResolveSchemaNameUsesSearchPathFromURL(t *testing.T) {
+	got := resolveSchemaName(nil, "postgresql://postgres:secret@localhost:15432/postgres?search_path=tenant,public")
+	if got != "tenant" {
+		t.Fatalf("resolveSchemaName() = %q, want %q", got, "tenant")
 	}
 }
 

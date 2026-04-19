@@ -84,6 +84,7 @@ func Diff(old, new *ir.Schema) *Changeset {
 	oldModels := indexModels(old.Models)
 	newModels := indexModels(new.Models)
 	allNames := mergedSortedKeys(oldModels, newModels)
+	var createdTables []string
 
 	for _, name := range allNames {
 		oldM, inOld := oldModels[name]
@@ -92,12 +93,15 @@ func Diff(old, new *ir.Schema) *Changeset {
 		switch {
 		case inNew && !inOld:
 			cs.add(Change{Type: CreateTable, Model: name})
+			createdTables = append(createdTables, name)
 		case inOld && !inNew:
 			cs.add(Change{Type: DropTable, Model: name})
 		default:
 			compareModels(cs, old, new, oldM, newM)
 		}
 	}
+
+	addForeignKeysForCreatedTables(cs, newModels, createdTables)
 
 	return cs
 }
@@ -361,6 +365,32 @@ func compareForeignKeys(cs *Changeset, model string, oldSchema, newSchema *ir.Sc
 					"fields":     strings.Join(or.Fields, ","),
 					"references": strings.Join(or.References, ","),
 					"toModel":    or.ToModel,
+				},
+			})
+		}
+	}
+}
+
+func addForeignKeysForCreatedTables(cs *Changeset, newModels map[string]*ir.Model, createdTables []string) {
+	for _, tableName := range createdTables {
+		model := newModels[tableName]
+		if model == nil {
+			continue
+		}
+		relations := mapFKRelations(cs.New, model, model.Relations)
+		keys := make([]string, 0, len(relations))
+		for key := range relations {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			rel := relations[key]
+			cs.add(Change{
+				Type: AddFK, Model: tableName, NewValue: rel.ToModel,
+				Details: map[string]string{
+					"fields":     strings.Join(rel.Fields, ","),
+					"references": strings.Join(rel.References, ","),
+					"toModel":    rel.ToModel,
 				},
 			})
 		}
