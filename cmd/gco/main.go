@@ -68,7 +68,7 @@ Usage:
   gco <command> [flags]
 
 Commands:
-	init         Initialize a new GCO ORM schema interactively
+  init         Initialize a new GCO ORM schema interactively
   generate     Generate Go client code from schema
   fmt          Format schema files
   validate     Validate schema files

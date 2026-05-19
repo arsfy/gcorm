@@ -30,6 +30,28 @@ enum Role {
 }
 `
 
+const schemaWithPost = `datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator go {
+  provider = "gco-go"
+  output   = "./testout"
+  package  = "db"
+}
+
+model User {
+  id    String @id @default(uuid())
+  email String @unique
+}
+
+model Post {
+  id    String @id @default(uuid())
+  title String
+}
+`
+
 // writeSchema creates a schema directory with a .gco file and returns its path.
 func writeSchema(t *testing.T, dir, schema string) string {
 	t.Helper()
@@ -98,7 +120,7 @@ func TestRunGenerateFromSchemaFiles(t *testing.T) {
 		filepath.Join("model", "enums.go"),
 		filepath.Join("query", "user.go"),
 		filepath.Join("client", "client.go"),
-		"AI_USAGE.md",
+		"GUIDE.md",
 	}
 	for _, rel := range expected {
 		path := filepath.Join(outputDir, rel)
@@ -116,19 +138,19 @@ func TestRunGenerateFromSchemaFiles(t *testing.T) {
 		}
 	}
 
-	aiDoc, err := os.ReadFile(filepath.Join(outputDir, "AI_USAGE.md"))
+	guideDoc, err := os.ReadFile(filepath.Join(outputDir, "GUIDE.md"))
 	if err != nil {
-		t.Fatalf("read AI usage doc: %v", err)
+		t.Fatalf("read guide doc: %v", err)
 	}
-	aiText := string(aiDoc)
-	if !strings.Contains(aiText, "# AI Usage Guide for Generated GCO Client") {
-		t.Fatalf("AI usage doc missing title: %s", aiText)
+	guideText := string(guideDoc)
+	if !strings.Contains(guideText, "# Guide for Generated GCO Client") {
+		t.Fatalf("guide doc missing title: %s", guideText)
 	}
-	if !strings.Contains(aiText, "## CRUD Builder Pattern") {
-		t.Fatalf("AI usage doc missing CRUD section: %s", aiText)
+	if !strings.Contains(guideText, "## CRUD Builder Pattern") {
+		t.Fatalf("guide doc missing CRUD section: %s", guideText)
 	}
-	if !strings.Contains(aiText, "query.User.Email") {
-		t.Fatalf("AI usage doc missing model-specific query example: %s", aiText)
+	if !strings.Contains(guideText, "query.User.Email") {
+		t.Fatalf("guide doc missing model-specific query example: %s", guideText)
 	}
 }
 
@@ -156,6 +178,41 @@ func TestRunOutputDirectoryCreation(t *testing.T) {
 	}
 	if !info.IsDir() {
 		t.Error("output path is not a directory")
+	}
+}
+
+func TestRunRemovesStaleGeneratedFiles(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+	schemaDir := writeSchema(t, dir, schemaWithPost)
+
+	if err := Run([]string{"--schema", schemaDir}); err != nil {
+		t.Fatalf("first Run() error: %v", err)
+	}
+
+	outputDir := filepath.Join(dir, "testout")
+	staleGenerated := filepath.Join(outputDir, "query", "post.go")
+	if _, err := os.Stat(staleGenerated); err != nil {
+		t.Fatalf("expected generated post query before schema change: %v", err)
+	}
+
+	manualFile := filepath.Join(outputDir, "query", "manual.go")
+	if err := os.WriteFile(manualFile, []byte("package query\n"), 0o644); err != nil {
+		t.Fatalf("write manual file: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(schemaDir, "main.gco"), []byte(validSchema), 0o644); err != nil {
+		t.Fatalf("update schema: %v", err)
+	}
+	if err := Run([]string{"--schema", schemaDir}); err != nil {
+		t.Fatalf("second Run() error: %v", err)
+	}
+
+	if _, err := os.Stat(staleGenerated); !os.IsNotExist(err) {
+		t.Fatalf("stale generated file still exists after schema change")
+	}
+	if _, err := os.Stat(manualFile); err != nil {
+		t.Fatalf("manual file should be preserved: %v", err)
 	}
 }
 
