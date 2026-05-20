@@ -232,7 +232,7 @@ func (g DDLGenerator) dropIndexSQL(c Change) string {
 	case "mysql":
 		return fmt.Sprintf("DROP INDEX %s ON %s;", g.quoteID(name), g.quoteID(c.Model))
 	default:
-		return fmt.Sprintf("DROP INDEX %s;", g.quoteID(name))
+		return fmt.Sprintf("DROP INDEX IF EXISTS %s;", g.quoteID(name))
 	}
 }
 
@@ -255,7 +255,7 @@ func (g DDLGenerator) dropUniqueSQL(c Change) string {
 	case "mysql":
 		return fmt.Sprintf("DROP INDEX %s ON %s;", g.quoteID(name), g.quoteID(c.Model))
 	default:
-		return fmt.Sprintf("DROP INDEX %s;", g.quoteID(name))
+		return fmt.Sprintf("DROP INDEX IF EXISTS %s;", g.quoteID(name))
 	}
 }
 
@@ -268,7 +268,7 @@ func (g DDLGenerator) changePKSQL(c Change) string {
 		case "mysql":
 			parts = append(parts, fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY;", tbl))
 		default:
-			parts = append(parts, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;",
+			parts = append(parts, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;",
 				tbl, g.quoteID(c.Model+"_pkey")))
 		}
 	}
@@ -449,7 +449,7 @@ func (g DDLGenerator) dropFKSQL(c Change) string {
 	case "mysql":
 		return fmt.Sprintf("ALTER TABLE %s DROP FOREIGN KEY %s;", tbl, constraintName)
 	default:
-		return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;", tbl, constraintName)
+		return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;", tbl, constraintName)
 	}
 }
 

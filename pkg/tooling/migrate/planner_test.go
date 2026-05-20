@@ -333,11 +333,29 @@ func TestDDLGenerateUp_PostgreSQLDefaultFunctions(t *testing.T) {
 	if !strings.Contains(sql, "DEFAULT NOW()") {
 		t.Fatalf("expected PostgreSQL now() default mapping, got:\n%s", sql)
 	}
+	if !strings.Contains(sql, `"created_at"`) {
+		t.Fatalf("expected camelCase field to use snake_case column, got:\n%s", sql)
+	}
+	if strings.Contains(sql, `"createdAt"`) {
+		t.Fatalf("unexpected camelCase column in DDL:\n%s", sql)
+	}
 	if strings.Contains(sql, "DEFAULT uuid()") {
 		t.Fatalf("unexpected raw uuid() default in PostgreSQL DDL:\n%s", sql)
 	}
 	if strings.Contains(sql, "DEFAULT now()") {
 		t.Fatalf("unexpected raw now() default in PostgreSQL DDL:\n%s", sql)
+	}
+}
+
+func TestColumnNameDefaultsToSnakeCase(t *testing.T) {
+	field := testField("abcAbc", "String")
+	if got := columnName(field); got != "abc_abc" {
+		t.Fatalf("columnName() = %q, want %q", got, "abc_abc")
+	}
+
+	field.DBName = "custom_column"
+	if got := columnName(field); got != "custom_column" {
+		t.Fatalf("columnName() with DBName = %q, want %q", got, "custom_column")
 	}
 }
 
@@ -393,7 +411,7 @@ func TestDDLGenerateUpOrdersForeignKeysAfterTables(t *testing.T) {
 
 	usersIdx := strings.Index(sql, `CREATE TABLE "users"`)
 	postsIdx := strings.Index(sql, `CREATE TABLE "posts"`)
-	fkIdx := strings.Index(sql, `ALTER TABLE "posts" ADD CONSTRAINT "fk_posts_authorId" FOREIGN KEY ("authorId") REFERENCES "users" ("id")`)
+	fkIdx := strings.Index(sql, `ALTER TABLE "posts" ADD CONSTRAINT "fk_posts_author_id" FOREIGN KEY ("author_id") REFERENCES "users" ("id")`)
 	if usersIdx == -1 || postsIdx == -1 || fkIdx == -1 {
 		t.Fatalf("expected users table, posts table, and FK statement in SQL:\n%s", sql)
 	}
@@ -493,6 +511,73 @@ func TestDDLGenerateDown(t *testing.T) {
 	// Reverse of AddColumn → DROP COLUMN
 	if !strings.Contains(sql, "DROP COLUMN") {
 		t.Errorf("expected DROP COLUMN in down SQL, got:\n%s", sql)
+	}
+}
+
+func TestDDLDropIndexUsesIfExists(t *testing.T) {
+	change := Change{
+		Type:     DropIndex,
+		Model:    "post_tags",
+		OldValue: "idx_post_tags_post_id_tag_id",
+		Details:  map[string]string{"fields": "post_id,tag_id"},
+	}
+
+	pg := DDLGenerator{Dialect: "postgresql"}.dropIndexSQL(change)
+	if pg != `DROP INDEX IF EXISTS "idx_post_tags_post_id_tag_id";` {
+		t.Fatalf("postgresql drop index SQL = %q", pg)
+	}
+
+	sqlite := DDLGenerator{Dialect: "sqlite"}.dropIndexSQL(change)
+	if sqlite != `DROP INDEX IF EXISTS "idx_post_tags_post_id_tag_id";` {
+		t.Fatalf("sqlite drop index SQL = %q", sqlite)
+	}
+
+	mysql := DDLGenerator{Dialect: "mysql"}.dropIndexSQL(change)
+	if mysql != "DROP INDEX `idx_post_tags_post_id_tag_id` ON `post_tags`;" {
+		t.Fatalf("mysql drop index SQL = %q", mysql)
+	}
+}
+
+func TestDDLDropUniqueUsesIfExists(t *testing.T) {
+	change := Change{
+		Type:     DropUnique,
+		Model:    "users",
+		OldValue: "uq_users_email",
+		Details:  map[string]string{"fields": "email"},
+	}
+
+	pg := DDLGenerator{Dialect: "postgresql"}.dropUniqueSQL(change)
+	if pg != `DROP INDEX IF EXISTS "uq_users_email";` {
+		t.Fatalf("postgresql drop unique SQL = %q", pg)
+	}
+}
+
+func TestDDLChangePKDropUsesIfExists(t *testing.T) {
+	change := Change{
+		Type:     ChangePK,
+		Model:    "post_tags",
+		OldValue: "post_id,tag_id",
+		NewValue: "post_id",
+	}
+
+	pg := DDLGenerator{Dialect: "postgresql"}.changePKSQL(change)
+	if !strings.Contains(pg, `ALTER TABLE "post_tags" DROP CONSTRAINT IF EXISTS "post_tags_pkey";`) {
+		t.Fatalf("postgresql change PK SQL missing IF EXISTS:\n%s", pg)
+	}
+}
+
+func TestDDLDropFKUsesIfExists(t *testing.T) {
+	change := Change{
+		Type:  DropFK,
+		Model: "post_tags",
+		Details: map[string]string{
+			"fields": "post_id",
+		},
+	}
+
+	pg := DDLGenerator{Dialect: "postgresql"}.dropFKSQL(change)
+	if pg != `ALTER TABLE "post_tags" DROP CONSTRAINT IF EXISTS "fk_post_tags_post_id";` {
+		t.Fatalf("postgresql drop FK SQL = %q", pg)
 	}
 }
 

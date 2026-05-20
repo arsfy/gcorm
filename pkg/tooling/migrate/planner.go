@@ -5,6 +5,7 @@ package migrate
 import (
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/arsfy/gco-orm/pkg/schema/ir"
 )
@@ -511,7 +512,18 @@ func columnName(f *ir.Field) string {
 	if f.DBName != "" {
 		return f.DBName
 	}
-	return f.Name
+	return toSnakeCase(f.Name)
+}
+
+func toSnakeCase(s string) string {
+	var result []rune
+	for i, r := range s {
+		if unicode.IsUpper(r) && i > 0 {
+			result = append(result, '_')
+		}
+		result = append(result, unicode.ToLower(r))
+	}
+	return string(result)
 }
 
 func coalesceField(values ...*ir.Field) *ir.Field {

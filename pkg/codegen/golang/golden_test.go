@@ -253,6 +253,48 @@ func TestGoldenQueryOutput(t *testing.T) {
 	}
 }
 
+func TestGoldenColumnNamesUseResolvedDBName(t *testing.T) {
+	schema := &ir.Schema{
+		Datasource: &ir.Datasource{Provider: "postgresql"},
+		Generators: []*ir.Generator{{Name: "go", Package: "db", Output: "./gen"}},
+		Models: []*ir.Model{
+			{
+				Name: "Thing",
+				Fields: []*ir.Field{
+					{Name: "id", Type: ir.FieldKindScalar, ScalarType: "String", IsID: true},
+					{Name: "abcAbc", Type: ir.FieldKindScalar, ScalarType: "String"},
+					{Name: "mappedField", DBName: "custom_column", Type: ir.FieldKindScalar, ScalarType: "String"},
+				},
+				PrimaryKey: &ir.PrimaryKey{Fields: []string{"id"}},
+			},
+		},
+	}
+	g := NewGenerator(schema)
+	files, err := g.Generate()
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	models := fileContent(t, files, "model/models.go")
+	if !strings.Contains(models, `db:"abc_abc"`) {
+		t.Fatalf("model should use snake_case db tag for abcAbc:\n%s", models)
+	}
+	if !strings.Contains(models, `db:"custom_column"`) {
+		t.Fatalf("model should respect explicit DBName:\n%s", models)
+	}
+
+	query := fileContent(t, files, "query/thing.go")
+	if !strings.Contains(query, `Field: "abc_abc"`) {
+		t.Fatalf("query should use snake_case column for abcAbc:\n%s", query)
+	}
+	if !strings.Contains(query, `Field: "custom_column"`) {
+		t.Fatalf("query should respect explicit DBName:\n%s", query)
+	}
+	if strings.Contains(query, `Field: "abcAbc"`) {
+		t.Fatalf("query should not use raw camelCase field name:\n%s", query)
+	}
+}
+
 func TestGoldenClientRealMethods(t *testing.T) {
 	files := generateGoldenFiles(t)
 	content := fileContent(t, files, "client/client.go")
