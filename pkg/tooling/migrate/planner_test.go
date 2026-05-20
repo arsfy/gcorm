@@ -177,6 +177,21 @@ func TestDiff_AddIndex(t *testing.T) {
 	}
 }
 
+func TestDiff_DefaultIndexNameMatchesIntrospectedIndex(t *testing.T) {
+	oldPost := testModel("Post", testField("id", "Int"), testField("change", "String"))
+	oldPost.DBName = "posts"
+	oldPost.Indexes = []*ir.Index{{Name: "idx_posts_change", Fields: []string{"change"}}}
+
+	newPost := testModel("Post", testField("id", "Int"), testField("change", "String"))
+	newPost.DBName = "posts"
+	newPost.Indexes = []*ir.Index{{Fields: []string{"change"}}}
+
+	cs := Diff(testSchema(oldPost), testSchema(newPost))
+	if hasChange(cs, AddIndex, "posts", "") || hasChange(cs, DropIndex, "posts", "") {
+		t.Fatalf("expected default-named existing index to be reused, got changes: %+v", cs.Changes)
+	}
+}
+
 func TestDiff_ComplexScenario(t *testing.T) {
 	old := testSchema(
 		testModel("User", testField("id", "Int"), testField("name", "String"), testField("age", "String")),

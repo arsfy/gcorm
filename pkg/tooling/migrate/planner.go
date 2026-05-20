@@ -267,10 +267,25 @@ func mapIndexes(model *ir.Model, idxs []*ir.Index) map[string]*ir.Index {
 }
 
 func idxKey(model *ir.Model, idx *ir.Index) string {
+	return effectiveIndexName(model, idx)
+}
+
+func effectiveIndexName(model *ir.Model, idx *ir.Index) string {
+	if idx == nil {
+		return ""
+	}
 	if idx.Name != "" {
 		return idx.Name
 	}
-	return strings.Join(normalizeFieldNames(model, idx.Fields), ",")
+	return defaultIndexName(model, normalizeFieldNames(model, idx.Fields))
+}
+
+func defaultIndexName(model *ir.Model, fields []string) string {
+	tableName := ""
+	if model != nil {
+		tableName = model.TableName()
+	}
+	return "idx_" + tableName + "_" + strings.Join(fields, "_")
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +549,7 @@ func normalizedIndex(model *ir.Model, idx *ir.Index) *ir.Index {
 	}
 	clone := *idx
 	clone.Fields = normalizeFieldNames(model, idx.Fields)
+	clone.Name = effectiveIndexName(model, &clone)
 	return &clone
 }
 
