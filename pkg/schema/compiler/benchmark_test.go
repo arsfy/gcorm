@@ -8,14 +8,14 @@ import (
 )
 
 func BenchmarkCompile(b *testing.B) {
-	source, err := os.ReadFile("../../../testdata/full_schema.gco")
+	source, err := os.ReadFile("../../../testdata/full_schema.gcorm")
 	if err != nil {
 		b.Fatal(err)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ds, err := parser.ParseMulti(map[string][]byte{"full_schema.gco": source})
+		ds, err := parser.ParseMulti(map[string][]byte{"full_schema.gcorm": source})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -27,14 +27,14 @@ func BenchmarkCompile(b *testing.B) {
 }
 
 func BenchmarkParseOnly(b *testing.B) {
-	source, err := os.ReadFile("../../../testdata/full_schema.gco")
+	source, err := os.ReadFile("../../../testdata/full_schema.gcorm")
 	if err != nil {
 		b.Fatal(err)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := parser.ParseMulti(map[string][]byte{"full_schema.gco": source})
+		_, err := parser.ParseMulti(map[string][]byte{"full_schema.gcorm": source})
 		if err != nil {
 			b.Fatal(err)
 		}

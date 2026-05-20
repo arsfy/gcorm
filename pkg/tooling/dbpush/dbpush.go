@@ -151,7 +151,7 @@ func loadTargetSchema(schemaPath, configPath string) (*ir.Schema, error) {
 		return nil, err
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("no .gco schema files found in %v", roots)
+		return nil, fmt.Errorf("no .gcorm schema files found in %v", roots)
 	}
 
 	fileContents := make(map[string][]byte, len(files))
@@ -219,7 +219,7 @@ func resolveURL(explicitURL string, schema *ir.Schema) (string, string, error) {
 	if schema != nil {
 		modelCount = len(schema.Models)
 	}
-	return "", "", fmt.Errorf("db push: schema compiled with %d model(s). Push to database requires a connection URL.\nSet datasource url in your .gco schema or provide --url flag.", modelCount)
+	return "", "", fmt.Errorf("db push: schema compiled with %d model(s). Push to database requires a connection URL.\nSet datasource url in your .gcorm schema or provide --url flag.", modelCount)
 }
 
 func normalizeConnectionURL(rawURL, provider string) (string, error) {

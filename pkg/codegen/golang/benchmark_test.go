@@ -9,11 +9,11 @@ import (
 )
 
 func BenchmarkCodegen(b *testing.B) {
-	source, err := os.ReadFile("../../../testdata/full_schema.gco")
+	source, err := os.ReadFile("../../../testdata/full_schema.gcorm")
 	if err != nil {
 		b.Fatal(err)
 	}
-	ds, err := parser.ParseMulti(map[string][]byte{"full_schema.gco": source})
+	ds, err := parser.ParseMulti(map[string][]byte{"full_schema.gcorm": source})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -33,11 +33,11 @@ func BenchmarkCodegen(b *testing.B) {
 }
 
 func BenchmarkCodeSize(b *testing.B) {
-	source, err := os.ReadFile("../../../testdata/full_schema.gco")
+	source, err := os.ReadFile("../../../testdata/full_schema.gcorm")
 	if err != nil {
 		b.Fatal(err)
 	}
-	ds, err := parser.ParseMulti(map[string][]byte{"full_schema.gco": source})
+	ds, err := parser.ParseMulti(map[string][]byte{"full_schema.gcorm": source})
 	if err != nil {
 		b.Fatal(err)
 	}

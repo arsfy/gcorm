@@ -133,8 +133,8 @@ func TestDiscoverSchemaRootsConflict(t *testing.T) {
 
 func TestDiscoverSchemaFiles(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "models.gco"), []byte("model X {}"), 0o644)
-	os.WriteFile(filepath.Join(dir, "enums.gco"), []byte("enum Y { A }"), 0o644)
+	os.WriteFile(filepath.Join(dir, "models.gcorm"), []byte("model X {}"), 0o644)
+	os.WriteFile(filepath.Join(dir, "enums.gcorm"), []byte("enum Y { A }"), 0o644)
 	os.WriteFile(filepath.Join(dir, "readme.md"), []byte("# hi"), 0o644)
 
 	files, err := DiscoverSchemaFiles([]string{dir})
@@ -150,8 +150,8 @@ func TestDiscoverSchemaFilesExcludesVendor(t *testing.T) {
 	dir := t.TempDir()
 	vendorDir := filepath.Join(dir, "vendor")
 	os.Mkdir(vendorDir, 0o755)
-	os.WriteFile(filepath.Join(vendorDir, "skip.gco"), []byte("model X {}"), 0o644)
-	os.WriteFile(filepath.Join(dir, "keep.gco"), []byte("model Y {}"), 0o644)
+	os.WriteFile(filepath.Join(vendorDir, "skip.gcorm"), []byte("model X {}"), 0o644)
+	os.WriteFile(filepath.Join(dir, "keep.gcorm"), []byte("model Y {}"), 0o644)
 
 	files, err := DiscoverSchemaFiles([]string{dir})
 	if err != nil {

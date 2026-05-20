@@ -15,7 +15,7 @@ func TestFormatSingleFile(t *testing.T) {
 	dir := t.TempDir()
 
 	unformatted := "model   User   {\nid    String   @id    @default(uuid())\n  email     String   @unique\n}\n"
-	path := filepath.Join(dir, "test.gco")
+	path := filepath.Join(dir, "test.gcorm")
 	if err := os.WriteFile(path, []byte(unformatted), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestFormatIdempotent(t *testing.T) {
 
 	// Already canonical: the formatter should produce identical output.
 	schema := "model User {\n  id    String @id\n  email String @unique\n}\n"
-	path := filepath.Join(dir, "test.gco")
+	path := filepath.Join(dir, "test.gcorm")
 	if err := os.WriteFile(path, []byte(schema), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestFormatIdempotent(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFormatNonExistentFile(t *testing.T) {
-	err := Run([]string{"/nonexistent/path/schema.gco"})
+	err := Run([]string{"/nonexistent/path/schema.gcorm"})
 	if err == nil {
 		t.Fatal("expected error for non-existent file")
 	}
@@ -99,10 +99,10 @@ func TestFormatMultipleFilesInDirectory(t *testing.T) {
 	file1 := "model  Alpha {\nid  String  @id\n}\n"
 	file2 := "model  Beta {\nid  String @id\n}\n"
 
-	if err := os.WriteFile(filepath.Join(dir, "alpha.gco"), []byte(file1), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "alpha.gcorm"), []byte(file1), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "beta.gco"), []byte(file2), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "beta.gcorm"), []byte(file2), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -110,7 +110,7 @@ func TestFormatMultipleFilesInDirectory(t *testing.T) {
 		t.Fatalf("Run() error: %v", err)
 	}
 
-	for _, name := range []string{"alpha.gco", "beta.gco"} {
+	for _, name := range []string{"alpha.gcorm", "beta.gcorm"} {
 		data, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			t.Fatal(err)
@@ -130,7 +130,7 @@ func TestFormatCheckMode(t *testing.T) {
 	dir := t.TempDir()
 
 	unformatted := "model   User    {\nid    String   @id\n}\n"
-	path := filepath.Join(dir, "test.gco")
+	path := filepath.Join(dir, "test.gcorm")
 	if err := os.WriteFile(path, []byte(unformatted), 0o644); err != nil {
 		t.Fatal(err)
 	}

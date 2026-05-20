@@ -106,7 +106,7 @@ func DetectProvider(dsn string) string {
 	}
 }
 
-// GenerateSchema produces .gco schema text from introspected table info.
+// GenerateSchema produces .gcorm schema text from introspected table info.
 func GenerateSchema(provider string, tables []TableInfo) string {
 	var b strings.Builder
 

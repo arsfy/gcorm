@@ -40,7 +40,7 @@ func Run(args []string) error {
 				return err
 			}
 			for _, e := range entries {
-				if !e.IsDir() && filepath.Ext(e.Name()) == ".gco" {
+				if !e.IsDir() && filepath.Ext(e.Name()) == ".gcorm" {
 					files = append(files, filepath.Join(t, e.Name()))
 				}
 			}
@@ -50,7 +50,7 @@ func Run(args []string) error {
 	}
 
 	if len(files) == 0 {
-		return fmt.Errorf("no .gco files found")
+		return fmt.Errorf("no .gcorm files found")
 	}
 
 	unformatted := 0

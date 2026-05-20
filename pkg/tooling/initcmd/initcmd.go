@@ -18,7 +18,7 @@ func Run(args []string) error {
 func runWithIO(args []string, in io.Reader, out io.Writer) error {
 	opts := initOptions{
 		Provider:   "",
-		SchemaFile: filepath.Join("schema", "schema.gco"),
+		SchemaFile: filepath.Join("schema", "schema.gcorm"),
 		EnvVar:     "DATABASE_URL",
 		OutputDir:  "./gen",
 		Package:    "db",

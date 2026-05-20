@@ -126,7 +126,7 @@ func DiscoverSchemaRoots(cfg *Config, cwd string) ([]string, error) {
 	return []string{cwd}, nil
 }
 
-// DiscoverSchemaFiles finds all .gco files in the given roots with deterministic ordering.
+// DiscoverSchemaFiles finds all .gcorm files in the given roots with deterministic ordering.
 func DiscoverSchemaFiles(roots []string) ([]string, error) {
 	excludeDirs := map[string]bool{
 		"node_modules": true,
@@ -145,7 +145,7 @@ func DiscoverSchemaFiles(roots []string) ([]string, error) {
 			if info.IsDir() && excludeDirs[info.Name()] {
 				return filepath.SkipDir
 			}
-			if !info.IsDir() && filepath.Ext(path) == ".gco" {
+			if !info.IsDir() && filepath.Ext(path) == ".gcorm" {
 				absPath, err := filepath.Abs(path)
 				if err != nil {
 					return err

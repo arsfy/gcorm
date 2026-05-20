@@ -22,12 +22,12 @@ func TestCodegenBloatThreshold(t *testing.T) {
 		regressionLimit = 100.0 // ceiling after real query execution codegen
 	)
 
-	schemaSource, err := os.ReadFile("../../../testdata/full_schema.gco")
+	schemaSource, err := os.ReadFile("../../../testdata/full_schema.gcorm")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	ds, err := parser.ParseMulti(map[string][]byte{"full_schema.gco": schemaSource})
+	ds, err := parser.ParseMulti(map[string][]byte{"full_schema.gcorm": schemaSource})
 	if err != nil {
 		t.Fatal(err)
 	}

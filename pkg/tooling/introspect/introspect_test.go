@@ -130,11 +130,11 @@ func TestWriteSchemaFile(t *testing.T) {
 	subdir := filepath.Join(dir, "schema")
 	content := "datasource db {}\n"
 
-	if err := WriteSchemaFile(subdir, "main.gco", content); err != nil {
+	if err := WriteSchemaFile(subdir, "main.gcorm", content); err != nil {
 		t.Fatalf("WriteSchemaFile: %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(subdir, "main.gco"))
+	data, err := os.ReadFile(filepath.Join(subdir, "main.gcorm"))
 	if err != nil {
 		t.Fatalf("read back: %v", err)
 	}

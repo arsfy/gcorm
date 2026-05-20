@@ -61,8 +61,8 @@ func TestArrayLiteralImplementsExpression(t *testing.T) {
 
 func TestExprSpanReturnsCorrectSpan(t *testing.T) {
 	span := Span{
-		Start: Position{File: "schema.gco", Line: 5, Column: 3, Offset: 42},
-		End:   Position{File: "schema.gco", Line: 5, Column: 10, Offset: 49},
+		Start: Position{File: "schema.gcorm", Line: 5, Column: 3, Offset: 42},
+		End:   Position{File: "schema.gcorm", Line: 5, Column: 10, Offset: 49},
 	}
 
 	cases := []struct {

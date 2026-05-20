@@ -17,7 +17,7 @@ func filterTokens(tokens []Token) []Token {
 
 func tokenize(t *testing.T, input string) []Token {
 	t.Helper()
-	lex := NewLexer("test.gco", []byte(input))
+	lex := NewLexer("test.gcorm", []byte(input))
 	tokens, err := lex.Tokenize()
 	if err != nil {
 		t.Fatalf("unexpected lexer error: %v", err)
@@ -27,7 +27,7 @@ func tokenize(t *testing.T, input string) []Token {
 
 func tokenizeWithError(t *testing.T, input string) ([]Token, error) {
 	t.Helper()
-	lex := NewLexer("test.gco", []byte(input))
+	lex := NewLexer("test.gcorm", []byte(input))
 	tokens, err := lex.Tokenize()
 	return filterTokens(tokens), err
 }
@@ -403,7 +403,7 @@ func TestErrorInvalidCharacter(t *testing.T) {
 
 func TestPositionTracking(t *testing.T) {
 	input := "model User {\n  id String\n}"
-	lex := NewLexer("test.gco", []byte(input))
+	lex := NewLexer("test.gcorm", []byte(input))
 	tokens, err := lex.Tokenize()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -451,8 +451,8 @@ func TestPositionTracking(t *testing.T) {
 	}
 
 	// Verify filename is set
-	if tokens[0].Pos.File != "test.gco" {
-		t.Errorf("expected filename %q, got %q", "test.gco", tokens[0].Pos.File)
+	if tokens[0].Pos.File != "test.gcorm" {
+		t.Errorf("expected filename %q, got %q", "test.gcorm", tokens[0].Pos.File)
 	}
 }
 

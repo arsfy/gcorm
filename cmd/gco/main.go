@@ -132,7 +132,7 @@ func runValidate(args []string) error {
 	}
 
 	if len(files) == 0 {
-		return fmt.Errorf("no .gco schema files found in %v", roots)
+		return fmt.Errorf("no .gcorm schema files found in %v", roots)
 	}
 
 	// Parse all schema files.

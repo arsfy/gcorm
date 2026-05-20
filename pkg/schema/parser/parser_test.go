@@ -7,7 +7,7 @@ import (
 )
 
 func TestParseEmptyFile(t *testing.T) {
-	doc, err := Parse("test.gco", []byte(""))
+	doc, err := Parse("test.gcorm", []byte(""))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestParseDatasource(t *testing.T) {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestParseGenerator(t *testing.T) {
   output   = "./gen"
   package  = "db"
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestParseSimpleModel(t *testing.T) {
   email String
   age   Int
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestParseModelWithAttributes(t *testing.T) {
   id    String @id @default(uuid())
   email String @unique
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestParseOptionalAndListFields(t *testing.T) {
   name    String?
   tags    String[]
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestParseModelLevelAttributes(t *testing.T) {
   @@index([createdAt])
   @@map("users")
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestParseEnum(t *testing.T) {
   ADMIN
   MODERATOR
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -336,7 +336,7 @@ func TestParseRelationAttribute(t *testing.T) {
   authorId String
   author   User   @relation(fields: [authorId], references: [id])
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -406,7 +406,7 @@ enum Role {
   USER
   ADMIN
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -449,7 +449,7 @@ enum Role {
   USER
   ADMIN
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -500,10 +500,10 @@ enum Role {
 
 func TestParseMulti(t *testing.T) {
 	files := map[string][]byte{
-		"a.gco": []byte(`model User {
+		"a.gcorm": []byte(`model User {
   id String
 }`),
-		"b.gco": []byte(`model Post {
+		"b.gcorm": []byte(`model Post {
   id String
 }`),
 	}
@@ -518,11 +518,11 @@ func TestParseMulti(t *testing.T) {
 		t.Fatalf("files = %d, want 2", len(ds.Files))
 	}
 	// Files should be sorted alphabetically.
-	if ds.Files[0] != "a.gco" {
-		t.Errorf("file[0] = %q, want %q", ds.Files[0], "a.gco")
+	if ds.Files[0] != "a.gcorm" {
+		t.Errorf("file[0] = %q, want %q", ds.Files[0], "a.gcorm")
 	}
-	if ds.Files[1] != "b.gco" {
-		t.Errorf("file[1] = %q, want %q", ds.Files[1], "b.gco")
+	if ds.Files[1] != "b.gcorm" {
+		t.Errorf("file[1] = %q, want %q", ds.Files[1], "b.gcorm")
 	}
 	if len(ds.Documents[0].Models) != 1 {
 		t.Errorf("doc[0] models = %d, want 1", len(ds.Documents[0].Models))
@@ -538,7 +538,7 @@ func TestParseComments(t *testing.T) {
 model User {
   id String
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -581,7 +581,7 @@ func TestParseErrorCases(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := Parse("test.gco", []byte(tt.src))
+			_, err := Parse("test.gcorm", []byte(tt.src))
 			if err == nil {
 				t.Error("expected error, got nil")
 			}
@@ -594,7 +594,7 @@ func TestParseBooleanLiteral(t *testing.T) {
   provider    = "gco-go"
   emitRuntime = false
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -623,7 +623,7 @@ func TestParseNativeTypeAttribute(t *testing.T) {
 	src := `model User {
   name String @db.VarChar(255)
 }`
-	doc, err := Parse("test.gco", []byte(src))
+	doc, err := Parse("test.gcorm", []byte(src))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

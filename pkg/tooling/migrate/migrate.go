@@ -128,7 +128,7 @@ func runDiff(args []string) error {
 		return fmt.Errorf("discover schema files: %w", err)
 	}
 	if len(schemaFiles) == 0 {
-		return fmt.Errorf("no .gco schema files found in %v", roots)
+		return fmt.Errorf("no .gcorm schema files found in %v", roots)
 	}
 
 	// Read and parse schema files.

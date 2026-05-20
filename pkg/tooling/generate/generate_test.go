@@ -52,14 +52,14 @@ model Post {
 }
 `
 
-// writeSchema creates a schema directory with a .gco file and returns its path.
+// writeSchema creates a schema directory with a .gcorm file and returns its path.
 func writeSchema(t *testing.T, dir, schema string) string {
 	t.Helper()
 	schemaDir := filepath.Join(dir, "schema")
 	if err := os.Mkdir(schemaDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(schemaDir, "main.gco"), []byte(schema), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(schemaDir, "main.gcorm"), []byte(schema), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return schemaDir
@@ -201,7 +201,7 @@ func TestRunRemovesStaleGeneratedFiles(t *testing.T) {
 		t.Fatalf("write manual file: %v", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(schemaDir, "main.gco"), []byte(validSchema), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(schemaDir, "main.gcorm"), []byte(validSchema), 0o644); err != nil {
 		t.Fatalf("update schema: %v", err)
 	}
 	if err := Run([]string{"--schema", schemaDir}); err != nil {
@@ -292,7 +292,7 @@ func TestRunInvalidSchema(t *testing.T) {
 
 	// Missing model name causes a parse error.
 	invalidSchema := "model {\n  id String @id\n}\n"
-	if err := os.WriteFile(filepath.Join(dir, "bad.gco"), []byte(invalidSchema), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "bad.gcorm"), []byte(invalidSchema), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

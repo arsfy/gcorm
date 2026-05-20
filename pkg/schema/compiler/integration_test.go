@@ -12,7 +12,7 @@ import (
 // parseAndCompile is a helper that parses schema text and runs the compiler.
 func parseAndCompile(t *testing.T, schema string) *CompileResult {
 	t.Helper()
-	ds, err := parser.ParseMulti(map[string][]byte{"test.gco": []byte(schema)})
+	ds, err := parser.ParseMulti(map[string][]byte{"test.gcorm": []byte(schema)})
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
 	}

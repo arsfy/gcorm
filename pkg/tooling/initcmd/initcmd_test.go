@@ -22,7 +22,7 @@ func TestRunWithIONonInteractive(t *testing.T) {
 		t.Fatalf("runWithIO() error: %v", err)
 	}
 
-	schemaPath := filepath.Join(dir, "schema", "schema.gco")
+	schemaPath := filepath.Join(dir, "schema", "schema.gcorm")
 	data, err := os.ReadFile(schemaPath)
 	if err != nil {
 		t.Fatalf("read schema file: %v", err)
@@ -50,7 +50,7 @@ func TestRunWithIOInteractive(t *testing.T) {
 	// provider, schema path, env var, output dir, package
 	input := strings.Join([]string{
 		"mysql",
-		"schema/app.gco",
+		"schema/app.gcorm",
 		"APP_DATABASE_URL",
 		"./generated",
 		"store",
@@ -62,7 +62,7 @@ func TestRunWithIOInteractive(t *testing.T) {
 		t.Fatalf("runWithIO() error: %v", err)
 	}
 
-	schemaPath := filepath.Join(dir, "schema", "app.gco")
+	schemaPath := filepath.Join(dir, "schema", "app.gcorm")
 	data, err := os.ReadFile(schemaPath)
 	if err != nil {
 		t.Fatalf("read schema file: %v", err)
@@ -93,7 +93,7 @@ func TestRunWithIOExistingFileWithoutForce(t *testing.T) {
 	if err := os.MkdirAll("schema", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join("schema", "schema.gco"), []byte("existing"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join("schema", "schema.gcorm"), []byte("existing"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

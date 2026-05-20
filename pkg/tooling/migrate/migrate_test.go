@@ -10,7 +10,7 @@ import (
 	"github.com/arsfy/gco-orm/pkg/schema/ir"
 )
 
-// testSchemaGCO is a minimal .gco schema used by integration tests.
+// testSchemaGCO is a minimal .gcorm schema used by integration tests.
 const testSchemaGCO = `datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
@@ -23,7 +23,7 @@ model User {
 }
 `
 
-// writeTestSchema creates a temporary directory with a .gco schema file and
+// writeTestSchema creates a temporary directory with a .gcorm schema file and
 // returns its path. The caller does not need to clean up; t.TempDir handles it.
 func writeTestSchema(t *testing.T, content string) string {
 	t.Helper()
@@ -31,7 +31,7 @@ func writeTestSchema(t *testing.T, content string) string {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "schema.gco"), []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "schema.gcorm"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return dir

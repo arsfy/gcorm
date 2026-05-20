@@ -71,7 +71,7 @@ func Run(args []string) error {
 	}
 
 	if len(files) == 0 {
-		return fmt.Errorf("no .gco schema files found in %v", roots)
+		return fmt.Errorf("no .gcorm schema files found in %v", roots)
 	}
 
 	fmt.Printf("Found %d schema file(s)\n", len(files))
