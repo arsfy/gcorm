@@ -144,6 +144,13 @@ type {{.Model.Name}}Query struct {
 {{- end}}
 }
 
+const {{.Model.Name}}Table = "{{tableName .Model}}"
+{{- range $field := .Model.Fields}}
+{{- if ne $field.Type 2}}
+const {{$.Model.Name}}{{upper $field.Name}}Column = "{{columnName $field}}"
+{{- end}}
+{{- end}}
+
 // {{.Model.Name}}Query provides query building methods for the {{.Model.Name}} model.
 var {{.Model.Name}} = {{.Model.Name}}Query{
 {{- range $field := .Model.Fields}}
@@ -429,6 +436,7 @@ import (
 	"database/sql"
 {{- if .Models}}
 	"fmt"
+	"reflect"
 	"strings"
 
 	"{{.BaseImport}}/model"
@@ -501,6 +509,118 @@ func (c *Client) placeholder(n int) string {
 		return fmt.Sprintf("$%d", n)
 	}
 	return "?"
+}
+
+func scanRowsToMaps(rows *sql.Rows) ([]map[string]any, error) {
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var results []map[string]any
+	for rows.Next() {
+		values := make([]any, len(cols))
+		dest := make([]any, len(cols))
+		for i := range values {
+			dest[i] = &values[i]
+		}
+		if err := rows.Scan(dest...); err != nil {
+			return nil, err
+		}
+		row := make(map[string]any, len(cols))
+		for i, col := range cols {
+			if b, ok := values[i].([]byte); ok {
+				row[col] = string(b)
+				continue
+			}
+			row[col] = values[i]
+		}
+		results = append(results, row)
+	}
+	return results, rows.Err()
+}
+
+func scanRowsToStructs[T any](rows *sql.Rows) ([]T, error) {
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	var sample T
+	typ := reflect.TypeOf(sample)
+	if typ.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("Raw: destination type must be a struct, got %s", typ.Kind())
+	}
+
+	fieldByColumn := make(map[string]int)
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if field.PkgPath != "" {
+			continue
+		}
+		dbName := field.Tag.Get("db")
+		if comma := strings.Index(dbName, ","); comma >= 0 {
+			dbName = dbName[:comma]
+		}
+		if dbName == "-" {
+			continue
+		}
+		if dbName != "" {
+			fieldByColumn[dbName] = i
+		}
+		fieldByColumn[field.Name] = i
+	}
+
+	var results []T
+	for rows.Next() {
+		var item T
+		value := reflect.ValueOf(&item).Elem()
+		dest := make([]any, len(cols))
+		for i, col := range cols {
+			if fieldIndex, ok := fieldByColumn[col]; ok {
+				field := value.Field(fieldIndex)
+				if field.CanAddr() {
+					dest[i] = field.Addr().Interface()
+					continue
+				}
+			}
+			var discard any
+			dest[i] = &discard
+		}
+		if err := rows.Scan(dest...); err != nil {
+			return nil, err
+		}
+		results = append(results, item)
+	}
+	return results, rows.Err()
+}
+
+// Raw executes a custom SELECT query and scans rows into T using db tags.
+func Raw[T any](ctx context.Context, c *Client, query string, args ...any) ([]T, error) {
+	rows, err := c.executor.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRowsToStructs[T](rows)
+}
+
+// RawRows executes a custom SELECT query and returns row maps keyed by column name.
+func (c *Client) RawRows(ctx context.Context, query string, args ...any) ([]map[string]any, error) {
+	rows, err := c.executor.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRowsToMaps(rows)
+}
+
+// RawExec executes custom SQL and returns affected rows.
+func (c *Client) RawExec(ctx context.Context, query string, args ...any) (int64, error) {
+	result, err := c.executor.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 {{- end}}
 
@@ -643,6 +763,157 @@ func (b {{$model.Name}}CreateBuilder) Set(sets ...query.{{$model.Name}}SetClause
 // Do executes the staged create operation.
 func (b {{$model.Name}}CreateBuilder) Do(ctx context.Context) (*model.{{$model.Name}}, error) {
 	return b.action.CreateOne(ctx, b.sets...)
+}
+
+// {{$model.Name}}CreateManyBuilder builds a bulk {{$model.Name}} insert operation.
+type {{$model.Name}}CreateManyBuilder struct {
+	action            {{$model.Name}}Actions
+	data              []query.{{$model.Name}}CreateInput
+	conflictDoNothing bool
+	conflictColumns   []string
+	returningColumns  []string
+	batchSize         int
+}
+
+// BulkCreate starts a staged bulk {{$model.Name}} insert operation.
+func (a {{$model.Name}}Actions) BulkCreate(data []query.{{$model.Name}}CreateInput) {{$model.Name}}CreateManyBuilder {
+	return {{$model.Name}}CreateManyBuilder{action: a, data: data}
+}
+
+// OnConflictDoNothing makes duplicate rows no-op instead of failing.
+func (b {{$model.Name}}CreateManyBuilder) OnConflictDoNothing(columns ...string) {{$model.Name}}CreateManyBuilder {
+	next := b
+	next.conflictDoNothing = true
+	next.conflictColumns = append([]string(nil), columns...)
+	return next
+}
+
+// Returning sets the columns returned by DoReturningValues.
+func (b {{$model.Name}}CreateManyBuilder) Returning(columns ...string) {{$model.Name}}CreateManyBuilder {
+	next := b
+	next.returningColumns = append([]string(nil), columns...)
+	return next
+}
+
+// BatchSize limits how many rows are inserted per statement.
+func (b {{$model.Name}}CreateManyBuilder) BatchSize(n int) {{$model.Name}}CreateManyBuilder {
+	next := b
+	next.batchSize = n
+	return next
+}
+
+// Do executes the bulk insert and returns total affected rows.
+func (b {{$model.Name}}CreateManyBuilder) Do(ctx context.Context) (int64, error) {
+	if len(b.data) == 0 {
+		return 0, nil
+	}
+	batchSize := b.batchSize
+	if batchSize <= 0 || batchSize > len(b.data) {
+		batchSize = len(b.data)
+	}
+	var total int64
+	for start := 0; start < len(b.data); start += batchSize {
+		end := start + batchSize
+		if end > len(b.data) {
+			end = len(b.data)
+		}
+		q, args := b.action.build{{$model.Name}}CreateManySQL(b.data[start:end], b.conflictDoNothing, b.conflictColumns, nil)
+		result, err := b.action.client.executor.ExecContext(ctx, q, args...)
+		if err != nil {
+			return total, fmt.Errorf("{{$model.Name}}.BulkCreate: %w", err)
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("{{$model.Name}}.BulkCreate rows affected: %w", err)
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// DoReturning executes the bulk insert and returns inserted rows.
+func (b {{$model.Name}}CreateManyBuilder) DoReturning(ctx context.Context) ([]model.{{$model.Name}}, error) {
+	if b.action.client.dialect != "postgresql" {
+		return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning: RETURNING is only supported for postgresql")
+	}
+	if len(b.returningColumns) > 0 {
+		return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning: custom returning columns require DoReturningValues")
+	}
+	if len(b.data) == 0 {
+		return nil, nil
+	}
+	batchSize := b.batchSize
+	if batchSize <= 0 || batchSize > len(b.data) {
+		batchSize = len(b.data)
+	}
+	var results []model.{{$model.Name}}
+	for start := 0; start < len(b.data); start += batchSize {
+		end := start + batchSize
+		if end > len(b.data) {
+			end = len(b.data)
+		}
+		q, args := b.action.build{{$model.Name}}CreateManySQL(b.data[start:end], b.conflictDoNothing, b.conflictColumns, []string{ {{scalarColNamesCSV $model}} })
+		rows, err := b.action.client.executor.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning: %w", err)
+		}
+		for rows.Next() {
+			var item model.{{$model.Name}}
+			if err := rows.Scan({{scanFields $model}}); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning scan: %w", err)
+			}
+			results = append(results, item)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning rows: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning close: %w", err)
+		}
+	}
+	return results, nil
+}
+
+// DoReturningValues executes the bulk insert and returns selected column values.
+func (b {{$model.Name}}CreateManyBuilder) DoReturningValues(ctx context.Context) ([]map[string]any, error) {
+	if b.action.client.dialect != "postgresql" {
+		return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturningValues: RETURNING is only supported for postgresql")
+	}
+	if len(b.data) == 0 {
+		return nil, nil
+	}
+	returningColumns := b.returningColumns
+	if len(returningColumns) == 0 {
+		returningColumns = []string{ {{scalarColNamesCSV $model}} }
+	}
+	batchSize := b.batchSize
+	if batchSize <= 0 || batchSize > len(b.data) {
+		batchSize = len(b.data)
+	}
+	var results []map[string]any
+	for start := 0; start < len(b.data); start += batchSize {
+		end := start + batchSize
+		if end > len(b.data) {
+			end = len(b.data)
+		}
+		q, args := b.action.build{{$model.Name}}CreateManySQL(b.data[start:end], b.conflictDoNothing, b.conflictColumns, returningColumns)
+		rows, err := b.action.client.executor.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturningValues: %w", err)
+		}
+		batch, err := scanRowsToMaps(rows)
+		closeErr := rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturningValues scan: %w", err)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturningValues close: %w", closeErr)
+		}
+		results = append(results, batch...)
+	}
+	return results, nil
 }
 
 // {{$model.Name}}QueryBuilder builds a {{$model.Name}} query incrementally.
@@ -926,9 +1197,10 @@ func (a {{$model.Name}}Actions) CreateOne(ctx context.Context, sets ...query.{{$
 
 // CreateMany creates multiple {{$model.Name}} records.
 func (a {{$model.Name}}Actions) CreateMany(ctx context.Context, data []query.{{$model.Name}}CreateInput) (int64, error) {
-	if len(data) == 0 {
-		return 0, nil
-	}
+	return a.BulkCreate(data).Do(ctx)
+}
+
+func (a {{$model.Name}}Actions) build{{$model.Name}}CreateManySQL(data []query.{{$model.Name}}CreateInput, conflictDoNothing bool, conflictColumns []string, returningColumns []string) (string, []any) {
 	cols := []string{ {{scalarColNamesCSV $model}} }
 	argIdx := 0
 	var valueSets []string
@@ -945,11 +1217,24 @@ func (a {{$model.Name}}Actions) CreateMany(ctx context.Context, data []query.{{$
 	}
 	q := fmt.Sprintf("INSERT INTO {{tableName $model}} (%s) VALUES %s",
 		strings.Join(cols, ", "), strings.Join(valueSets, ", "))
-	result, err := a.client.executor.ExecContext(ctx, q, args...)
-	if err != nil {
-		return 0, fmt.Errorf("{{$model.Name}}.CreateMany: %w", err)
+	if conflictDoNothing {
+		switch a.client.dialect {
+		case "mysql":
+			if len(cols) > 0 {
+				q += " ON DUPLICATE KEY UPDATE " + cols[0] + " = " + cols[0]
+			}
+		default:
+			q += " ON CONFLICT"
+			if len(conflictColumns) > 0 {
+				q += " (" + strings.Join(conflictColumns, ", ") + ")"
+			}
+			q += " DO NOTHING"
+		}
 	}
-	return result.RowsAffected()
+	if len(returningColumns) > 0 {
+		q += " RETURNING " + strings.Join(returningColumns, ", ")
+	}
+	return q, args
 }
 
 // UpdateOne updates a single {{$model.Name}} record matching the where clause.

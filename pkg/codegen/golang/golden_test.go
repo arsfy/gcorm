@@ -125,14 +125,21 @@ func TestGoldenClientOutput(t *testing.T) {
 		"func (c *Client) Tx(ctx context.Context",
 		"type PostActions struct",
 		"type UserCreateBuilder struct",
+		"type UserCreateManyBuilder struct",
 		"type UserQueryBuilder struct",
 		"type UserUpdateBuilder struct",
 		"type UserDeleteBuilder struct",
 		"func (a UserActions) Create() UserCreateBuilder",
+		"func (a UserActions) BulkCreate(data []query.UserCreateInput) UserCreateManyBuilder",
 		"func (a UserActions) Query() UserQueryBuilder",
 		"func (a UserActions) Update() UserUpdateBuilder",
 		"func (a UserActions) Delete() UserDeleteBuilder",
 		"func (b UserCreateBuilder) Do(ctx context.Context) (*model.User, error)",
+		"func (b UserCreateManyBuilder) OnConflictDoNothing(columns ...string) UserCreateManyBuilder",
+		"func (b UserCreateManyBuilder) Returning(columns ...string) UserCreateManyBuilder",
+		"func (b UserCreateManyBuilder) BatchSize(n int) UserCreateManyBuilder",
+		"func (b UserCreateManyBuilder) DoReturning(ctx context.Context) ([]model.User, error)",
+		"func (b UserCreateManyBuilder) DoReturningValues(ctx context.Context) ([]map[string]any, error)",
 		"func (b UserQueryBuilder) Do(ctx context.Context) ([]model.User, error)",
 		"func (b UserQueryBuilder) First(ctx context.Context) (*model.User, error)",
 		"func (b UserQueryBuilder) Count(ctx context.Context) (int64, error)",
@@ -203,6 +210,8 @@ func TestGoldenQueryOutput(t *testing.T) {
 		"UserCreateNestedInput",
 		"UserWhereUniqueInput",
 		"ScalarValues()",
+		`const UserTable = "User"`,
+		`const UserCreatedAtColumn = "created_at"`,
 	}
 	for _, check := range newQueryChecks {
 		if !strings.Contains(userQuery, check) {
@@ -335,7 +344,7 @@ func TestGoldenClientRealMethods(t *testing.T) {
 	// Verify all 13 methods are present for each model.
 	methods := []string{
 		"FindMany", "FindFirst", "FindUnique",
-		"Create", "Query", "Update", "Delete",
+		"Create", "BulkCreate", "Query", "Update", "Delete",
 		"CreateOne", "CreateMany",
 		"UpdateOne", "UpdateMany",
 		"UpsertOne",

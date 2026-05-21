@@ -152,6 +152,15 @@ func TestRunGenerateFromSchemaFiles(t *testing.T) {
 	if !strings.Contains(guideText, "query.User.Email") {
 		t.Fatalf("guide doc missing model-specific query example: %s", guideText)
 	}
+	if !strings.Contains(guideText, "## Bulk Inserts") || !strings.Contains(guideText, "OnConflictDoNothing") {
+		t.Fatalf("guide doc missing bulk insert docs: %s", guideText)
+	}
+	if !strings.Contains(guideText, "## Raw SQL") || !strings.Contains(guideText, "client.Raw[model.Post]") {
+		t.Fatalf("guide doc missing raw SQL docs: %s", guideText)
+	}
+	if !strings.Contains(guideText, "## Table and Column Constants") || !strings.Contains(guideText, "query.PostIdColumn") {
+		t.Fatalf("guide doc missing table/column constant docs: %s", guideText)
+	}
 }
 
 // ---------------------------------------------------------------------------
