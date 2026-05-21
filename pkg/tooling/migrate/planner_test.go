@@ -428,6 +428,60 @@ func TestDDLGenerateUpOrdersForeignKeysAfterTables(t *testing.T) {
 	}
 }
 
+func TestDDLForeignKeyReferentialActions(t *testing.T) {
+	tag := testModel("Tag", testField("id", "BigInt"))
+	tag.DBName = "tags"
+	post := testModel("Post", testField("id", "BigInt"))
+	post.DBName = "posts"
+	postTag := testModel(
+		"PostTag",
+		testField("tagId", "BigInt"),
+		testField("postId", "BigInt"),
+	)
+	postTag.DBName = "post_tags"
+	postTag.PrimaryKey = &ir.PrimaryKey{Fields: []string{"tagId", "postId"}, IsComposite: true}
+	tagRel := testRelation("PostTag", "Tag", []string{"tagId"}, []string{"id"})
+	tagRel.OnDelete = "Cascade"
+	postRel := testRelation("PostTag", "Post", []string{"postId"}, []string{"id"})
+	postRel.OnDelete = "Cascade"
+	postTag.Relations = []*ir.Relation{tagRel, postRel}
+
+	newSchema := testSchema(post, postTag, tag)
+	cs := Diff(&ir.Schema{}, newSchema)
+	gen := DDLGenerator{Dialect: "postgresql", Schema: newSchema}
+
+	sql := gen.GenerateUp(cs)
+
+	expected := []string{
+		`ALTER TABLE "post_tags" ADD CONSTRAINT "fk_post_tags_post_id" FOREIGN KEY ("post_id") REFERENCES "posts" ("id") ON DELETE CASCADE;`,
+		`ALTER TABLE "post_tags" ADD CONSTRAINT "fk_post_tags_tag_id" FOREIGN KEY ("tag_id") REFERENCES "tags" ("id") ON DELETE CASCADE;`,
+	}
+	for _, want := range expected {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("expected FK SQL %q, got:\n%s", want, sql)
+		}
+	}
+}
+
+func TestDiffDetectsForeignKeyReferentialActionChange(t *testing.T) {
+	user := testModel("User", testField("id", "String"))
+	user.DBName = "users"
+	oldPost := testModel("Post", testField("id", "String"), testField("authorId", "String"))
+	oldPost.DBName = "posts"
+	oldPost.Relations = []*ir.Relation{testRelation("Post", "User", []string{"authorId"}, []string{"id"})}
+
+	newPost := testModel("Post", testField("id", "String"), testField("authorId", "String"))
+	newPost.DBName = "posts"
+	newRel := testRelation("Post", "User", []string{"authorId"}, []string{"id"})
+	newRel.OnDelete = "Cascade"
+	newPost.Relations = []*ir.Relation{newRel}
+
+	cs := Diff(testSchema(oldPost, user), testSchema(newPost, user))
+	if !hasChange(cs, DropFK, "posts", "") || !hasChange(cs, AddFK, "posts", "") {
+		t.Fatalf("expected FK action change to drop and re-add FK, got: %+v", cs.Changes)
+	}
+}
+
 func TestDDLGenerateUpDropsTablesByDependency(t *testing.T) {
 	user := testModel("User", testField("id", "String"))
 	user.DBName = "users"

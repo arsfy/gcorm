@@ -368,20 +368,12 @@ func compareForeignKeys(cs *Changeset, model string, oldSchema, newSchema *ir.Sc
 		case inNew && !inOld:
 			cs.add(Change{
 				Type: AddFK, Model: model, NewValue: nr.ToModel,
-				Details: map[string]string{
-					"fields":     strings.Join(nr.Fields, ","),
-					"references": strings.Join(nr.References, ","),
-					"toModel":    nr.ToModel,
-				},
+				Details: fkDetails(nr),
 			})
 		case inOld && !inNew:
 			cs.add(Change{
 				Type: DropFK, Model: model, OldValue: or.ToModel,
-				Details: map[string]string{
-					"fields":     strings.Join(or.Fields, ","),
-					"references": strings.Join(or.References, ","),
-					"toModel":    or.ToModel,
-				},
+				Details: fkDetails(or),
 			})
 		}
 	}
@@ -403,11 +395,7 @@ func addForeignKeysForCreatedTables(cs *Changeset, newModels map[string]*ir.Mode
 			rel := relations[key]
 			cs.add(Change{
 				Type: AddFK, Model: tableName, NewValue: rel.ToModel,
-				Details: map[string]string{
-					"fields":     strings.Join(rel.Fields, ","),
-					"references": strings.Join(rel.References, ","),
-					"toModel":    rel.ToModel,
-				},
+				Details: fkDetails(rel),
 			})
 		}
 	}
@@ -425,7 +413,24 @@ func mapFKRelations(schema *ir.Schema, model *ir.Model, rels []*ir.Relation) map
 }
 
 func fkKey(r *ir.Relation) string {
-	return strings.Join(r.Fields, ",") + "->" + r.ToModel + "(" + strings.Join(r.References, ",") + ")"
+	return strings.Join(r.Fields, ",") + "->" + r.ToModel + "(" + strings.Join(r.References, ",") + ")" +
+		"|delete=" + effectiveReferentialAction(r.OnDelete) +
+		"|update=" + effectiveReferentialAction(r.OnUpdate)
+}
+
+func fkDetails(r *ir.Relation) map[string]string {
+	details := map[string]string{
+		"fields":     strings.Join(r.Fields, ","),
+		"references": strings.Join(r.References, ","),
+		"toModel":    r.ToModel,
+	}
+	if r.OnDelete != "" {
+		details["onDelete"] = r.OnDelete
+	}
+	if r.OnUpdate != "" {
+		details["onUpdate"] = r.OnUpdate
+	}
+	return details
 }
 
 // ---------------------------------------------------------------------------
@@ -585,5 +590,34 @@ func normalizedRelation(schema *ir.Schema, model *ir.Model, rel *ir.Relation) *i
 	if targetModel != nil {
 		clone.ToModel = targetModel.TableName()
 	}
+	clone.OnDelete = normalizeReferentialAction(rel.OnDelete)
+	clone.OnUpdate = normalizeReferentialAction(rel.OnUpdate)
 	return &clone
+}
+
+func normalizeReferentialAction(action string) string {
+	switch strings.ToLower(strings.ReplaceAll(strings.TrimSpace(action), "_", " ")) {
+	case "":
+		return ""
+	case "cascade":
+		return "CASCADE"
+	case "restrict":
+		return "RESTRICT"
+	case "noaction", "no action":
+		return "NO ACTION"
+	case "setnull", "set null":
+		return "SET NULL"
+	case "setdefault", "set default":
+		return "SET DEFAULT"
+	default:
+		return strings.ToUpper(action)
+	}
+}
+
+func effectiveReferentialAction(action string) string {
+	normalized := normalizeReferentialAction(action)
+	if normalized == "" {
+		return "NO ACTION"
+	}
+	return normalized
 }

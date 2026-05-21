@@ -289,9 +289,16 @@ func (g DDLGenerator) addFKSQL(c Change) string {
 	refTable := g.quoteID(c.Details["toModel"])
 	constraintName := g.quoteID(fmt.Sprintf("fk_%s_%s", c.Model, c.Details["fields"]))
 
-	return fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s);",
+	sql := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
 		tbl, constraintName, strings.Join(localFields, ", "),
 		refTable, strings.Join(refFields, ", "))
+	if onDelete := strings.TrimSpace(c.Details["onDelete"]); onDelete != "" {
+		sql += " ON DELETE " + onDelete
+	}
+	if onUpdate := strings.TrimSpace(c.Details["onUpdate"]); onUpdate != "" {
+		sql += " ON UPDATE " + onUpdate
+	}
+	return sql + ";"
 }
 
 func (g DDLGenerator) orderedChanges(cs *Changeset) []Change {
