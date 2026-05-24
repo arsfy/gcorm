@@ -162,6 +162,20 @@ func TestInvalidFieldType(t *testing.T) {
 	requireErrors(t, r, "unknown type")
 }
 
+func TestSmallIntIsValidScalar(t *testing.T) {
+	doc := &ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "Metric",
+			Fields: []ast.FieldDecl{
+				{Name: "id", Type: ast.FieldType{Name: "Int"}},
+				{Name: "bucket", Type: ast.FieldType{Name: "SmallInt"}},
+			},
+		}},
+	}
+	r := Validate(doc)
+	requireNoErrors(t, r)
+}
+
 func TestMultipleDatasources(t *testing.T) {
 	doc := &ast.Document{
 		Datasources: []ast.DatasourceDecl{

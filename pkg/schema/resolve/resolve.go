@@ -14,6 +14,7 @@ import (
 var knownScalars = map[string]bool{
 	"String":   true,
 	"Int":      true,
+	"SmallInt": true,
 	"BigInt":   true,
 	"Float":    true,
 	"Decimal":  true,

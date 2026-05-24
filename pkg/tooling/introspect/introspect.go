@@ -172,9 +172,10 @@ func mapSQLType(provider, sqlType string) string {
 		return "UUID"
 	case strings.HasPrefix(upper, "BIGINT"), strings.HasPrefix(upper, "BIGSERIAL"):
 		return "BigInt"
+	case strings.HasPrefix(upper, "SMALLINT"), strings.HasPrefix(upper, "INT2"):
+		return "SmallInt"
 	case strings.HasPrefix(upper, "INT"), strings.HasPrefix(upper, "INTEGER"),
-		strings.HasPrefix(upper, "SERIAL"), strings.HasPrefix(upper, "SMALLINT"),
-		strings.HasPrefix(upper, "TINYINT"):
+		strings.HasPrefix(upper, "SERIAL"), strings.HasPrefix(upper, "TINYINT"):
 		if upper == "TINYINT(1)" && provider == "mysql" {
 			return "Boolean"
 		}

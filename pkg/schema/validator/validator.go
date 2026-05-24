@@ -163,6 +163,7 @@ func ValidateDocumentSet(ds *ast.DocumentSet) *ValidationResult {
 var scalarTypes = map[string]bool{
 	"String":   true,
 	"Int":      true,
+	"SmallInt": true,
 	"BigInt":   true,
 	"Float":    true,
 	"Decimal":  true,
@@ -374,7 +375,7 @@ func (v *validator) validateDefaultArg(arg ast.AttributeArg, f ast.FieldDecl) {
 			v.addError(arg.Span.Start,
 				"@default value for String field must be a string or function call")
 		}
-	case "Int", "BigInt", "Float", "Decimal":
+	case "Int", "SmallInt", "BigInt", "Float", "Decimal":
 		if _, ok := arg.Value.(ast.NumberLiteral); !ok {
 			v.addError(arg.Span.Start, fmt.Sprintf(
 				"@default value for %s field must be a number or function call", f.Type.Name))

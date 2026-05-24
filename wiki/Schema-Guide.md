@@ -86,6 +86,7 @@ describe relationships and are not always stored as standalone columns.
 | --- | --- | --- |
 | `String` | `string` | `TEXT` |
 | `Int` | `int32` | `INTEGER` |
+| `SmallInt` | `int16` | `SMALLINT` / `INTEGER` |
 | `BigInt` | `int64` | `BIGINT` |
 | `Float` | `float64` | `DOUBLE` / `REAL` |
 | `Decimal` | `float64` | `DECIMAL` |

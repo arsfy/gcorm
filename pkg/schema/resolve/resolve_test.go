@@ -108,6 +108,7 @@ func TestResolveSimpleModel(t *testing.T) {
 			Name: "User",
 			Fields: []ast.FieldDecl{
 				{Name: "id", Type: ast.FieldType{Name: "Int"}},
+				{Name: "score", Type: ast.FieldType{Name: "SmallInt"}},
 				{Name: "email", Type: ast.FieldType{Name: "String"}},
 				{Name: "active", Type: ast.FieldType{Name: "Boolean", IsOptional: true}},
 			},
@@ -125,21 +126,26 @@ func TestResolveSimpleModel(t *testing.T) {
 	if m.Name != "User" {
 		t.Errorf("model name = %q", m.Name)
 	}
-	if len(m.Fields) != 3 {
-		t.Fatalf("expected 3 fields, got %d", len(m.Fields))
+	if len(m.Fields) != 4 {
+		t.Fatalf("expected 4 fields, got %d", len(m.Fields))
 	}
 	// id field
 	f := m.Fields[0]
 	if f.Type != ir.FieldKindScalar || f.ScalarType != "Int" {
 		t.Errorf("field[0] type = %v, scalar = %q", f.Type, f.ScalarType)
 	}
-	// email field
+	// score field
 	f = m.Fields[1]
-	if f.Type != ir.FieldKindScalar || f.ScalarType != "String" {
+	if f.Type != ir.FieldKindScalar || f.ScalarType != "SmallInt" {
 		t.Errorf("field[1] type = %v, scalar = %q", f.Type, f.ScalarType)
 	}
-	// active field
+	// email field
 	f = m.Fields[2]
+	if f.Type != ir.FieldKindScalar || f.ScalarType != "String" {
+		t.Errorf("field[2] type = %v, scalar = %q", f.Type, f.ScalarType)
+	}
+	// active field
+	f = m.Fields[3]
 	if !f.IsOptional {
 		t.Error("expected active to be optional")
 	}

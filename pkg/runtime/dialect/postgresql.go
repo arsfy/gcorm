@@ -102,6 +102,8 @@ func (PostgreSQL) TypeMapping(schemaType string, isOptional bool) string {
 		t = "TEXT"
 	case "Int":
 		t = "INTEGER"
+	case "SmallInt":
+		t = "SMALLINT"
 	case "BigInt":
 		t = "BIGINT"
 	case "Float":

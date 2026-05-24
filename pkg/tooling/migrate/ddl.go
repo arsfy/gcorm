@@ -677,6 +677,7 @@ func (g DDLGenerator) sqlType(scalarType string) string {
 	pg := map[string]string{
 		"String":   "TEXT",
 		"Int":      "INTEGER",
+		"SmallInt": "SMALLINT",
 		"BigInt":   "BIGINT",
 		"Float":    "DOUBLE PRECISION",
 		"Decimal":  "DECIMAL(65,30)",
@@ -689,6 +690,7 @@ func (g DDLGenerator) sqlType(scalarType string) string {
 	my := map[string]string{
 		"String":   "VARCHAR(255)",
 		"Int":      "INT",
+		"SmallInt": "SMALLINT",
 		"BigInt":   "BIGINT",
 		"Float":    "DOUBLE",
 		"Decimal":  "DECIMAL(65,30)",
@@ -701,6 +703,7 @@ func (g DDLGenerator) sqlType(scalarType string) string {
 	sl := map[string]string{
 		"String":   "TEXT",
 		"Int":      "INTEGER",
+		"SmallInt": "INTEGER",
 		"BigInt":   "INTEGER",
 		"Float":    "REAL",
 		"Decimal":  "TEXT",

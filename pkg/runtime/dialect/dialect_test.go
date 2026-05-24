@@ -125,6 +125,7 @@ func TestTypeMapping(t *testing.T) {
 	}{
 		{"String", "TEXT", "VARCHAR(191)", "TEXT"},
 		{"Int", "INTEGER", "INTEGER", "INTEGER"},
+		{"SmallInt", "SMALLINT", "SMALLINT", "INTEGER"},
 		{"BigInt", "BIGINT", "BIGINT", "INTEGER"},
 		{"Float", "DOUBLE PRECISION", "DOUBLE", "REAL"},
 		{"Decimal", "DECIMAL", "DECIMAL", "TEXT"},

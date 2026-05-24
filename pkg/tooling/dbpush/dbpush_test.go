@@ -252,6 +252,18 @@ func TestRiskyChanges(t *testing.T) {
 	}
 }
 
+func TestDatabaseScalarTypeSmallInt(t *testing.T) {
+	if got := postgresScalarType("smallint", "int2"); got != "SmallInt" {
+		t.Fatalf("postgresScalarType(smallint) = %q, want SmallInt", got)
+	}
+	if got := mysqlScalarType("smallint", "smallint"); got != "SmallInt" {
+		t.Fatalf("mysqlScalarType(smallint) = %q, want SmallInt", got)
+	}
+	if got := sqliteScalarType("SMALLINT"); got != "SmallInt" {
+		t.Fatalf("sqliteScalarType(SMALLINT) = %q, want SmallInt", got)
+	}
+}
+
 func TestParsePostgresIndexColumnDef(t *testing.T) {
 	col := parsePostgresIndexColumnDef("published_at", `"published_at" COLLATE "pg_catalog"."default" timestamptz_ops ASC NULLS LAST`)
 

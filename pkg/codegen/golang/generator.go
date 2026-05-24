@@ -359,6 +359,8 @@ func scalarGoType(t string) string {
 		return "string"
 	case "Int":
 		return "int"
+	case "SmallInt":
+		return "int16"
 	case "BigInt":
 		return "int64"
 	case "Float":
@@ -481,7 +483,7 @@ func isNumericField(f *ir.Field) bool {
 		return false
 	}
 	switch f.ScalarType {
-	case "Int", "BigInt", "Float", "Decimal":
+	case "Int", "SmallInt", "BigInt", "Float", "Decimal":
 		return true
 	}
 	return false

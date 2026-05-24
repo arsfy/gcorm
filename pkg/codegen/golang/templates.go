@@ -280,7 +280,7 @@ func ({{lower $.Model.Name}}{{upper $field.Name}}Field) NotIn(vals ...{{queryGoT
 	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: "NOT IN", Value: iVals}
 }
 
-{{- if or (eq $field.ScalarType "Int") (eq $field.ScalarType "BigInt") (eq $field.ScalarType "Float") (eq $field.ScalarType "Decimal") (eq $field.ScalarType "DateTime")}}
+{{- if or (eq $field.ScalarType "Int") (eq $field.ScalarType "SmallInt") (eq $field.ScalarType "BigInt") (eq $field.ScalarType "Float") (eq $field.ScalarType "Decimal") (eq $field.ScalarType "DateTime")}}
 
 // Lt creates a less-than condition.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Lt(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {

@@ -108,12 +108,12 @@ func TestContract_QuoteIdentMultiPart(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. TypeMapping handles all 10 schema types
+// 6. TypeMapping handles all schema types
 // ---------------------------------------------------------------------------
 
 func TestContract_TypeMappingAllTypes(t *testing.T) {
 	schemaTypes := []string{
-		"String", "Int", "BigInt", "Float", "Decimal",
+		"String", "Int", "SmallInt", "BigInt", "Float", "Decimal",
 		"Boolean", "DateTime", "Bytes", "Json", "UUID",
 	}
 
@@ -135,7 +135,7 @@ func TestContract_TypeMappingAllTypes(t *testing.T) {
 
 func TestContract_TypeMappingOptionalNonEmpty(t *testing.T) {
 	schemaTypes := []string{
-		"String", "Int", "BigInt", "Float", "Decimal",
+		"String", "Int", "SmallInt", "BigInt", "Float", "Decimal",
 		"Boolean", "DateTime", "Bytes", "Json", "UUID",
 	}
 

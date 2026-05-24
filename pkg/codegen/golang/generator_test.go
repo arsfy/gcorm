@@ -60,6 +60,11 @@ func testSchema() *ir.Schema {
 						ScalarType: "Int",
 					},
 					{
+						Name:       "rank",
+						Type:       ir.FieldKindScalar,
+						ScalarType: "SmallInt",
+					},
+					{
 						Name:       "createdAt",
 						Type:       ir.FieldKindScalar,
 						ScalarType: "DateTime",
@@ -208,6 +213,9 @@ func TestGenerateModelsContent(t *testing.T) {
 	if !strings.Contains(modelsContent, "type Post struct") {
 		t.Error("models.go should contain Post struct")
 	}
+	if !regexp.MustCompile(`(?m)\bRank\s+int16\b`).MatchString(modelsContent) {
+		t.Error("models.go should map SmallInt fields to int16")
+	}
 	// Check it has the DO NOT EDIT header.
 	if !strings.Contains(modelsContent, "DO NOT EDIT") {
 		t.Error("models.go should have DO NOT EDIT header")
@@ -293,6 +301,9 @@ func TestGenerateQueryContent(t *testing.T) {
 	}
 	if !strings.Contains(userQueryContent, "model.Role") {
 		t.Error("user.go should reference model.Role for enum fields")
+	}
+	if !strings.Contains(userQueryContent, "func (userRankField) Lt(v int16) UserWhereClause") {
+		t.Error("user.go should generate numeric comparison helpers for SmallInt")
 	}
 }
 
@@ -436,6 +447,11 @@ func TestGoTypeForField(t *testing.T) {
 			name:  "int",
 			field: &ir.Field{Type: ir.FieldKindScalar, ScalarType: "Int"},
 			want:  "int",
+		},
+		{
+			name:  "smallint",
+			field: &ir.Field{Type: ir.FieldKindScalar, ScalarType: "SmallInt"},
+			want:  "int16",
 		},
 		{
 			name:  "bigint",

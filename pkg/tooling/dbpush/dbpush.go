@@ -1259,7 +1259,9 @@ func postgresScalarType(dataType, udtName string) string {
 		return "UUID"
 	case strings.Contains(upperType, "BIGINT"), upperType == "INT8":
 		return "BigInt"
-	case strings.Contains(upperType, "INTEGER"), strings.Contains(upperType, "SMALLINT"), upperType == "INT4", upperType == "INT2":
+	case strings.Contains(upperType, "SMALLINT"), upperType == "INT2":
+		return "SmallInt"
+	case strings.Contains(upperType, "INTEGER"), upperType == "INT4":
 		return "Int"
 	case strings.Contains(upperType, "DOUBLE"), strings.Contains(upperType, "REAL"):
 		return "Float"
@@ -1306,7 +1308,9 @@ func mysqlScalarType(dataType, columnType string) string {
 		return "BigInt"
 	case strings.Contains(upperType, "TINYINT") && strings.Contains(upperColumn, "TINYINT(1)"):
 		return "Boolean"
-	case strings.Contains(upperType, "INT"), strings.Contains(upperType, "SMALLINT"), strings.Contains(upperType, "MEDIUMINT"), strings.Contains(upperType, "TINYINT"):
+	case strings.Contains(upperType, "SMALLINT"):
+		return "SmallInt"
+	case strings.Contains(upperType, "INT"), strings.Contains(upperType, "MEDIUMINT"), strings.Contains(upperType, "TINYINT"):
 		return "Int"
 	case strings.Contains(upperType, "DOUBLE"), strings.Contains(upperType, "FLOAT"):
 		return "Float"
@@ -1350,6 +1354,8 @@ func sqliteScalarType(dataType string) string {
 	switch {
 	case strings.Contains(upperType, "BIGINT"):
 		return "BigInt"
+	case strings.Contains(upperType, "SMALLINT"):
+		return "SmallInt"
 	case strings.Contains(upperType, "INT"):
 		return "Int"
 	case strings.Contains(upperType, "REAL"), strings.Contains(upperType, "DOUBLE"), strings.Contains(upperType, "FLOAT"):

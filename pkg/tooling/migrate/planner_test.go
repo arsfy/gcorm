@@ -313,6 +313,7 @@ func TestDiff_NilSchemas(t *testing.T) {
 func buildCreateTableChangeset() *Changeset {
 	user := testModel("User",
 		testField("id", "Int"),
+		testField("rank", "SmallInt"),
 		testField("email", "String"),
 	)
 	schema := testSchema(user)
@@ -342,6 +343,9 @@ func TestDDLGenerateUp_PostgreSQL(t *testing.T) {
 	}
 	if !strings.Contains(sql, "INTEGER") {
 		t.Error("expected INTEGER type for id")
+	}
+	if !strings.Contains(sql, "SMALLINT") {
+		t.Error("expected SMALLINT type for rank")
 	}
 	if !strings.Contains(sql, "TEXT") {
 		t.Error("expected TEXT type for email/name")
@@ -586,6 +590,25 @@ func TestDDLGenerateUp_SQLite(t *testing.T) {
 	}
 	if !strings.Contains(sql, "TEXT") {
 		t.Error("expected TEXT type for email")
+	}
+}
+
+func TestDDLSmallIntTypeMapping(t *testing.T) {
+	cases := []struct {
+		dialect string
+		want    string
+	}{
+		{"postgresql", "SMALLINT"},
+		{"mysql", "SMALLINT"},
+		{"sqlite", "INTEGER"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.dialect, func(t *testing.T) {
+			got := DDLGenerator{Dialect: tc.dialect}.sqlType("SmallInt")
+			if got != tc.want {
+				t.Fatalf("sqlType(SmallInt) = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

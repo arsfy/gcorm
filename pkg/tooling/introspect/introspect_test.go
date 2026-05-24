@@ -47,6 +47,8 @@ func TestMapSQLType(t *testing.T) {
 	}{
 		{"postgresql", "UUID", "UUID"},
 		{"postgresql", "BIGINT", "BigInt"},
+		{"postgresql", "SMALLINT", "SmallInt"},
+		{"postgresql", "INT2", "SmallInt"},
 		{"postgresql", "INTEGER", "Int"},
 		{"postgresql", "DOUBLE PRECISION", "Float"},
 		{"postgresql", "DECIMAL(10,2)", "Decimal"},
@@ -57,6 +59,7 @@ func TestMapSQLType(t *testing.T) {
 		{"postgresql", "TEXT", "String"},
 		{"postgresql", "VARCHAR(255)", "String"},
 		{"mysql", "TINYINT(1)", "Boolean"},
+		{"mysql", "SMALLINT", "SmallInt"},
 		{"mysql", "INT", "Int"},
 		{"mysql", "BIGINT", "BigInt"},
 		{"mysql", "DATETIME(3)", "DateTime"},

@@ -96,6 +96,8 @@ func (SQLite) TypeMapping(schemaType string, isOptional bool) string {
 		t = "TEXT"
 	case "Int":
 		t = "INTEGER"
+	case "SmallInt":
+		t = "INTEGER"
 	case "BigInt":
 		t = "INTEGER"
 	case "Float":
