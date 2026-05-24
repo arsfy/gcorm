@@ -165,10 +165,11 @@ Flags:
   --config <path>    Path to configuration file
 ```
 
-`gco upgrade` checks GitHub releases and upgrades with:
+`gco upgrade` checks GitHub releases and upgrades with the concrete latest
+release tag:
 
 ```sh
-go install github.com/arsfy/gcorm/cmd/gco@latest
+go install github.com/arsfy/gcorm/cmd/gco@va.b.c
 ```
 
 The upgrade command is limited to binaries installed with `go install`. If GCORM

@@ -23,10 +23,10 @@ the current binary was installed with:
 go install github.com/arsfy/gcorm/cmd/gco@version
 ```
 
-The upgrade path uses:
+The upgrade path uses the concrete latest GitHub release tag:
 
 ```sh
-go install github.com/arsfy/gcorm/cmd/gco@latest
+go install github.com/arsfy/gcorm/cmd/gco@va.b.c
 ```
 
 ## Manual Binary Installs
@@ -67,4 +67,3 @@ gco upgrade
 
 This keeps normal CLI commands predictable and avoids unexpected network checks
 during validation, generation, or database workflows.
-

@@ -1,7 +1,9 @@
 package upgrade
 
 import (
+	"bytes"
 	"context"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -70,6 +72,74 @@ func TestRunAlreadyUpToDateSkipsInstall(t *testing.T) {
 	}
 }
 
+func TestRunInstallsSpecificLatestRelease(t *testing.T) {
+	info := &debug.BuildInfo{
+		Path: commandPath,
+		Main: debug.Module{
+			Path:    modulePath,
+			Version: "v0.1.0",
+		},
+	}
+
+	var out bytes.Buffer
+	var gotName string
+	var gotArgs []string
+	err := runWithBuildInfo(context.Background(), Options{
+		InjectedVersion: "dev",
+		Out:             &out,
+		CheckLatest: func(context.Context, string, string, string) (versioncheck.Result, error) {
+			return versioncheck.Result{Current: "v0.1.0", Latest: "v0.2.0", UpdateAvailable: true}, nil
+		},
+		CommandContext: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			gotName = name
+			gotArgs = append([]string(nil), args...)
+			return exec.CommandContext(ctx, "go", "version")
+		},
+	}, info, true)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if gotName != "go" {
+		t.Fatalf("command name = %q, want go", gotName)
+	}
+	if len(gotArgs) != 2 || gotArgs[0] != "install" || gotArgs[1] != "github.com/arsfy/gcorm/cmd/gco@v0.2.0" {
+		t.Fatalf("command args = %#v", gotArgs)
+	}
+	if strings.Contains(strings.Join(gotArgs, " "), "@latest") {
+		t.Fatalf("upgrade command used @latest: %#v", gotArgs)
+	}
+	if !strings.Contains(out.String(), "upgrading gco v0.1.0 -> v0.2.0") {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestRunRequiresLatestReleaseCheck(t *testing.T) {
+	info := &debug.BuildInfo{
+		Path: commandPath,
+		Main: debug.Module{
+			Path:    modulePath,
+			Version: "v0.1.0",
+		},
+	}
+
+	err := runWithBuildInfo(context.Background(), Options{
+		InjectedVersion: "dev",
+		CheckLatest: func(context.Context, string, string, string) (versioncheck.Result, error) {
+			return versioncheck.Result{}, context.Canceled
+		},
+		CommandContext: func(context.Context, string, ...string) *exec.Cmd {
+			t.Fatal("CommandContext should not be called when latest release check fails")
+			return nil
+		},
+	}, info, true)
+	if err == nil {
+		t.Fatal("Run() error = nil, want check latest error")
+	}
+	if !strings.Contains(err.Error(), "check latest release") {
+		t.Fatalf("Run() error = %v", err)
+	}
+}
+
 func TestIsGoInstallBuildRejectsWrongCommand(t *testing.T) {
 	info := &debug.BuildInfo{
 		Path: "github.com/arsfy/gcorm/cmd/other",
@@ -81,5 +151,12 @@ func TestIsGoInstallBuildRejectsWrongCommand(t *testing.T) {
 
 	if isGoInstallBuild(info, "dev") {
 		t.Fatal("different command package should not be treated as gco go install")
+	}
+}
+
+func TestInstallSpecForVersion(t *testing.T) {
+	got := installSpecForVersion(" v1.2.3 ")
+	if got != "github.com/arsfy/gcorm/cmd/gco@v1.2.3" {
+		t.Fatalf("installSpecForVersion() = %q", got)
 	}
 }
