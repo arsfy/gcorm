@@ -153,12 +153,23 @@ Commands:
     resolve    Resolve migration state
   db push      Push schema changes directly to database
   version      Print version information
+  upgrade      Upgrade gco when installed with go install
   help         Show this help message
 
 Flags:
   --schema <path>    Path to schema directory or file
   --config <path>    Path to configuration file
 ```
+
+`gco upgrade` checks GitHub releases and upgrades with:
+
+```sh
+go install github.com/arsfy/gcorm/cmd/gco@latest
+```
+
+The upgrade command is limited to binaries installed with `go install`. If GCORM
+was installed manually from a release archive, download and replace the binary
+from GitHub Releases instead.
 
 ## Configuration
 
@@ -299,6 +310,19 @@ Run generated-client runtime benchmarks:
 GCO_RUN_GENERATED_BENCH=1 go test -v ./pkg/codegen/golang \
   -run TestGeneratedClientBulkCreateAndRawRuntime -count=1
 ```
+
+## Release Builds
+
+Release archive builds can inject the CLI version with Go linker flags:
+
+```sh
+go build -ldflags "-X main.Version=v0.1.0" ./cmd/gco
+```
+
+When installed with `go install github.com/arsfy/gcorm/cmd/gco@v0.1.0`, GCORM
+uses Go build metadata to report the module version and allows `gco upgrade` to
+upgrade the CLI through `go install`. Manually downloaded binaries should be
+upgraded manually from GitHub Releases.
 
 ## Project Layout
 

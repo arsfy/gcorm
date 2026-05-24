@@ -2,10 +2,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"github.com/arsfy/gcorm/internal/config"
+	"github.com/arsfy/gcorm/internal/upgrade"
 	"github.com/arsfy/gcorm/pkg/schema/compiler"
 	"github.com/arsfy/gcorm/pkg/schema/parser"
 	"github.com/arsfy/gcorm/pkg/tooling/dbpush"
@@ -16,7 +19,7 @@ import (
 	"github.com/arsfy/gcorm/pkg/tooling/migrate"
 )
 
-const version = "0.1.0"
+var Version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -45,8 +48,10 @@ func main() {
 			fmt.Fprintf(os.Stderr, "unknown db subcommand\n")
 			os.Exit(1)
 		}
-	case "version":
-		fmt.Printf("gco v%s\n", version)
+	case "version", "--version", "-v":
+		printVersion()
+	case "upgrade":
+		err = upgrade.Run(context.Background(), upgrade.Options{InjectedVersion: Version})
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -59,6 +64,20 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func currentVersion() string {
+	if Version != "" && Version != "dev" {
+		return Version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info != nil && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "dev"
+}
+
+func printVersion() {
+	fmt.Printf("gco %s\n", currentVersion())
 }
 
 func printUsage() {
@@ -80,6 +99,7 @@ Commands:
     resolve    Resolve migration state
   db push      Push schema changes directly to database
   version      Print version information
+  upgrade      Upgrade gco when installed with go install
   help         Show this help message
 
 Flags:
