@@ -313,29 +313,10 @@ GCO_RUN_GENERATED_BENCH=1 go test -v ./pkg/codegen/golang \
 
 ## Release Builds
 
-When a GitHub release is published, the `.github/workflows/release.yml`
-workflow automatically compiles `gco` for the following targets and attaches the
-archives to the release:
-
-| Target          | Archive                                   | UPX |
-| --------------- | ----------------------------------------- | --- |
-| Linux AMD64     | `gco-<version>-linux-amd64.tar.gz`        | ✓   |
-| Linux ARM64     | `gco-<version>-linux-arm64.tar.gz`        | ✓   |
-| Windows AMD64   | `gco-<version>-windows-amd64.zip`         | ✓   |
-| Windows ARM64   | `gco-<version>-windows-arm64.zip`         | ✓   |
-| macOS AMD64     | `gco-<version>-darwin-amd64.tar.gz`       | –   |
-| macOS ARM64     | `gco-<version>-darwin-arm64.tar.gz`       | –   |
-
-All binaries are built with `CGO_ENABLED=0` for fully static output, and the
-version is injected via linker flags. Linux and Windows binaries are compressed
-with [UPX](https://upx.github.io/) (`--best`) to reduce executable size. macOS
-binaries are left uncompressed because UPX is not compatible with macOS code
-signing.
-
-To reproduce a release binary locally:
+Release archive builds can inject the CLI version with Go linker flags:
 
 ```sh
-go build -ldflags "-s -w -X main.Version=v0.1.0" -o gco ./cmd/gco
+go build -ldflags "-X main.Version=v0.1.0" ./cmd/gco
 ```
 
 When installed with `go install github.com/arsfy/gcorm/cmd/gco@v0.1.0`, GCORM
