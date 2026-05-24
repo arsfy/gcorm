@@ -264,6 +264,45 @@ func TestDatabaseScalarTypeSmallInt(t *testing.T) {
 	}
 }
 
+func TestPostgresColumnTypeArray(t *testing.T) {
+	scalarType, isList := postgresColumnType("ARRAY", "_int8")
+	if scalarType != "BigInt" || !isList {
+		t.Fatalf("postgresColumnType(ARRAY, _int8) = %q, %v; want BigInt, true", scalarType, isList)
+	}
+
+	scalarType, isList = postgresColumnType("ARRAY", "_int2")
+	if scalarType != "SmallInt" || !isList {
+		t.Fatalf("postgresColumnType(ARRAY, _int2) = %q, %v; want SmallInt, true", scalarType, isList)
+	}
+}
+
+func TestPostgresDefaultValueNormalizesIdentityAndCasts(t *testing.T) {
+	identity := postgresDefaultValue("", true)
+	if identity == nil || !identity.IsFunction || identity.FuncName != "autoincrement" {
+		t.Fatalf("identity default = %#v, want autoincrement", identity)
+	}
+
+	text := postgresDefaultValue("''::text", false)
+	if text == nil || !text.IsString || text.Value != "" {
+		t.Fatalf("text default = %#v, want empty string", text)
+	}
+
+	json := postgresDefaultValue("'[]'::jsonb", false)
+	if json == nil || !json.IsString || json.Value != "[]" {
+		t.Fatalf("json default = %#v, want [] string", json)
+	}
+
+	number := postgresDefaultValue("0", false)
+	if number == nil || !number.IsNumber || number.Value != "0" {
+		t.Fatalf("numeric default = %#v, want numeric 0", number)
+	}
+
+	array := postgresDefaultValue("'{}'::bigint[]", false)
+	if array == nil || !array.IsArray || len(array.ArrayValue) != 0 {
+		t.Fatalf("array default = %#v, want empty array", array)
+	}
+}
+
 func TestParsePostgresIndexColumnDef(t *testing.T) {
 	col := parsePostgresIndexColumnDef("published_at", `"published_at" COLLATE "pg_catalog"."default" timestamptz_ops ASC NULLS LAST`)
 
@@ -288,6 +327,9 @@ func TestParsePostgresIndexColumns(t *testing.T) {
 	cols := parsePostgresIndexColumns(
 		[]string{"status", "published_at"},
 		[]string{`status int8_ops DESC`, `"published_at" timestamptz_ops ASC NULLS LAST`},
+		nil,
+		nil,
+		nil,
 	)
 
 	if len(cols) != 2 {
@@ -298,6 +340,28 @@ func TestParsePostgresIndexColumns(t *testing.T) {
 	}
 	if cols[1].Field != "published_at" || cols[1].OpClass != "timestamptz_ops" || cols[1].Sort != "ASC" || cols[1].Nulls != "LAST" {
 		t.Fatalf("second column = %+v", cols[1])
+	}
+}
+
+func TestParsePostgresIndexColumnsCatalogOptions(t *testing.T) {
+	cols := parsePostgresIndexColumns(
+		[]string{"pinned", "published_at", "id"},
+		[]string{"pinned", "published_at", "id"},
+		[]string{"1", "1", "1"},
+		[]string{"bool_ops", "timestamptz_ops", "int8_ops"},
+		[]string{"NULL", "NULL", "NULL"},
+	)
+
+	if len(cols) != 3 {
+		t.Fatalf("columns = %d, want 3", len(cols))
+	}
+	for _, col := range cols {
+		if col.Sort != "DESC" || col.Nulls != "LAST" {
+			t.Fatalf("column options = %+v, want DESC NULLS LAST", col)
+		}
+	}
+	if cols[0].OpClass != "bool_ops" || cols[1].OpClass != "timestamptz_ops" || cols[2].OpClass != "int8_ops" {
+		t.Fatalf("opclasses = %+v", cols)
 	}
 }
 

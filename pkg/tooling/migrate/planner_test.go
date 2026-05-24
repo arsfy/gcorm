@@ -140,6 +140,33 @@ func TestDiff_TypeChange(t *testing.T) {
 	}
 }
 
+func TestDiff_ListTypeSignature(t *testing.T) {
+	oldSSHKeys := testField("sshkeys", "BigInt")
+	oldSSHKeys.IsList = true
+	newSSHKeys := testField("sshkeys", "BigInt")
+	newSSHKeys.IsList = true
+
+	cs := Diff(
+		testSchema(testModel("Instance", testField("id", "Int"), oldSSHKeys)),
+		testSchema(testModel("Instance", testField("id", "Int"), newSSHKeys)),
+	)
+	if hasChange(cs, AlterType, "Instance", "sshkeys") {
+		t.Fatalf("expected matching BigInt[] fields not to alter type, got: %+v", cs.Changes)
+	}
+
+	newSSHKeys.IsList = false
+	cs = Diff(
+		testSchema(testModel("Instance", testField("id", "Int"), oldSSHKeys)),
+		testSchema(testModel("Instance", testField("id", "Int"), newSSHKeys)),
+	)
+	if !hasChange(cs, AlterType, "Instance", "sshkeys") {
+		t.Fatalf("expected BigInt[] to BigInt to alter type, got: %+v", cs.Changes)
+	}
+	if cs.Changes[0].OldValue != "BigInt[]" || cs.Changes[0].NewValue != "BigInt" {
+		t.Fatalf("type values = %q -> %q, want BigInt[] -> BigInt", cs.Changes[0].OldValue, cs.Changes[0].NewValue)
+	}
+}
+
 func TestDiff_NullabilityChange(t *testing.T) {
 	old := testSchema(testModel("User", testField("id", "Int"), testField("bio", "String")))
 	new := testSchema(testModel("User", testField("id", "Int"), testFieldOptional("bio", "String")))
@@ -163,6 +190,43 @@ func TestDiff_DefaultChange(t *testing.T) {
 	cs := Diff(old, new)
 	if !hasChange(cs, AlterDefault, "User", "uid") {
 		t.Fatal("expected AlterDefault for uid")
+	}
+}
+
+func TestDiff_DropFieldUniqueUsesIntrospectedConstraintName(t *testing.T) {
+	email := testField("email", "String")
+	email.IsUnique = true
+	oldUser := testModel("users", testField("id", "Int"), email)
+	oldUser.UniqueConstraints = []*ir.UniqueConstraint{{
+		Name:   "users_email_key",
+		Fields: []string{"email"},
+	}}
+	newUser := testModel("users", testField("id", "Int"), testField("email", "String"))
+
+	cs := Diff(testSchema(oldUser), testSchema(newUser))
+	if len(cs.Changes) != 1 || cs.Changes[0].Type != DropUnique {
+		t.Fatalf("expected one DropUnique, got: %+v", cs.Changes)
+	}
+	if cs.Changes[0].OldValue != "users_email_key" {
+		t.Fatalf("DropUnique OldValue = %q, want users_email_key", cs.Changes[0].OldValue)
+	}
+}
+
+func TestDiff_FieldUniqueMatchesNamedDatabaseConstraintByFields(t *testing.T) {
+	email := testField("email", "String")
+	email.IsUnique = true
+	oldUser := testModel("users", testField("id", "Int"), email)
+	oldUser.UniqueConstraints = []*ir.UniqueConstraint{{
+		Name:   "users_email_key",
+		Fields: []string{"email"},
+	}}
+	newEmail := testField("email", "String")
+	newEmail.IsUnique = true
+	newUser := testModel("users", testField("id", "Int"), newEmail)
+
+	cs := Diff(testSchema(oldUser), testSchema(newUser))
+	if len(cs.Changes) != 0 {
+		t.Fatalf("expected named DB unique to match field @unique by fields, got: %+v", cs.Changes)
 	}
 }
 
@@ -197,7 +261,7 @@ func TestDiff_IndexOptionsTriggerRecreate(t *testing.T) {
 			Field:   "email",
 			Sort:    "DESC",
 			Nulls:   "LAST",
-			OpClass: "text_ops",
+			OpClass: "text_pattern_ops",
 		}},
 	}}
 
@@ -209,8 +273,53 @@ func TestDiff_IndexOptionsTriggerRecreate(t *testing.T) {
 	if add.Details["where"] != "email IS NOT NULL" {
 		t.Fatalf("where detail = %q", add.Details["where"])
 	}
-	if add.Details["sorts"] != "DESC" || add.Details["nulls"] != "LAST" || add.Details["opclasses"] != "text_ops" {
+	if add.Details["sorts"] != "DESC" || add.Details["nulls"] != "LAST" || add.Details["opclasses"] != "text_pattern_ops" {
 		t.Fatalf("details = %+v", add.Details)
+	}
+}
+
+func TestDiff_IndexSignatureNormalizesPostgreSQLDefaults(t *testing.T) {
+	oldPost := testModel("Post", testField("id", "Int"), testField("status", "BigInt"), testField("publishedAt", "DateTime"))
+	oldPost.DBName = "posts"
+	oldPost.Fields[2].DBName = "published_at"
+	oldPost.Indexes = []*ir.Index{{
+		Name:   "idx_posts_status_published_at",
+		Fields: []string{"status", "published_at"},
+		Where:  "((status = 1) AND (published_at IS NOT NULL))",
+		Columns: []ir.IndexColumn{
+			{Field: "status"},
+			{Field: "published_at"},
+		},
+	}}
+
+	newPost := testModel("Post", testField("id", "Int"), testField("status", "BigInt"), testField("publishedAt", "DateTime"))
+	newPost.DBName = "posts"
+	newPost.Fields[2].DBName = "published_at"
+	newPost.Indexes = []*ir.Index{{
+		Name:   "idx_posts_status_published_at",
+		Fields: []string{"status", "publishedAt"},
+		Where:  "status = 1 AND published_at IS NOT NULL",
+		Columns: []ir.IndexColumn{
+			{
+				Field:     "status",
+				Sort:      "ASC",
+				Nulls:     "LAST",
+				OpClass:   "int8_ops",
+				Collation: "pg_catalog.default",
+			},
+			{
+				Field:     "publishedAt",
+				Sort:      "ASC",
+				Nulls:     "LAST",
+				OpClass:   "timestamptz_ops",
+				Collation: "pg_catalog.default",
+			},
+		},
+	}}
+
+	cs := Diff(testSchema(oldPost), testSchema(newPost))
+	if len(cs.Changes) != 0 {
+		t.Fatalf("expected PostgreSQL default index options to be stable, got: %+v", cs.Changes)
 	}
 }
 
@@ -385,6 +494,39 @@ func TestDDLGenerateUp_PostgreSQLDefaultFunctions(t *testing.T) {
 	}
 	if strings.Contains(sql, "DEFAULT now()") {
 		t.Fatalf("unexpected raw now() default in PostgreSQL DDL:\n%s", sql)
+	}
+}
+
+func TestDDLGenerateUp_PostgreSQLAutoIncrementIsColumnClause(t *testing.T) {
+	table := testModel("announcements",
+		testFieldWithDefault("id", "BigInt", &ir.DefaultValue{IsFunction: true, FuncName: "autoincrement"}),
+	)
+	cs := &Changeset{
+		Changes: []Change{{Type: CreateTable, Model: "announcements", Rollback: SafeRollback}},
+		New:     testSchema(table),
+	}
+
+	sql := DDLGenerator{Dialect: "postgresql", Schema: cs.New}.GenerateUp(cs)
+
+	if strings.Contains(sql, "DEFAULT GENERATED BY DEFAULT AS IDENTITY") {
+		t.Fatalf("autoincrement must not be emitted as DEFAULT expression:\n%s", sql)
+	}
+	if !strings.Contains(sql, `"id" BIGINT GENERATED BY DEFAULT AS IDENTITY NOT NULL`) {
+		t.Fatalf("expected PostgreSQL identity column clause, got:\n%s", sql)
+	}
+}
+
+func TestDDLAlterDefaultPostgreSQLAutoIncrementUsesIdentity(t *testing.T) {
+	change := Change{
+		Type:     AlterDefault,
+		Model:    "announcements",
+		Field:    "id",
+		NewValue: "autoincrement()",
+	}
+
+	sql := DDLGenerator{Dialect: "postgresql"}.alterDefaultSQL(change)
+	if sql != `ALTER TABLE "announcements" ALTER COLUMN "id" ADD GENERATED BY DEFAULT AS IDENTITY;` {
+		t.Fatalf("alter default SQL = %q", sql)
 	}
 }
 
@@ -612,6 +754,35 @@ func TestDDLSmallIntTypeMapping(t *testing.T) {
 	}
 }
 
+func TestDDLPostgresListDefaultEmptyArray(t *testing.T) {
+	field := testField("sshkeys", "BigInt")
+	field.IsList = true
+	field.Default = &ir.DefaultValue{IsArray: true}
+	model := testModel("KeySet", testField("id", "Int"), field)
+	cs := &Changeset{
+		Changes: []Change{{Type: CreateTable, Model: "KeySet", Rollback: SafeRollback}},
+		New:     testSchema(model),
+	}
+
+	sql := DDLGenerator{Dialect: "postgresql", Schema: cs.New}.GenerateUp(cs)
+	if !strings.Contains(sql, `"sshkeys" BIGINT[] NOT NULL DEFAULT '{}'`) {
+		t.Fatalf("expected BigInt[] empty array default, got:\n%s", sql)
+	}
+}
+
+func TestDDLAlterTypePostgresListType(t *testing.T) {
+	sql := DDLGenerator{Dialect: "postgresql"}.alterTypeSQL(Change{
+		Type:     AlterType,
+		Model:    "instance",
+		Field:    "sshkeys",
+		OldValue: "BigInt",
+		NewValue: "BigInt[]",
+	})
+	if sql != `ALTER TABLE "instance" ALTER COLUMN "sshkeys" TYPE BIGINT[];` {
+		t.Fatalf("alter type SQL = %q", sql)
+	}
+}
+
 func TestDDLGenerateDown(t *testing.T) {
 	cs := buildCreateTableChangeset()
 	gen := DDLGenerator{Dialect: "postgresql", Schema: cs.New}
@@ -721,8 +892,23 @@ func TestDDLDropUniqueUsesIfExists(t *testing.T) {
 	}
 
 	pg := DDLGenerator{Dialect: "postgresql"}.dropUniqueSQL(change)
-	if pg != `DROP INDEX IF EXISTS "uq_users_email";` {
+	if pg != `ALTER TABLE "users" DROP CONSTRAINT IF EXISTS "uq_users_email";` {
 		t.Fatalf("postgresql drop unique SQL = %q", pg)
+	}
+}
+
+func TestDDLAddUniqueUsesConstraintForPostgreSQL(t *testing.T) {
+	change := Change{
+		Type:     AddUnique,
+		Model:    "announcement_email_jobs",
+		NewValue: "announcement_email_jobs_announcement_id_uid_key",
+		Details:  map[string]string{"fields": "announcement_id,uid"},
+	}
+
+	pg := DDLGenerator{Dialect: "postgresql"}.addUniqueSQL(change)
+	want := `ALTER TABLE "announcement_email_jobs" ADD CONSTRAINT "announcement_email_jobs_announcement_id_uid_key" UNIQUE ("announcement_id", "uid");`
+	if pg != want {
+		t.Fatalf("postgresql add unique SQL = %q, want %q", pg, want)
 	}
 }
 

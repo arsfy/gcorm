@@ -232,6 +232,36 @@ func TestResolveFieldMap(t *testing.T) {
 	}
 }
 
+func TestResolveListDefault(t *testing.T) {
+	ds := docSet(&ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "KeySet",
+			Fields: []ast.FieldDecl{{
+				Name: "sshkeys",
+				Type: ast.FieldType{Name: "BigInt", IsList: true},
+				Attributes: []ast.Attribute{{
+					Name: "default",
+					Args: []ast.AttributeArg{{
+						Value: ast.ArrayLiteral{},
+					}},
+				}},
+			}},
+		}},
+	})
+
+	schema, errs := Resolve(ds)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	field := schema.Models[0].Fields[0]
+	if field.Default == nil || !field.Default.IsArray {
+		t.Fatalf("default = %#v, want array default", field.Default)
+	}
+	if len(field.Default.ArrayValue) != 0 {
+		t.Fatalf("array default values = %v, want empty", field.Default.ArrayValue)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 6. Resolve model with @relation
 // ---------------------------------------------------------------------------

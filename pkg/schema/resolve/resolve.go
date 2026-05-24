@@ -286,6 +286,11 @@ func (r *resolver) resolveDefault(expr ast.Expression) *ir.DefaultValue {
 	case ast.Identifier:
 		// Enum value reference or bare identifier (e.g. autoincrement).
 		dv.Value = v.Name
+	case ast.ArrayLiteral:
+		dv.IsArray = true
+		for _, elem := range v.Elements {
+			dv.ArrayValue = append(dv.ArrayValue, exprToString(elem))
+		}
 	}
 	return dv
 }

@@ -140,9 +140,9 @@ func compareFields(cs *Changeset, model string, oldFields, newFields []*ir.Field
 
 		switch {
 		case inNew && !inOld:
-			cs.add(Change{Type: AddColumn, Model: model, Field: fn, NewValue: nf.ScalarType})
+			cs.add(Change{Type: AddColumn, Model: model, Field: fn, NewValue: fieldTypeSignature(nf)})
 		case inOld && !inNew:
-			cs.add(Change{Type: DropColumn, Model: model, Field: fn, OldValue: of.ScalarType})
+			cs.add(Change{Type: DropColumn, Model: model, Field: fn, OldValue: fieldTypeSignature(of)})
 		default:
 			compareField(cs, model, of, nf)
 		}
@@ -150,10 +150,12 @@ func compareFields(cs *Changeset, model string, oldFields, newFields []*ir.Field
 }
 
 func compareField(cs *Changeset, model string, of, nf *ir.Field) {
-	if of.ScalarType != nf.ScalarType {
+	oldType := fieldTypeSignature(of)
+	newType := fieldTypeSignature(nf)
+	if oldType != newType {
 		cs.add(Change{
 			Type: AlterType, Model: model, Field: columnName(nf),
-			OldValue: of.ScalarType, NewValue: nf.ScalarType,
+			OldValue: oldType, NewValue: newType,
 		})
 	}
 
@@ -172,20 +174,6 @@ func compareField(cs *Changeset, model string, of, nf *ir.Field) {
 			OldValue: od, NewValue: nd,
 		})
 	}
-
-	if of.IsUnique != nf.IsUnique {
-		changeType := AddUnique
-		if !nf.IsUnique {
-			changeType = DropUnique
-		}
-		cs.add(Change{
-			Type:  changeType,
-			Model: model,
-			Details: map[string]string{
-				"fields": columnName(coalesceField(nf, of)),
-			},
-		})
-	}
 }
 
 func nullLabel(optional bool) string {
@@ -199,6 +187,9 @@ func formatDefault(d *ir.DefaultValue) string {
 	if d == nil {
 		return ""
 	}
+	if d.IsArray {
+		return "[" + strings.Join(d.ArrayValue, ",") + "]"
+	}
 	if d.IsFunction {
 		if len(d.FuncArgs) > 0 {
 			return d.FuncName + "(" + strings.Join(d.FuncArgs, ",") + ")"
@@ -206,6 +197,16 @@ func formatDefault(d *ir.DefaultValue) string {
 		return d.FuncName + "()"
 	}
 	return d.Value
+}
+
+func fieldTypeSignature(f *ir.Field) string {
+	if f == nil {
+		return ""
+	}
+	if f.IsList {
+		return f.ScalarType + "[]"
+	}
+	return f.ScalarType
 }
 
 // ---------------------------------------------------------------------------
@@ -267,15 +268,148 @@ func indexSignature(idx *ir.Index) string {
 	if idx == nil {
 		return ""
 	}
+	cols := effectiveIndexColumns(idx)
 	return strings.Join([]string{
 		strings.Join(idx.Fields, ","),
 		boolStr(idx.IsUnique),
-		idx.Where,
-		strings.Join(indexColumnValues(effectiveIndexColumns(idx), func(c ir.IndexColumn) string { return c.Sort }), ","),
-		strings.Join(indexColumnValues(effectiveIndexColumns(idx), func(c ir.IndexColumn) string { return c.Nulls }), ","),
-		strings.Join(indexColumnValues(effectiveIndexColumns(idx), func(c ir.IndexColumn) string { return c.OpClass }), ","),
-		strings.Join(indexColumnValues(effectiveIndexColumns(idx), func(c ir.IndexColumn) string { return c.Collation }), ","),
+		normalizeIndexPredicate(idx.Where),
+		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexSort(c.Sort) }), ","),
+		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexNulls(c.Sort, c.Nulls) }), ","),
+		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexOpClass(c.OpClass) }), ","),
+		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexCollation(c.Collation) }), ","),
 	}, "\x00")
+}
+
+func normalizeIndexPredicate(where string) string {
+	where = strings.TrimSpace(where)
+	for hasWrappingParens(where) {
+		where = strings.TrimSpace(where[1 : len(where)-1])
+	}
+	for {
+		next := stripSimplePredicateParens(where)
+		if next == where {
+			break
+		}
+		where = next
+	}
+	return strings.Join(strings.Fields(where), " ")
+}
+
+func stripSimplePredicateParens(s string) string {
+	var b strings.Builder
+	changed := false
+	for i := 0; i < len(s); i++ {
+		if s[i] != '(' || (i > 0 && !isPredicateBoundaryByte(s[i-1])) {
+			b.WriteByte(s[i])
+			continue
+		}
+		end := matchingParenIndex(s, i)
+		if end == -1 || (end+1 < len(s) && !isPredicateBoundaryByte(s[end+1])) {
+			b.WriteByte(s[i])
+			continue
+		}
+		inner := strings.TrimSpace(s[i+1 : end])
+		upper := strings.ToUpper(inner)
+		if strings.Contains(upper, " AND ") || strings.Contains(upper, " OR ") {
+			b.WriteByte(s[i])
+			continue
+		}
+		b.WriteString(inner)
+		i = end
+		changed = true
+	}
+	if !changed {
+		return s
+	}
+	return b.String()
+}
+
+func matchingParenIndex(s string, start int) int {
+	depth := 0
+	for i := start; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func isPredicateBoundaryByte(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\n', '\r', '(', ')':
+		return true
+	default:
+		return false
+	}
+}
+
+func hasWrappingParens(s string) bool {
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return false
+	}
+	depth := 0
+	for i, r := range s {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && i != len(s)-1 {
+				return false
+			}
+		}
+		if depth < 0 {
+			return false
+		}
+	}
+	return depth == 0
+}
+
+func normalizeIndexSort(sort string) string {
+	sort = strings.ToUpper(strings.TrimSpace(sort))
+	if sort == "" {
+		return "ASC"
+	}
+	return sort
+}
+
+func normalizeIndexNulls(sort, nulls string) string {
+	nulls = strings.ToUpper(strings.TrimSpace(nulls))
+	if nulls != "" {
+		return nulls
+	}
+	if normalizeIndexSort(sort) == "DESC" {
+		return "FIRST"
+	}
+	return "LAST"
+}
+
+func normalizeIndexOpClass(opclass string) string {
+	opclass = strings.TrimSpace(opclass)
+	switch strings.ToLower(opclass) {
+	case "bool_ops", "int2_ops", "int4_ops", "int8_ops", "text_ops", "timestamp_ops", "timestamptz_ops", "uuid_ops":
+		return ""
+	default:
+		return opclass
+	}
+}
+
+func normalizeIndexCollation(collation string) string {
+	collation = strings.Trim(strings.TrimSpace(collation), `"`)
+	collation = strings.ReplaceAll(collation, `"."`, ".")
+	collation = strings.ReplaceAll(collation, `"`, "")
+	switch strings.ToLower(collation) {
+	case "default", "pg_catalog.default":
+		return ""
+	default:
+		return collation
+	}
 }
 
 func indexColumnValues(cols []ir.IndexColumn, pick func(ir.IndexColumn) string) []string {
@@ -335,16 +469,8 @@ func defaultIndexName(model *ir.Model, fields []string) string {
 // ---------------------------------------------------------------------------
 
 func compareUniques(cs *Changeset, model string, oldM, newM *ir.Model) {
-	oldMap := make(map[string]*ir.UniqueConstraint, len(oldM.UniqueConstraints))
-	for _, uc := range oldM.UniqueConstraints {
-		normalized := normalizedUnique(oldM, uc)
-		oldMap[ucKey(normalized)] = normalized
-	}
-	newMap := make(map[string]*ir.UniqueConstraint, len(newM.UniqueConstraints))
-	for _, uc := range newM.UniqueConstraints {
-		normalized := normalizedUnique(newM, uc)
-		newMap[ucKey(normalized)] = normalized
-	}
+	oldMap := mapUniqueConstraints(oldM)
+	newMap := mapUniqueConstraints(newM)
 	allKeys := mergedSortedKeys(oldMap, newMap)
 
 	for _, k := range allKeys {
@@ -366,10 +492,31 @@ func compareUniques(cs *Changeset, model string, oldM, newM *ir.Model) {
 	}
 }
 
-func ucKey(uc *ir.UniqueConstraint) string {
-	if uc.Name != "" {
-		return uc.Name
+func mapUniqueConstraints(model *ir.Model) map[string]*ir.UniqueConstraint {
+	constraints := make([]*ir.UniqueConstraint, 0, len(model.UniqueConstraints)+len(model.Fields))
+	for _, uc := range model.UniqueConstraints {
+		constraints = append(constraints, uc)
 	}
+	for _, field := range model.ScalarFields() {
+		if !field.IsUnique {
+			continue
+		}
+		constraints = append(constraints, &ir.UniqueConstraint{Fields: []string{field.Name}})
+	}
+
+	out := make(map[string]*ir.UniqueConstraint, len(constraints))
+	for _, uc := range constraints {
+		normalized := normalizedUnique(model, uc)
+		key := ucKey(normalized)
+		if existing := out[key]; existing != nil && existing.Name != "" {
+			continue
+		}
+		out[key] = normalized
+	}
+	return out
+}
+
+func ucKey(uc *ir.UniqueConstraint) string {
 	return strings.Join(uc.Fields, ",")
 }
 

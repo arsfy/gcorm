@@ -98,6 +98,8 @@ type DefaultValue struct {
 	FuncName   string // e.g. "uuid", "now", "autoincrement"
 	FuncArgs   []string
 	Value      string // literal value for non-function defaults
+	IsArray    bool
+	ArrayValue []string
 	IsString   bool
 	IsNumber   bool
 	IsBool     bool

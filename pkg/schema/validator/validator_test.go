@@ -266,6 +266,48 @@ func TestDefaultWithWrongArgCount(t *testing.T) {
 	requireErrors(t, r, "@default requires exactly one argument")
 }
 
+func TestListDefaultAllowsEmptyArray(t *testing.T) {
+	doc := &ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "KeySet",
+			Fields: []ast.FieldDecl{
+				{Name: "id", Type: ast.FieldType{Name: "Int"}},
+				{
+					Name: "sshkeys",
+					Type: ast.FieldType{Name: "BigInt", IsList: true},
+					Attributes: []ast.Attribute{{
+						Name: "default",
+						Args: []ast.AttributeArg{posArg(arrayLit())},
+					}},
+				},
+			},
+		}},
+	}
+	r := Validate(doc)
+	requireNoErrors(t, r)
+}
+
+func TestListDefaultValidatesElementTypes(t *testing.T) {
+	doc := &ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "KeySet",
+			Fields: []ast.FieldDecl{
+				{Name: "id", Type: ast.FieldType{Name: "Int"}},
+				{
+					Name: "sshkeys",
+					Type: ast.FieldType{Name: "BigInt", IsList: true},
+					Attributes: []ast.Attribute{{
+						Name: "default",
+						Args: []ast.AttributeArg{posArg(arrayLit(strLit("bad")))},
+					}},
+				},
+			},
+		}},
+	}
+	r := Validate(doc)
+	requireErrors(t, r, "must be numbers")
+}
+
 func TestUpdatedAtOnNonDateTime(t *testing.T) {
 	doc := &ast.Document{
 		Models: []ast.ModelDecl{{

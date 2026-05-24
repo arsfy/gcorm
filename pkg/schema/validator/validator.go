@@ -369,6 +369,10 @@ func (v *validator) validateDefaultArg(arg ast.AttributeArg, f ast.FieldDecl) {
 	if _, ok := arg.Value.(ast.FunctionCall); ok {
 		return
 	}
+	if f.Type.IsList {
+		v.validateListDefaultArg(arg, f)
+		return
+	}
 	switch f.Type.Name {
 	case "String":
 		if _, ok := arg.Value.(ast.StringLiteral); !ok {
@@ -384,6 +388,39 @@ func (v *validator) validateDefaultArg(arg ast.AttributeArg, f ast.FieldDecl) {
 		if _, ok := arg.Value.(ast.BooleanLiteral); !ok {
 			v.addError(arg.Span.Start,
 				"@default value for Boolean field must be a boolean or function call")
+		}
+	}
+}
+
+func (v *validator) validateListDefaultArg(arg ast.AttributeArg, f ast.FieldDecl) {
+	arr, ok := arg.Value.(ast.ArrayLiteral)
+	if !ok {
+		v.addError(arg.Span.Start, fmt.Sprintf(
+			"@default value for %s[] field must be an array literal or function call", f.Type.Name))
+		return
+	}
+	for _, elem := range arr.Elements {
+		switch f.Type.Name {
+		case "String", "UUID", "Bytes", "Json":
+			if _, ok := elem.(ast.StringLiteral); !ok {
+				v.addError(elem.ExprSpan().Start, fmt.Sprintf(
+					"@default array values for %s[] field must be strings", f.Type.Name))
+			}
+		case "Int", "SmallInt", "BigInt", "Float", "Decimal":
+			if _, ok := elem.(ast.NumberLiteral); !ok {
+				v.addError(elem.ExprSpan().Start, fmt.Sprintf(
+					"@default array values for %s[] field must be numbers", f.Type.Name))
+			}
+		case "Boolean":
+			if _, ok := elem.(ast.BooleanLiteral); !ok {
+				v.addError(elem.ExprSpan().Start,
+					"@default array values for Boolean[] field must be booleans")
+			}
+		case "DateTime":
+			if _, ok := elem.(ast.StringLiteral); !ok {
+				v.addError(elem.ExprSpan().Start,
+					"@default array values for DateTime[] field must be strings or use a function default")
+			}
 		}
 	}
 }

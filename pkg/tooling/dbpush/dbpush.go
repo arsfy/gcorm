@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -112,6 +113,13 @@ func Run(args []string) error {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
+
+	if provider == "postgresql" {
+		schemaName := resolveSchemaName(targetSchema, dsn)
+		if _, err := tx.ExecContext(ctx, "SET LOCAL search_path TO "+postgresQuoteIdent(schemaName)); err != nil {
+			return fmt.Errorf("set search_path to %q: %w", schemaName, err)
+		}
+	}
 
 	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
@@ -568,7 +576,7 @@ ORDER BY table_name`, schemaName)
 
 func loadPostgresColumns(ctx context.Context, db *sql.DB, schemaName string, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
-SELECT table_name, column_name, is_nullable, data_type, udt_name, column_default
+SELECT table_name, column_name, is_nullable, data_type, udt_name, column_default, is_identity
 FROM information_schema.columns
 WHERE table_schema = $1
 ORDER BY table_name, ordinal_position`, schemaName)
@@ -578,9 +586,9 @@ ORDER BY table_name, ordinal_position`, schemaName)
 	defer rows.Close()
 
 	for rows.Next() {
-		var tableName, columnName, isNullable, dataType, udtName string
+		var tableName, columnName, isNullable, dataType, udtName, isIdentity string
 		var columnDefault sql.NullString
-		if err := rows.Scan(&tableName, &columnName, &isNullable, &dataType, &udtName, &columnDefault); err != nil {
+		if err := rows.Scan(&tableName, &columnName, &isNullable, &dataType, &udtName, &columnDefault, &isIdentity); err != nil {
 			return err
 		}
 		model := models[tableName]
@@ -591,10 +599,10 @@ ORDER BY table_name, ordinal_position`, schemaName)
 			Name:       columnName,
 			DBName:     columnName,
 			Type:       ir.FieldKindScalar,
-			ScalarType: postgresScalarType(dataType, udtName),
 			IsOptional: isNullable == "YES",
-			Default:    postgresDefaultValue(columnDefault.String),
+			Default:    postgresDefaultValue(columnDefault.String, isIdentity == "YES"),
 		}
+		field.ScalarType, field.IsList = postgresColumnType(dataType, udtName)
 		model.Fields = append(model.Fields, field)
 	}
 	return rows.Err()
@@ -686,7 +694,6 @@ ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`, schemaName)
 		if len(fields) == 1 {
 			if field := findFieldByColumn(model, fields[0]); field != nil {
 				field.IsUnique = true
-				continue
 			}
 		}
 		model.UniqueConstraints = append(model.UniqueConstraints, &ir.UniqueConstraint{
@@ -705,6 +712,9 @@ SELECT
   ix.indisunique,
   array_agg(a.attname ORDER BY keys.ord) AS columns,
   array_agg(pg_get_indexdef(ix.indexrelid, keys.ord::int, false) ORDER BY keys.ord) AS column_defs,
+  array_agg((ix.indoption::int2[])[keys.ord::int - 1] ORDER BY keys.ord) AS column_options,
+  array_agg(opc.opcname ORDER BY keys.ord) AS opclasses,
+  array_agg(CASE WHEN coll.oid IS NULL THEN '' ELSE collns.nspname || '.' || coll.collname END ORDER BY keys.ord) AS collations,
   pg_get_expr(ix.indpred, ix.indrelid) AS predicate
 FROM pg_class t
 JOIN pg_namespace ns ON ns.oid = t.relnamespace
@@ -712,12 +722,17 @@ JOIN pg_index ix ON t.oid = ix.indrelid
 JOIN pg_class i ON i.oid = ix.indexrelid
 JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS keys(attnum, ord) ON true
 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = keys.attnum
+JOIN LATERAL unnest(ix.indclass) WITH ORDINALITY AS classes(opcoid, ord) ON classes.ord = keys.ord
+JOIN pg_opclass opc ON opc.oid = classes.opcoid
+JOIN LATERAL unnest(ix.indcollation) WITH ORDINALITY AS index_collations(colloid, ord) ON index_collations.ord = keys.ord
+LEFT JOIN pg_collation coll ON coll.oid = index_collations.colloid
+LEFT JOIN pg_namespace collns ON collns.oid = coll.collnamespace
 LEFT JOIN pg_constraint c ON c.conindid = ix.indexrelid
 WHERE ns.nspname = $1
   AND t.relkind = 'r'
   AND NOT ix.indisprimary
   AND c.oid IS NULL
-GROUP BY t.relname, i.relname, ix.indisunique, ix.indpred, ix.indrelid
+GROUP BY t.relname, i.relname, ix.indisunique, ix.indpred, ix.indrelid, ix.indexrelid
 ORDER BY t.relname, i.relname`, schemaName)
 	if err != nil {
 		return err
@@ -727,9 +742,9 @@ ORDER BY t.relname, i.relname`, schemaName)
 	for rows.Next() {
 		var tableName, indexName string
 		var isUnique bool
-		var columns, columnDefs []byte
+		var columns, columnDefs, columnOptions, opclasses, collations []byte
 		var predicate sql.NullString
-		if err := rows.Scan(&tableName, &indexName, &isUnique, &columns, &columnDefs, &predicate); err != nil {
+		if err := rows.Scan(&tableName, &indexName, &isUnique, &columns, &columnDefs, &columnOptions, &opclasses, &collations, &predicate); err != nil {
 			return err
 		}
 		model := models[tableName]
@@ -740,7 +755,7 @@ ORDER BY t.relname, i.relname`, schemaName)
 		model.Indexes = append(model.Indexes, &ir.Index{
 			Name:     indexName,
 			Fields:   fields,
-			Columns:  parsePostgresIndexColumns(fields, parsePostgresTextArray(string(columnDefs))),
+			Columns:  parsePostgresIndexColumns(fields, parsePostgresTextArray(string(columnDefs)), parsePostgresTextArray(string(columnOptions)), parsePostgresTextArray(string(opclasses)), parsePostgresTextArray(string(collations))),
 			Where:    strings.TrimSpace(predicate.String),
 			IsUnique: isUnique,
 		})
@@ -952,7 +967,6 @@ ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`)
 		if len(fields) == 1 {
 			if field := findFieldByColumn(model, fields[0]); field != nil {
 				field.IsUnique = true
-				continue
 			}
 		}
 		model.UniqueConstraints = append(model.UniqueConstraints, &ir.UniqueConstraint{Name: key.name, Fields: fields})
@@ -1173,7 +1187,6 @@ func loadSQLiteIndexes(ctx context.Context, db *sql.DB, models map[string]*ir.Mo
 				if len(fields) == 1 {
 					if field := findFieldByColumn(model, fields[0]); field != nil {
 						field.IsUnique = true
-						continue
 					}
 				}
 				model.UniqueConstraints = append(model.UniqueConstraints, &ir.UniqueConstraint{Name: idx.name, Fields: fields})
@@ -1251,36 +1264,48 @@ func loadSQLiteForeignKeys(ctx context.Context, db *sql.DB, models map[string]*i
 	return nil
 }
 
+func postgresColumnType(dataType, udtName string) (string, bool) {
+	upperType := strings.ToUpper(strings.TrimSpace(dataType))
+	upperUDT := strings.ToUpper(strings.TrimSpace(udtName))
+	if upperType == "ARRAY" || strings.HasPrefix(upperUDT, "_") {
+		return postgresScalarType("", strings.TrimPrefix(udtName, "_")), true
+	}
+	return postgresScalarType(dataType, udtName), false
+}
+
 func postgresScalarType(dataType, udtName string) string {
-	upperType := strings.ToUpper(dataType)
-	upperUDT := strings.ToUpper(udtName)
+	upperType := strings.ToUpper(strings.TrimSpace(dataType))
+	upperUDT := strings.ToUpper(strings.TrimSpace(udtName))
 	switch {
 	case upperUDT == "UUID":
 		return "UUID"
-	case strings.Contains(upperType, "BIGINT"), upperType == "INT8":
+	case strings.Contains(upperType, "BIGINT"), upperType == "INT8", upperUDT == "INT8":
 		return "BigInt"
-	case strings.Contains(upperType, "SMALLINT"), upperType == "INT2":
+	case strings.Contains(upperType, "SMALLINT"), upperType == "INT2", upperUDT == "INT2":
 		return "SmallInt"
-	case strings.Contains(upperType, "INTEGER"), upperType == "INT4":
+	case strings.Contains(upperType, "INTEGER"), upperType == "INT4", upperUDT == "INT4":
 		return "Int"
-	case strings.Contains(upperType, "DOUBLE"), strings.Contains(upperType, "REAL"):
+	case strings.Contains(upperType, "DOUBLE"), strings.Contains(upperType, "REAL"), upperUDT == "FLOAT8", upperUDT == "FLOAT4":
 		return "Float"
-	case strings.Contains(upperType, "NUMERIC"), strings.Contains(upperType, "DECIMAL"):
+	case strings.Contains(upperType, "NUMERIC"), strings.Contains(upperType, "DECIMAL"), upperUDT == "NUMERIC":
 		return "Decimal"
-	case strings.Contains(upperType, "BOOLEAN"):
+	case strings.Contains(upperType, "BOOLEAN"), upperUDT == "BOOL":
 		return "Boolean"
-	case strings.Contains(upperType, "TIMESTAMP"), strings.Contains(upperType, "DATE"), strings.Contains(upperType, "TIME"):
+	case strings.Contains(upperType, "TIMESTAMP"), strings.Contains(upperType, "DATE"), strings.Contains(upperType, "TIME"), upperUDT == "TIMESTAMP", upperUDT == "TIMESTAMPTZ", upperUDT == "DATE", upperUDT == "TIME":
 		return "DateTime"
-	case strings.Contains(upperType, "BYTEA"):
+	case strings.Contains(upperType, "BYTEA"), upperUDT == "BYTEA":
 		return "Bytes"
-	case strings.Contains(upperType, "JSON"):
+	case strings.Contains(upperType, "JSON"), upperUDT == "JSON", upperUDT == "JSONB":
 		return "Json"
 	default:
 		return "String"
 	}
 }
 
-func postgresDefaultValue(def string) *ir.DefaultValue {
+func postgresDefaultValue(def string, isIdentity bool) *ir.DefaultValue {
+	if isIdentity {
+		return &ir.DefaultValue{IsFunction: true, FuncName: "autoincrement"}
+	}
 	def = strings.TrimSpace(def)
 	if def == "" {
 		return nil
@@ -1293,9 +1318,26 @@ func postgresDefaultValue(def string) *ir.DefaultValue {
 		return &ir.DefaultValue{IsFunction: true, FuncName: "uuid"}
 	case strings.Contains(lower, "now()"), strings.Contains(lower, "current_timestamp"):
 		return &ir.DefaultValue{IsFunction: true, FuncName: "now"}
+	case strings.HasPrefix(lower, "'{}'::"):
+		return &ir.DefaultValue{IsArray: true}
+	case strings.HasPrefix(lower, "array["):
+		return &ir.DefaultValue{Value: strings.TrimSpace(def), IsString: true}
 	default:
-		return &ir.DefaultValue{Value: strings.Trim(def, "'"), IsString: true}
+		value := normalizePostgresLiteralDefault(def)
+		return &ir.DefaultValue{Value: value, IsString: !isNumericLiteral(value) && value != "true" && value != "false", IsNumber: isNumericLiteral(value), IsBool: value == "true" || value == "false"}
 	}
+}
+
+func normalizePostgresLiteralDefault(def string) string {
+	def = strings.TrimSpace(def)
+	if idx := strings.Index(def, "::"); idx >= 0 {
+		def = strings.TrimSpace(def[:idx])
+	}
+	if len(def) >= 2 && def[0] == '\'' && def[len(def)-1] == '\'' {
+		def = def[1 : len(def)-1]
+		def = strings.ReplaceAll(def, "''", "'")
+	}
+	return def
 }
 
 func mysqlScalarType(dataType, columnType string) string {
@@ -1432,6 +1474,10 @@ func sqliteQuoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
+func postgresQuoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
 func parsePostgresTextArray(input string) []string {
 	input = strings.TrimSpace(strings.Trim(input, "{}"))
 	if input == "" {
@@ -1445,15 +1491,62 @@ func parsePostgresTextArray(input string) []string {
 	return out
 }
 
-func parsePostgresIndexColumns(fields, defs []string) []ir.IndexColumn {
+func parsePostgresIndexColumns(fields, defs, options, opclasses, collations []string) []ir.IndexColumn {
 	cols := make([]ir.IndexColumn, len(fields))
 	for i, field := range fields {
 		cols[i] = ir.IndexColumn{Field: field}
 		if i < len(defs) {
 			cols[i] = parsePostgresIndexColumnDef(field, defs[i])
 		}
+		applyPostgresIndexCatalogOptions(&cols[i], arrayValueAt(options, i), arrayValueAt(opclasses, i), arrayValueAt(collations, i))
 	}
 	return cols
+}
+
+func arrayValueAt(values []string, idx int) string {
+	if idx < len(values) {
+		return values[idx]
+	}
+	return ""
+}
+
+func applyPostgresIndexCatalogOptions(col *ir.IndexColumn, optionText, opclass, collation string) {
+	if col == nil {
+		return
+	}
+	option, err := strconv.Atoi(strings.TrimSpace(optionText))
+	if err == nil {
+		desc := option&1 == 1
+		nullsFirst := option&2 == 2
+		if desc {
+			col.Sort = "DESC"
+		} else if col.Sort == "" {
+			col.Sort = "ASC"
+		}
+		switch {
+		case nullsFirst:
+			col.Nulls = "FIRST"
+		case desc:
+			col.Nulls = "LAST"
+		}
+	}
+
+	opclass = normalizePostgresArrayItem(opclass)
+	if opclass != "" {
+		col.OpClass = opclass
+	}
+	collation = normalizePostgresArrayItem(collation)
+	if collation != "" {
+		col.Collation = normalizePostgresIdentifierPath(collation)
+	}
+}
+
+func normalizePostgresArrayItem(value string) string {
+	value = strings.TrimSpace(strings.Trim(value, `"`))
+	if strings.EqualFold(value, "NULL") {
+		return ""
+	}
+	return value
 }
 
 func parsePostgresIndexColumnDef(field, def string) ir.IndexColumn {
