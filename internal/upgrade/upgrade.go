@@ -13,7 +13,8 @@ import (
 )
 
 const (
-	modulePath  = "github.com/arsfy/gcorm/cmd/gco"
+	modulePath  = "github.com/arsfy/gcorm"
+	commandPath = "github.com/arsfy/gcorm/cmd/gco"
 	installSpec = "github.com/arsfy/gcorm/cmd/gco@latest"
 	releasesURL = "https://github.com/arsfy/gcorm/releases"
 )
@@ -79,7 +80,7 @@ func isGoInstallBuild(info *debug.BuildInfo, injectedVersion string) bool {
 	if info == nil {
 		return false
 	}
-	return info.Main.Path == modulePath && isReleaseVersion(info.Main.Version)
+	return info.Path == commandPath && info.Main.Path == modulePath && isReleaseVersion(info.Main.Version)
 }
 
 func currentBuildVersion(info *debug.BuildInfo) string {

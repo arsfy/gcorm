@@ -11,6 +11,7 @@ import (
 
 func TestIsGoInstallBuild(t *testing.T) {
 	info := &debug.BuildInfo{
+		Path: commandPath,
 		Main: debug.Module{
 			Path:    modulePath,
 			Version: "v0.1.0",
@@ -27,6 +28,7 @@ func TestIsGoInstallBuild(t *testing.T) {
 
 func TestIsGoInstallBuildRejectsLocalBuild(t *testing.T) {
 	info := &debug.BuildInfo{
+		Path: commandPath,
 		Main: debug.Module{
 			Path:    modulePath,
 			Version: "(devel)",
@@ -50,6 +52,7 @@ func TestRunRejectsManualInstall(t *testing.T) {
 
 func TestRunAlreadyUpToDateSkipsInstall(t *testing.T) {
 	info := &debug.BuildInfo{
+		Path: commandPath,
 		Main: debug.Module{
 			Path:    modulePath,
 			Version: "v0.1.0",
@@ -64,5 +67,19 @@ func TestRunAlreadyUpToDateSkipsInstall(t *testing.T) {
 	result := versioncheck.Result{Current: "v0.1.0", Latest: "v0.1.0", UpdateAvailable: false}
 	if result.UpdateAvailable {
 		t.Fatal("same version should not be update available")
+	}
+}
+
+func TestIsGoInstallBuildRejectsWrongCommand(t *testing.T) {
+	info := &debug.BuildInfo{
+		Path: "github.com/arsfy/gcorm/cmd/other",
+		Main: debug.Module{
+			Path:    modulePath,
+			Version: "v0.1.0",
+		},
+	}
+
+	if isGoInstallBuild(info, "dev") {
+		t.Fatal("different command package should not be treated as gco go install")
 	}
 }
