@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/arsfy/gco-orm/pkg/schema/formatter"
-	"github.com/arsfy/gco-orm/pkg/schema/parser"
+	"github.com/arsfy/gcorm/pkg/schema/formatter"
+	"github.com/arsfy/gcorm/pkg/schema/parser"
 )
 
 // Run executes the fmt command.

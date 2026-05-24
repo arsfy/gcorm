@@ -4,9 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/arsfy/gco-orm/pkg/codegen/golang"
-	"github.com/arsfy/gco-orm/pkg/schema/ir"
-	"github.com/arsfy/gco-orm/pkg/schema/parser"
+	"github.com/arsfy/gcorm/pkg/codegen/golang"
+	"github.com/arsfy/gcorm/pkg/schema/ir"
+	"github.com/arsfy/gcorm/pkg/schema/parser"
 )
 
 // parseAndCompile is a helper that parses schema text and runs the compiler.

@@ -6,9 +6,9 @@ import (
 	"sort"
 	"strings"
 
-	runtimepkg "github.com/arsfy/gco-orm/pkg/runtime"
-	runtimedialect "github.com/arsfy/gco-orm/pkg/runtime/dialect"
-	"github.com/arsfy/gco-orm/pkg/schema/ir"
+	runtimepkg "github.com/arsfy/gcorm/pkg/runtime"
+	runtimedialect "github.com/arsfy/gcorm/pkg/runtime/dialect"
+	"github.com/arsfy/gcorm/pkg/schema/ir"
 )
 
 // DDLGenerator generates dialect-specific DDL from a changeset.

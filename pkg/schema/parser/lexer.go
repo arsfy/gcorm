@@ -6,7 +6,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/arsfy/gco-orm/pkg/schema/ast"
+	"github.com/arsfy/gcorm/pkg/schema/ast"
 )
 
 // Lexer tokenizes GCO schema source code.

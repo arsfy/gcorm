@@ -1,4 +1,4 @@
-// Package golang implements Go code generation from a resolved GCO ORM schema IR.
+// Package golang implements Go code generation from a resolved GCORM schema IR.
 // It produces a client/query/model package structure that provides Prisma-like
 // type-safe query builders.
 package golang
@@ -14,7 +14,7 @@ import (
 	"text/template"
 	"unicode"
 
-	"github.com/arsfy/gco-orm/pkg/schema/ir"
+	"github.com/arsfy/gcorm/pkg/schema/ir"
 )
 
 // Generator produces Go source files from a resolved schema.

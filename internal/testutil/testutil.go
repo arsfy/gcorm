@@ -1,4 +1,4 @@
-// Package testutil provides shared test helpers for GCO ORM tests.
+// Package testutil provides shared test helpers for GCORM tests.
 package testutil
 
 import (

@@ -5,15 +5,15 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/arsfy/gco-orm/internal/config"
-	"github.com/arsfy/gco-orm/pkg/schema/compiler"
-	"github.com/arsfy/gco-orm/pkg/schema/parser"
-	"github.com/arsfy/gco-orm/pkg/tooling/dbpush"
-	gcofmt "github.com/arsfy/gco-orm/pkg/tooling/fmt"
-	"github.com/arsfy/gco-orm/pkg/tooling/generate"
-	"github.com/arsfy/gco-orm/pkg/tooling/initcmd"
-	"github.com/arsfy/gco-orm/pkg/tooling/introspect"
-	"github.com/arsfy/gco-orm/pkg/tooling/migrate"
+	"github.com/arsfy/gcorm/internal/config"
+	"github.com/arsfy/gcorm/pkg/schema/compiler"
+	"github.com/arsfy/gcorm/pkg/schema/parser"
+	"github.com/arsfy/gcorm/pkg/tooling/dbpush"
+	gcofmt "github.com/arsfy/gcorm/pkg/tooling/fmt"
+	"github.com/arsfy/gcorm/pkg/tooling/generate"
+	"github.com/arsfy/gcorm/pkg/tooling/initcmd"
+	"github.com/arsfy/gcorm/pkg/tooling/introspect"
+	"github.com/arsfy/gcorm/pkg/tooling/migrate"
 )
 
 const version = "0.1.0"
@@ -62,13 +62,13 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println(`gco - GCO ORM CLI
+	fmt.Println(`gco - GCORM CLI https://github.com/arsfy/gcorm
 
 Usage:
   gco <command> [flags]
 
 Commands:
-  init         Initialize a new GCO ORM schema interactively
+  init         Initialize a new GCORM schema interactively
   generate     Generate Go client code from schema
   fmt          Format schema files
   validate     Validate schema files

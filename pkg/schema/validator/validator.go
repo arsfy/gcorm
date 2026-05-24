@@ -1,4 +1,4 @@
-// Package validator provides semantic validation for GCO ORM schema ASTs.
+// Package validator provides semantic validation for GCORM schema ASTs.
 package validator
 
 import (
@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/arsfy/gco-orm/pkg/schema/ast"
+	"github.com/arsfy/gcorm/pkg/schema/ast"
 )
 
 // ---------------------------------------------------------------------------

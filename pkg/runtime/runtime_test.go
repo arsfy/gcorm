@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	gcoerr "github.com/arsfy/gco-orm/pkg/runtime/errors"
+	gcoerr "github.com/arsfy/gcorm/pkg/runtime/errors"
 )
 
 // ---------------------------------------------------------------------------

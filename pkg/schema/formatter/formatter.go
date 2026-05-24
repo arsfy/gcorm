@@ -1,11 +1,11 @@
-// Package formatter provides canonical formatting for GCO ORM schema ASTs.
+// Package formatter provides canonical formatting for GCORM schema ASTs.
 package formatter
 
 import (
 	"sort"
 	"strings"
 
-	"github.com/arsfy/gco-orm/pkg/schema/ast"
+	"github.com/arsfy/gcorm/pkg/schema/ast"
 )
 
 // Format formats a Document AST into a canonical schema string.

@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/arsfy/gco-orm/pkg/schema/parser"
+	"github.com/arsfy/gcorm/pkg/schema/parser"
 )
 
 func BenchmarkCompile(b *testing.B) {

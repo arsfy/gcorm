@@ -1,4 +1,4 @@
-// PostgreSQL example schema for GCO ORM.
+// PostgreSQL example schema for GCORM.
 
 datasource db {
   provider = "postgresql"

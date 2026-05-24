@@ -1,7 +1,7 @@
 package runtime
 
 import (
-	gcoerr "github.com/arsfy/gco-orm/pkg/runtime/errors"
+	gcoerr "github.com/arsfy/gcorm/pkg/runtime/errors"
 )
 
 // DBError is a type alias for the classified database error from the errors

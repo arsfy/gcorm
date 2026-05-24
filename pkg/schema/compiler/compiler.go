@@ -3,10 +3,10 @@
 package compiler
 
 import (
-	"github.com/arsfy/gco-orm/pkg/schema/ast"
-	"github.com/arsfy/gco-orm/pkg/schema/ir"
-	"github.com/arsfy/gco-orm/pkg/schema/resolve"
-	"github.com/arsfy/gco-orm/pkg/schema/validator"
+	"github.com/arsfy/gcorm/pkg/schema/ast"
+	"github.com/arsfy/gcorm/pkg/schema/ir"
+	"github.com/arsfy/gcorm/pkg/schema/resolve"
+	"github.com/arsfy/gcorm/pkg/schema/validator"
 )
 
 // CompileResult holds the output of the compilation pipeline.

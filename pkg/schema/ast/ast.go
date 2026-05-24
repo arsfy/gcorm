@@ -1,4 +1,4 @@
-// Package ast defines the abstract syntax tree types for the GCO ORM schema DSL.
+// Package ast defines the abstract syntax tree types for the GCORM schema DSL.
 //
 // The DSL is Prisma-like and supports four top-level block types:
 //   - datasource: database connection configuration
@@ -184,8 +184,8 @@ type AttributeArg struct {
 // Expression is the interface implemented by all expression AST nodes.
 // Expressions appear as attribute arguments and config entry values.
 type Expression interface {
-	expressionNode()  // Marker method to restrict the interface to this package.
-	ExprSpan() Span   // Returns the source span of the expression.
+	expressionNode() // Marker method to restrict the interface to this package.
+	ExprSpan() Span  // Returns the source span of the expression.
 }
 
 // StringLiteral represents a quoted string value, e.g. "hello".
@@ -194,8 +194,8 @@ type StringLiteral struct {
 	Span  Span
 }
 
-func (StringLiteral) expressionNode()     {}
-func (s StringLiteral) ExprSpan() Span    { return s.Span }
+func (StringLiteral) expressionNode()  {}
+func (s StringLiteral) ExprSpan() Span { return s.Span }
 
 // NumberLiteral represents a numeric value (integer or floating-point).
 type NumberLiteral struct {
@@ -204,8 +204,8 @@ type NumberLiteral struct {
 	Span    Span
 }
 
-func (NumberLiteral) expressionNode()     {}
-func (n NumberLiteral) ExprSpan() Span    { return n.Span }
+func (NumberLiteral) expressionNode()  {}
+func (n NumberLiteral) ExprSpan() Span { return n.Span }
 
 // BooleanLiteral represents a boolean value (true or false).
 type BooleanLiteral struct {
@@ -213,8 +213,8 @@ type BooleanLiteral struct {
 	Span  Span
 }
 
-func (BooleanLiteral) expressionNode()    {}
-func (b BooleanLiteral) ExprSpan() Span   { return b.Span }
+func (BooleanLiteral) expressionNode()  {}
+func (b BooleanLiteral) ExprSpan() Span { return b.Span }
 
 // Identifier represents a name reference, possibly with dotted path segments,
 // e.g. "autoincrement" or "db.uuid".
@@ -224,8 +224,8 @@ type Identifier struct {
 	Span  Span
 }
 
-func (Identifier) expressionNode()        {}
-func (i Identifier) ExprSpan() Span       { return i.Span }
+func (Identifier) expressionNode()  {}
+func (i Identifier) ExprSpan() Span { return i.Span }
 
 // FunctionCall represents a function invocation, e.g. env("DATABASE_URL")
 // or autoincrement().
@@ -235,8 +235,8 @@ type FunctionCall struct {
 	Span Span
 }
 
-func (FunctionCall) expressionNode()      {}
-func (f FunctionCall) ExprSpan() Span     { return f.Span }
+func (FunctionCall) expressionNode()  {}
+func (f FunctionCall) ExprSpan() Span { return f.Span }
 
 // ArrayLiteral represents a bracketed list of expressions, e.g. [1, 2, 3].
 type ArrayLiteral struct {
@@ -244,5 +244,5 @@ type ArrayLiteral struct {
 	Span     Span
 }
 
-func (ArrayLiteral) expressionNode()      {}
-func (a ArrayLiteral) ExprSpan() Span     { return a.Span }
+func (ArrayLiteral) expressionNode()  {}
+func (a ArrayLiteral) ExprSpan() Span { return a.Span }

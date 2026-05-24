@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/arsfy/gco-orm/pkg/schema/ir"
+	"github.com/arsfy/gcorm/pkg/schema/ir"
 )
 
 // schemaWithUser returns a minimal schema containing a single User model.

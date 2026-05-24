@@ -1,4 +1,4 @@
-// SQLite example schema for GCO ORM.
+// SQLite example schema for GCORM.
 
 datasource db {
   provider = "sqlite"

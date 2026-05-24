@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/arsfy/gco-orm/pkg/schema/ast"
+	"github.com/arsfy/gcorm/pkg/schema/ast"
 )
 
 // ParseError represents a parsing error with source location.

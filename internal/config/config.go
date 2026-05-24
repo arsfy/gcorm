@@ -9,7 +9,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config represents the GCO ORM configuration.
+// Config represents the GCORM configuration.
 type Config struct {
 	SchemaRoots       []string          `yaml:"schemaRoots"`
 	MigrationDir      string            `yaml:"migrationDir"`

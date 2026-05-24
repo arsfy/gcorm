@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/arsfy/gco-orm/pkg/schema/ast"
-	"github.com/arsfy/gco-orm/pkg/schema/ir"
+	"github.com/arsfy/gcorm/pkg/schema/ast"
+	"github.com/arsfy/gcorm/pkg/schema/ir"
 )
 
 // Known scalar type names.

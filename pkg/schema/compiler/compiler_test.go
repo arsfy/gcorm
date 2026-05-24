@@ -3,7 +3,7 @@ package compiler
 import (
 	"testing"
 
-	"github.com/arsfy/gco-orm/pkg/schema/ast"
+	"github.com/arsfy/gcorm/pkg/schema/ast"
 )
 
 // ---------------------------------------------------------------------------

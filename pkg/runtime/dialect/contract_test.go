@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/arsfy/gco-orm/pkg/runtime"
-	gcoerr "github.com/arsfy/gco-orm/pkg/runtime/errors"
+	"github.com/arsfy/gcorm/pkg/runtime"
+	gcoerr "github.com/arsfy/gcorm/pkg/runtime/errors"
 )
 
 // contractDialects returns all dialect instances for contract testing.

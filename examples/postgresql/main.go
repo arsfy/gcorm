@@ -1,4 +1,4 @@
-// Example usage of GCO ORM with PostgreSQL.
+// Example usage of GCORM with PostgreSQL.
 //
 // This file demonstrates the intended usage pattern after running `gco generate`.
 // The generated client code provides a Prisma-like experience for database operations.

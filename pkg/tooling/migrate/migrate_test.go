@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/arsfy/gco-orm/pkg/schema/ir"
+	"github.com/arsfy/gcorm/pkg/schema/ir"
 )
 
 // testSchemaGCO is a minimal .gcorm schema used by integration tests.

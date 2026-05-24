@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/arsfy/gco-orm/pkg/runtime"
-	gcoerr "github.com/arsfy/gco-orm/pkg/runtime/errors"
+	"github.com/arsfy/gcorm/pkg/runtime"
+	gcoerr "github.com/arsfy/gcorm/pkg/runtime/errors"
 )
 
 // SQLite implements the runtime.Dialect interface for SQLite databases.

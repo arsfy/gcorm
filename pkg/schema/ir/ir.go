@@ -1,8 +1,8 @@
-// Package ir defines the resolved intermediate representation (IR) of a GCO ORM
+// Package ir defines the resolved intermediate representation (IR) of a GCORM
 // schema. The IR is produced by the resolve stage and consumed by code generators.
 package ir
 
-import "github.com/arsfy/gco-orm/pkg/schema/ast"
+import "github.com/arsfy/gcorm/pkg/schema/ast"
 
 // Schema is the fully resolved schema graph, the output of the compiler pipeline.
 type Schema struct {
