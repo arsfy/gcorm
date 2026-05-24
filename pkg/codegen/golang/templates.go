@@ -594,6 +594,11 @@ func scanRowsToStructs[T any](rows *sql.Rows) ([]T, error) {
 	return results, rows.Err()
 }
 
+func escapeLikePattern(s string) string {
+	replacer := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_")
+	return replacer.Replace(s)
+}
+
 // Raw executes a custom SELECT query and scans rows into T using db tags.
 func Raw[T any](ctx context.Context, c *Client, query string, args ...any) ([]T, error) {
 	rows, err := c.executor.QueryContext(ctx, query, args...)
@@ -713,16 +718,16 @@ func build{{$model.Name}}Where(c *Client, wheres []query.{{$model.Name}}WhereCla
 				}
 			case "CONTAINS":
 				*argIdx++
-				parts = append(parts, w.Field+" LIKE "+c.placeholder(*argIdx))
-				args = append(args, "%"+fmt.Sprint(w.Value)+"%")
+				parts = append(parts, w.Field+" LIKE "+c.placeholder(*argIdx)+" ESCAPE '\\'")
+				args = append(args, "%"+escapeLikePattern(fmt.Sprint(w.Value))+"%")
 			case "STARTS_WITH":
 				*argIdx++
-				parts = append(parts, w.Field+" LIKE "+c.placeholder(*argIdx))
-				args = append(args, fmt.Sprint(w.Value)+"%")
+				parts = append(parts, w.Field+" LIKE "+c.placeholder(*argIdx)+" ESCAPE '\\'")
+				args = append(args, escapeLikePattern(fmt.Sprint(w.Value))+"%")
 			case "ENDS_WITH":
 				*argIdx++
-				parts = append(parts, w.Field+" LIKE "+c.placeholder(*argIdx))
-				args = append(args, "%"+fmt.Sprint(w.Value))
+				parts = append(parts, w.Field+" LIKE "+c.placeholder(*argIdx)+" ESCAPE '\\'")
+				args = append(args, "%"+escapeLikePattern(fmt.Sprint(w.Value)))
 			default:
 				*argIdx++
 				parts = append(parts, w.Field+" "+w.Operator+" "+c.placeholder(*argIdx))

@@ -180,6 +180,32 @@ func TestBulkCreateDoReturningValues(t *testing.T) {
 	}
 }
 
+func TestLikeWildcardsAreEscaped(t *testing.T) {
+	c := openCaptureClient(t)
+	defer c.Close()
+
+	_, err := c.Post.Query().
+		Where(query.Post.Title.Contains("50%_off\\sale")).
+		Do(context.Background())
+	if err != nil {
+		t.Fatalf("FindMany() error: %v", err)
+	}
+
+	captureState.Lock()
+	gotQuery := captureState.query
+	gotArgs := append([]driver.Value(nil), captureState.args...)
+	captureState.Unlock()
+
+	wantQuery := "SELECT id, title, published, author_id FROM Post WHERE title LIKE $1 ESCAPE '\\'"
+	if gotQuery != wantQuery {
+		t.Fatalf("query = %q, want %q", gotQuery, wantQuery)
+	}
+	wantArgs := []driver.Value{"%50\\%\\_off\\\\sale%"}
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("args = %#v, want %#v", gotArgs, wantArgs)
+	}
+}
+
 func TestRawScansStructsByDBTag(t *testing.T) {
 	c := openCaptureClient(t)
 	defer c.Close()
