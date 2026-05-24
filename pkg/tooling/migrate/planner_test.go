@@ -651,7 +651,9 @@ func TestDiffDetectsForeignKeyReferentialActionChange(t *testing.T) {
 	user.DBName = "users"
 	oldPost := testModel("Post", testField("id", "String"), testField("authorId", "String"))
 	oldPost.DBName = "posts"
-	oldPost.Relations = []*ir.Relation{testRelation("Post", "User", []string{"authorId"}, []string{"id"})}
+	oldRel := testRelation("Post", "User", []string{"authorId"}, []string{"id"})
+	oldRel.ConstraintName = "posts_author_id_fkey"
+	oldPost.Relations = []*ir.Relation{oldRel}
 
 	newPost := testModel("Post", testField("id", "String"), testField("authorId", "String"))
 	newPost.DBName = "posts"
@@ -662,6 +664,44 @@ func TestDiffDetectsForeignKeyReferentialActionChange(t *testing.T) {
 	cs := Diff(testSchema(oldPost, user), testSchema(newPost, user))
 	if !hasChange(cs, DropFK, "posts", "") || !hasChange(cs, AddFK, "posts", "") {
 		t.Fatalf("expected FK action change to drop and re-add FK, got: %+v", cs.Changes)
+	}
+	var drop *Change
+	for i := range cs.Changes {
+		if cs.Changes[i].Type == DropFK {
+			drop = &cs.Changes[i]
+			break
+		}
+	}
+	if drop == nil || drop.Details["name"] != "posts_author_id_fkey" {
+		t.Fatalf("expected DropFK to carry existing constraint name, got: %+v", cs.Changes)
+	}
+	if drop.Rollback != SafeRollback {
+		t.Fatalf("referential action replacement DropFK rollback = %s, want safe", drop.Rollback)
+	}
+}
+
+func TestDiffRemovingForeignKeyRemainsDestructive(t *testing.T) {
+	user := testModel("User", testField("id", "String"))
+	user.DBName = "users"
+	oldPost := testModel("Post", testField("id", "String"), testField("authorId", "String"))
+	oldPost.DBName = "posts"
+	oldPost.Relations = []*ir.Relation{testRelation("Post", "User", []string{"authorId"}, []string{"id"})}
+	newPost := testModel("Post", testField("id", "String"), testField("authorId", "String"))
+	newPost.DBName = "posts"
+
+	cs := Diff(testSchema(oldPost, user), testSchema(newPost, user))
+	var drop *Change
+	for i := range cs.Changes {
+		if cs.Changes[i].Type == DropFK {
+			drop = &cs.Changes[i]
+			break
+		}
+	}
+	if drop == nil {
+		t.Fatalf("expected DropFK, got: %+v", cs.Changes)
+	}
+	if drop.Rollback != DestructiveRollback {
+		t.Fatalf("removed FK rollback = %s, want destructive", drop.Rollback)
 	}
 }
 
@@ -937,6 +977,22 @@ func TestDDLDropFKUsesIfExists(t *testing.T) {
 
 	pg := DDLGenerator{Dialect: "postgresql"}.dropFKSQL(change)
 	if pg != `ALTER TABLE "post_tags" DROP CONSTRAINT IF EXISTS "fk_post_tags_post_id";` {
+		t.Fatalf("postgresql drop FK SQL = %q", pg)
+	}
+}
+
+func TestDDLDropFKUsesKnownConstraintName(t *testing.T) {
+	change := Change{
+		Type:  DropFK,
+		Model: "post_tags",
+		Details: map[string]string{
+			"name":   "post_tags_post_id_fkey",
+			"fields": "post_id",
+		},
+	}
+
+	pg := DDLGenerator{Dialect: "postgresql"}.dropFKSQL(change)
+	if pg != `ALTER TABLE "post_tags" DROP CONSTRAINT IF EXISTS "post_tags_post_id_fkey";` {
 		t.Fatalf("postgresql drop FK SQL = %q", pg)
 	}
 }

@@ -108,7 +108,9 @@ func Diff(old, new *ir.Schema) *Changeset {
 }
 
 func (cs *Changeset) add(c Change) {
-	c.Rollback = classifyRollback(c.Type)
+	if c.Rollback == "" {
+		c.Rollback = classifyRollback(c.Type)
+	}
 	cs.Changes = append(cs.Changes, c)
 }
 
@@ -546,6 +548,7 @@ func pkString(model *ir.Model, pk *ir.PrimaryKey) string {
 func compareForeignKeys(cs *Changeset, model string, oldSchema, newSchema *ir.Schema, oldM, newM *ir.Model) {
 	oldMap := mapFKRelations(oldSchema, oldM, oldM.Relations)
 	newMap := mapFKRelations(newSchema, newM, newM.Relations)
+	newByIdentity := mapFKRelationsByIdentity(newMap)
 	allKeys := mergedSortedKeys(oldMap, newMap)
 
 	for _, k := range allKeys {
@@ -559,9 +562,14 @@ func compareForeignKeys(cs *Changeset, model string, oldSchema, newSchema *ir.Sc
 				Details: fkDetails(nr),
 			})
 		case inOld && !inNew:
+			rollback := DestructiveRollback
+			if _, ok := newByIdentity[fkIdentityKey(or)]; ok {
+				rollback = SafeRollback
+			}
 			cs.add(Change{
 				Type: DropFK, Model: model, OldValue: or.ToModel,
-				Details: fkDetails(or),
+				Details:  fkDetails(or),
+				Rollback: rollback,
 			})
 		}
 	}
@@ -600,8 +608,20 @@ func mapFKRelations(schema *ir.Schema, model *ir.Model, rels []*ir.Relation) map
 	return m
 }
 
+func mapFKRelationsByIdentity(rels map[string]*ir.Relation) map[string]*ir.Relation {
+	m := make(map[string]*ir.Relation, len(rels))
+	for _, rel := range rels {
+		m[fkIdentityKey(rel)] = rel
+	}
+	return m
+}
+
+func fkIdentityKey(r *ir.Relation) string {
+	return strings.Join(r.Fields, ",") + "->" + r.ToModel + "(" + strings.Join(r.References, ",") + ")"
+}
+
 func fkKey(r *ir.Relation) string {
-	return strings.Join(r.Fields, ",") + "->" + r.ToModel + "(" + strings.Join(r.References, ",") + ")" +
+	return fkIdentityKey(r) +
 		"|delete=" + effectiveReferentialAction(r.OnDelete) +
 		"|update=" + effectiveReferentialAction(r.OnUpdate)
 }
@@ -611,6 +631,9 @@ func fkDetails(r *ir.Relation) map[string]string {
 		"fields":     strings.Join(r.Fields, ","),
 		"references": strings.Join(r.References, ","),
 		"toModel":    r.ToModel,
+	}
+	if r.ConstraintName != "" {
+		details["name"] = r.ConstraintName
 	}
 	if r.OnDelete != "" {
 		details["onDelete"] = r.OnDelete

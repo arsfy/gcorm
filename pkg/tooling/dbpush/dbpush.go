@@ -806,11 +806,12 @@ ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`, schemaName)
 		rel := grouped[key]
 		if rel == nil {
 			rel = &ir.Relation{
-				Name:      constraintName,
-				FromModel: tableName,
-				ToModel:   foreignTable,
-				OnDelete:  onDelete,
-				OnUpdate:  onUpdate,
+				Name:           constraintName,
+				ConstraintName: constraintName,
+				FromModel:      tableName,
+				ToModel:        foreignTable,
+				OnDelete:       onDelete,
+				OnUpdate:       onUpdate,
 			}
 			grouped[key] = rel
 		}
@@ -1049,7 +1050,7 @@ ORDER BY kcu.table_name, kcu.constraint_name, kcu.ordinal_position`)
 		key := fkKey{table: tableName, name: constraintName}
 		rel := grouped[key]
 		if rel == nil {
-			rel = &ir.Relation{Name: constraintName, FromModel: tableName, ToModel: foreignTable, OnDelete: onDelete, OnUpdate: onUpdate}
+			rel = &ir.Relation{Name: constraintName, ConstraintName: constraintName, FromModel: tableName, ToModel: foreignTable, OnDelete: onDelete, OnUpdate: onUpdate}
 			grouped[key] = rel
 		}
 		rel.Fields = append(rel.Fields, columnName)
@@ -1234,11 +1235,12 @@ func loadSQLiteForeignKeys(ctx context.Context, db *sql.DB, models map[string]*i
 			rel := grouped[id]
 			if rel == nil {
 				rel = &ir.Relation{
-					Name:      fmt.Sprintf("fk_%s_%s", tableName, fromColumn),
-					FromModel: tableName,
-					ToModel:   refTable,
-					OnDelete:  onDelete,
-					OnUpdate:  onUpdate,
+					Name:           fmt.Sprintf("fk_%s_%s", tableName, fromColumn),
+					ConstraintName: fmt.Sprintf("fk_%s_%s", tableName, fromColumn),
+					FromModel:      tableName,
+					ToModel:        refTable,
+					OnDelete:       onDelete,
+					OnUpdate:       onUpdate,
 				}
 				grouped[id] = rel
 			}

@@ -596,7 +596,11 @@ func topoSortTables(schema *ir.Schema, tables []string) []string {
 
 func (g DDLGenerator) dropFKSQL(c Change) string {
 	tbl := g.quoteID(c.Model)
-	constraintName := g.quoteID(fmt.Sprintf("fk_%s_%s", c.Model, c.Details["fields"]))
+	name := c.Details["name"]
+	if name == "" {
+		name = fmt.Sprintf("fk_%s_%s", c.Model, c.Details["fields"])
+	}
+	constraintName := g.quoteID(name)
 
 	switch g.Dialect {
 	case "mysql":

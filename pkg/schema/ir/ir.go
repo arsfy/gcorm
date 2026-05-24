@@ -113,15 +113,16 @@ type NativeType struct {
 
 // Relation holds the resolved relationship between two models.
 type Relation struct {
-	Name       string // relation name (optional)
-	Field      *Field // the field that declared @relation
-	Type       RelationType
-	FromModel  string
-	ToModel    string
-	Fields     []string // local fields (from `fields:`)
-	References []string // remote fields (from `references:`)
-	OnDelete   string
-	OnUpdate   string
+	Name           string // relation name (optional)
+	ConstraintName string // database foreign key constraint name, when known
+	Field          *Field // the field that declared @relation
+	Type           RelationType
+	FromModel      string
+	ToModel        string
+	Fields         []string // local fields (from `fields:`)
+	References     []string // remote fields (from `references:`)
+	OnDelete       string
+	OnUpdate       string
 }
 
 // RelationType classifies the cardinality of a relation.
