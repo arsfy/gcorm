@@ -23,6 +23,10 @@ The project is designed around generated Go code: define your data model in
   `migrate`, and `db push`
 - Raw SQL escape hatches when you need full control
 
+## Docs
+
+For full documentation, examples, and guides, visit the [GCORM Wiki](https://github.com/arsfy/gcorm/wiki).
+
 ## Status
 
 GCORM is early-stage software. The public APIs and schema language may still
