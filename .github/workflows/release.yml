@@ -14,12 +14,12 @@ jobs:
     strategy:
       matrix:
         include:
-          - {goos: linux,   goarch: amd64, runner: ubuntu-latest, upx: true,  ext: "",    archive: tar}
-          - {goos: linux,   goarch: arm64, runner: ubuntu-latest, upx: true,  ext: "",    archive: tar}
-          - {goos: windows, goarch: amd64, runner: ubuntu-latest, upx: true,  ext: .exe,  archive: zip}
-          - {goos: windows, goarch: arm64, runner: ubuntu-latest, upx: true,  ext: .exe,  archive: zip}
-          - {goos: darwin,  goarch: amd64, runner: macos-latest,  upx: false, ext: "",    archive: tar}
-          - {goos: darwin,  goarch: arm64, runner: macos-latest,  upx: false, ext: "",    archive: tar}
+          - {goos: linux,   goarch: amd64, runner: ubuntu-latest, ext: "",    archive: tar}
+          - {goos: linux,   goarch: arm64, runner: ubuntu-latest, ext: "",    archive: tar}
+          - {goos: windows, goarch: amd64, runner: ubuntu-latest, ext: .exe,  archive: zip}
+          - {goos: windows, goarch: arm64, runner: ubuntu-latest, ext: .exe,  archive: zip}
+          - {goos: darwin,  goarch: amd64, runner: macos-latest,  ext: "",    archive: tar}
+          - {goos: darwin,  goarch: arm64, runner: macos-latest,  ext: "",    archive: tar}
 
     steps:
       - uses: actions/checkout@v4
@@ -36,14 +36,6 @@ jobs:
         run: |
           VERSION="${{ github.event.release.tag_name }}"
           go build -ldflags "-s -w -X main.Version=${VERSION}" -o "gco${{ matrix.ext }}" ./cmd/gco
-
-      - name: Compress with UPX
-        if: matrix.upx
-        uses: crazy-max/ghaction-upx@v3
-        with:
-          version: latest
-          files: ./gco${{ matrix.ext }}
-          args: --best
 
       - name: Create archive
         run: |
