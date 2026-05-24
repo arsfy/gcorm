@@ -20,7 +20,18 @@ type DDLGenerator struct {
 // GenerateUp produces the up migration SQL.
 func (g DDLGenerator) GenerateUp(cs *Changeset) string {
 	var b strings.Builder
+	createdTables := make(map[string]bool)
+	if cs != nil {
+		for _, c := range cs.Changes {
+			if c.Type == CreateTable {
+				createdTables[c.Model] = true
+			}
+		}
+	}
 	for _, c := range g.orderedChanges(cs) {
+		if g.Dialect == "sqlite" && c.Type == AddFK && createdTables[c.Model] {
+			continue
+		}
 		sql := g.changeToUp(c, cs)
 		if sql != "" {
 			b.WriteString(sql)
@@ -110,6 +121,30 @@ func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
 			continue
 		}
 		cols = append(cols, fmt.Sprintf("  UNIQUE (%s)", strings.Join(fields, ", ")))
+	}
+
+	if g.Dialect == "sqlite" {
+		for _, rel := range model.Relations {
+			if len(rel.Fields) == 0 || len(rel.References) == 0 {
+				continue
+			}
+			target := findModel(cs.New, rel.ToModel)
+			refTable := rel.ToModel
+			if target != nil {
+				refTable = target.TableName()
+			}
+			localFields := g.quoteIDs(normalizeFieldNames(model, rel.Fields))
+			refFields := g.quoteIDs(normalizeFieldNames(target, rel.References))
+			fk := fmt.Sprintf("  FOREIGN KEY (%s) REFERENCES %s (%s)",
+				strings.Join(localFields, ", "), g.quoteID(refTable), strings.Join(refFields, ", "))
+			if onDelete := strings.TrimSpace(rel.OnDelete); onDelete != "" {
+				fk += " ON DELETE " + onDelete
+			}
+			if onUpdate := strings.TrimSpace(rel.OnUpdate); onUpdate != "" {
+				fk += " ON UPDATE " + onUpdate
+			}
+			cols = append(cols, fk)
+		}
 	}
 
 	b.WriteString(strings.Join(cols, ",\n"))
@@ -283,6 +318,9 @@ func (g DDLGenerator) changePKSQL(c Change) string {
 }
 
 func (g DDLGenerator) addFKSQL(c Change) string {
+	if g.Dialect == "sqlite" {
+		return fmt.Sprintf("-- SQLite: adding foreign key constraints requires table rebuild for %s", c.Model)
+	}
 	tbl := g.quoteID(c.Model)
 	localFields := g.quoteIDs(strings.Split(c.Details["fields"], ","))
 	refFields := g.quoteIDs(strings.Split(c.Details["references"], ","))

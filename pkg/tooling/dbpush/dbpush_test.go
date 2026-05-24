@@ -1,7 +1,11 @@
 package dbpush
 
 import (
+	"context"
+	"database/sql"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -100,6 +104,64 @@ func TestResolveURLPreservesExistingSearchPathAndSSLMode(t *testing.T) {
 	}
 }
 
+func TestNormalizeMySQLURLConvertsURLFormToDSN(t *testing.T) {
+	got, err := normalizeConnectionURL("mysql://user:secret@localhost:3306/app?parseTime=true", "mysql")
+	if err != nil {
+		t.Fatalf("normalizeConnectionURL() error = %v", err)
+	}
+	want := "user:secret@tcp(localhost:3306)/app?parseTime=true"
+	if got != want {
+		t.Fatalf("normalizeConnectionURL() = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeMySQLURLPreservesDriverDSN(t *testing.T) {
+	dsn := "user:secret@tcp(localhost:3306)/app?parseTime=true"
+	got, err := normalizeConnectionURL(dsn, "mysql")
+	if err != nil {
+		t.Fatalf("normalizeConnectionURL() error = %v", err)
+	}
+	if got != dsn {
+		t.Fatalf("normalizeConnectionURL() = %q, want %q", got, dsn)
+	}
+}
+
+func TestNormalizeSQLiteURL(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"file:./dev.db", "file:./dev.db"},
+		{":memory:", ":memory:"},
+		{"sqlite:///tmp/app.db", "/tmp/app.db"},
+	}
+
+	for _, tc := range cases {
+		got, err := normalizeConnectionURL(tc.raw, "sqlite")
+		if err != nil {
+			t.Fatalf("normalizeConnectionURL(%q) error = %v", tc.raw, err)
+		}
+		if got != tc.want {
+			t.Fatalf("normalizeConnectionURL(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestProviderDriverMapping(t *testing.T) {
+	if !isSupportedProvider("mysql") || !isSupportedProvider("sqlite") {
+		t.Fatal("mysql and sqlite should be supported providers")
+	}
+	if driverName("postgresql") != "pgx" {
+		t.Fatalf("postgresql driver = %q", driverName("postgresql"))
+	}
+	if driverName("mysql") != "mysql" {
+		t.Fatalf("mysql driver = %q", driverName("mysql"))
+	}
+	if driverName("sqlite") != "sqlite" {
+		t.Fatalf("sqlite driver = %q", driverName("sqlite"))
+	}
+}
+
 func TestResolveSchemaNameUsesDatasourceSchemaFirst(t *testing.T) {
 	schema := &ir.Schema{
 		Datasource: &ir.Datasource{Schema: "app"},
@@ -188,4 +250,149 @@ func TestRiskyChanges(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("len(riskyChanges) = %d, want 2", len(got))
 	}
+}
+
+func TestIntrospectSQLite(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	statements := []string{
+		`PRAGMA foreign_keys = ON`,
+		`CREATE TABLE users (
+			id INTEGER PRIMARY KEY,
+			email TEXT NOT NULL UNIQUE,
+			name TEXT,
+			created_at TEXT DEFAULT (datetime('now'))
+		)`,
+		`CREATE TABLE posts (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			author_id INTEGER NOT NULL,
+			FOREIGN KEY(author_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX idx_posts_author_id ON posts(author_id)`,
+	}
+	for _, stmt := range statements {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("exec %q: %v", stmt, err)
+		}
+	}
+
+	schema, err := introspectSQLite(context.Background(), db)
+	if err != nil {
+		t.Fatalf("introspectSQLite() error = %v", err)
+	}
+	if schema.Datasource.Provider != "sqlite" {
+		t.Fatalf("provider = %q, want sqlite", schema.Datasource.Provider)
+	}
+
+	users := findTestModel(schema, "users")
+	if users == nil {
+		t.Fatal("users model not found")
+	}
+	email := findFieldByColumn(users, "email")
+	if email == nil || !email.IsUnique || email.IsOptional {
+		t.Fatalf("email field = %#v", email)
+	}
+	createdAt := findFieldByColumn(users, "created_at")
+	if createdAt == nil || createdAt.Default == nil || createdAt.Default.FuncName != "now" {
+		t.Fatalf("created_at default = %#v", createdAt)
+	}
+
+	posts := findTestModel(schema, "posts")
+	if posts == nil {
+		t.Fatal("posts model not found")
+	}
+	if len(posts.Indexes) != 1 || posts.Indexes[0].Name != "idx_posts_author_id" {
+		t.Fatalf("posts indexes = %#v", posts.Indexes)
+	}
+	if len(posts.Relations) != 1 || posts.Relations[0].ToModel != "users" || posts.Relations[0].OnDelete != "CASCADE" {
+		t.Fatalf("posts relations = %#v", posts.Relations)
+	}
+}
+
+func TestRunSQLiteDBPushCreatesTables(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dev.db")
+	schemaPath := filepath.Join(dir, "schema.gcorm")
+	schema := `datasource db {
+  provider = "sqlite"
+  url      = "file:` + filepath.ToSlash(dbPath) + `"
+}
+
+generator client {
+  provider = "gco-go"
+  output   = "./gen"
+}
+
+model User {
+  id    String @id
+  email String @unique
+  name  String?
+  posts Post[]
+}
+
+model Post {
+  id       String @id
+  title    String
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id], onDelete: CASCADE)
+}
+`
+	if err := os.WriteFile(schemaPath, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Run([]string{"--schema", schemaPath}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'User'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("table count = %d, want 1", count)
+	}
+
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'Post'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("post table count = %d, want 1", count)
+	}
+
+	fkRows, err := db.Query(`SELECT "table", "from", "to", on_delete FROM pragma_foreign_key_list('Post')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fkRows.Close()
+	if !fkRows.Next() {
+		t.Fatal("expected Post foreign key")
+	}
+	var refTable, fromColumn, toColumn, onDelete string
+	if err := fkRows.Scan(&refTable, &fromColumn, &toColumn, &onDelete); err != nil {
+		t.Fatal(err)
+	}
+	if refTable != "User" || fromColumn != "author_id" || toColumn != "id" || onDelete != "CASCADE" {
+		t.Fatalf("foreign key = %s %s %s %s", refTable, fromColumn, toColumn, onDelete)
+	}
+}
+
+func findTestModel(schema *ir.Schema, name string) *ir.Model {
+	for _, model := range schema.Models {
+		if model.TableName() == name {
+			return model
+		}
+	}
+	return nil
 }

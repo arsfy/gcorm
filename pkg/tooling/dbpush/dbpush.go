@@ -7,10 +7,13 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
+	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "modernc.org/sqlite"
 
 	"github.com/arsfy/gcorm/internal/config"
 	"github.com/arsfy/gcorm/pkg/schema/compiler"
@@ -62,11 +65,11 @@ func Run(args []string) error {
 	if targetSchema.Datasource != nil && targetSchema.Datasource.Provider != "" {
 		provider = targetSchema.Datasource.Provider
 	}
-	if provider != "postgresql" {
-		return fmt.Errorf("db push currently supports only postgresql, got %q", provider)
+	if !isSupportedProvider(provider) {
+		return fmt.Errorf("db push supports postgresql, mysql, and sqlite; got %q", provider)
 	}
 
-	db, err := sql.Open("pgx", dsn)
+	db, err := sql.Open(driverName(provider), dsn)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -77,9 +80,7 @@ func Run(args []string) error {
 		return fmt.Errorf("ping database: %w", err)
 	}
 
-	currentSchemaName := resolveSchemaName(targetSchema, dsn)
-
-	currentSchema, err := introspectPostgres(ctx, db, currentSchemaName)
+	currentSchema, err := introspectDatabase(ctx, db, provider, targetSchema, dsn)
 	if err != nil {
 		return fmt.Errorf("introspect database: %w", err)
 	}
@@ -222,11 +223,39 @@ func resolveURL(explicitURL string, schema *ir.Schema) (string, string, error) {
 	return "", "", fmt.Errorf("db push: schema compiled with %d model(s). Push to database requires a connection URL.\nSet datasource url in your .gcorm schema or provide --url flag.", modelCount)
 }
 
+func isSupportedProvider(provider string) bool {
+	switch provider {
+	case "postgresql", "mysql", "sqlite":
+		return true
+	default:
+		return false
+	}
+}
+
+func driverName(provider string) string {
+	switch provider {
+	case "postgresql":
+		return "pgx"
+	case "mysql":
+		return "mysql"
+	case "sqlite":
+		return "sqlite"
+	default:
+		return provider
+	}
+}
+
 func normalizeConnectionURL(rawURL, provider string) (string, error) {
-	if provider != "postgresql" && !isPostgresURL(rawURL) {
+	switch {
+	case provider == "postgresql" || isPostgresURL(rawURL):
+		return normalizePostgresURL(rawURL)
+	case provider == "mysql":
+		return normalizeMySQLURL(rawURL)
+	case provider == "sqlite":
+		return normalizeSQLiteURL(rawURL)
+	default:
 		return rawURL, nil
 	}
-	return normalizePostgresURL(rawURL)
 }
 
 func normalizePostgresURL(rawURL string) (string, error) {
@@ -285,6 +314,63 @@ func postgresSchemaFromURL(rawURL string) string {
 func isPostgresURL(rawURL string) bool {
 	lower := strings.ToLower(rawURL)
 	return strings.HasPrefix(lower, "postgresql://") || strings.HasPrefix(lower, "postgres://")
+}
+
+func normalizeMySQLURL(rawURL string) (string, error) {
+	if strings.Contains(rawURL, "@tcp(") || strings.Contains(rawURL, "@unix(") {
+		return rawURL, nil
+	}
+
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parse mysql connection URL: %w", err)
+	}
+	if parsedURL.Scheme == "" || parsedURL.Scheme != "mysql" {
+		return rawURL, nil
+	}
+
+	user := parsedURL.User.Username()
+	password, hasPassword := parsedURL.User.Password()
+	auth := user
+	if hasPassword {
+		auth += ":" + password
+	}
+	if auth != "" {
+		auth += "@"
+	}
+
+	host := parsedURL.Host
+	if host == "" {
+		host = "localhost:3306"
+	}
+	dbName := strings.TrimPrefix(parsedURL.Path, "/")
+	query := parsedURL.RawQuery
+	if query != "" {
+		query = "?" + query
+	}
+	return fmt.Sprintf("%stcp(%s)/%s%s", auth, host, dbName, query), nil
+}
+
+func normalizeSQLiteURL(rawURL string) (string, error) {
+	lower := strings.ToLower(rawURL)
+	switch {
+	case strings.HasPrefix(lower, "sqlite://"):
+		parsedURL, err := url.Parse(rawURL)
+		if err != nil {
+			return "", fmt.Errorf("parse sqlite connection URL: %w", err)
+		}
+		if parsedURL.Host != "" {
+			return filepath.Join(string(filepath.Separator), parsedURL.Host, parsedURL.Path), nil
+		}
+		if parsedURL.Path != "" {
+			return parsedURL.Path, nil
+		}
+		return ":memory:", nil
+	case strings.HasPrefix(lower, "file:"), rawURL == ":memory:":
+		return rawURL, nil
+	default:
+		return rawURL, nil
+	}
 }
 
 func isLocalPostgresHost(host string) bool {
@@ -380,6 +466,78 @@ func introspectPostgres(ctx context.Context, db *sql.DB, schemaName string) (*ir
 		schema.Models = append(schema.Models, models[name])
 	}
 	return schema, nil
+}
+
+func introspectDatabase(ctx context.Context, db *sql.DB, provider string, targetSchema *ir.Schema, dsn string) (*ir.Schema, error) {
+	switch provider {
+	case "postgresql":
+		return introspectPostgres(ctx, db, resolveSchemaName(targetSchema, dsn))
+	case "mysql":
+		return introspectMySQL(ctx, db)
+	case "sqlite":
+		return introspectSQLite(ctx, db)
+	default:
+		return nil, fmt.Errorf("unsupported provider %q", provider)
+	}
+}
+
+func introspectMySQL(ctx context.Context, db *sql.DB) (*ir.Schema, error) {
+	schema := &ir.Schema{Datasource: &ir.Datasource{Provider: "mysql"}}
+
+	models, err := loadMySQLTables(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadMySQLColumns(ctx, db, models); err != nil {
+		return nil, err
+	}
+	if err := loadMySQLPrimaryKeys(ctx, db, models); err != nil {
+		return nil, err
+	}
+	if err := loadMySQLUniqueConstraints(ctx, db, models); err != nil {
+		return nil, err
+	}
+	if err := loadMySQLIndexes(ctx, db, models); err != nil {
+		return nil, err
+	}
+	if err := loadMySQLForeignKeys(ctx, db, models); err != nil {
+		return nil, err
+	}
+
+	appendSortedModels(schema, models)
+	return schema, nil
+}
+
+func introspectSQLite(ctx context.Context, db *sql.DB) (*ir.Schema, error) {
+	schema := &ir.Schema{Datasource: &ir.Datasource{Provider: "sqlite"}}
+
+	models, err := loadSQLiteTables(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadSQLiteColumns(ctx, db, models); err != nil {
+		return nil, err
+	}
+	if err := loadSQLiteIndexes(ctx, db, models); err != nil {
+		return nil, err
+	}
+	if err := loadSQLiteForeignKeys(ctx, db, models); err != nil {
+		return nil, err
+	}
+
+	appendSortedModels(schema, models)
+	return schema, nil
+}
+
+func appendSortedModels(schema *ir.Schema, models map[string]*ir.Model) {
+	names := make([]string, 0, len(models))
+	for name := range models {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		schema.Models = append(schema.Models, models[name])
+	}
 }
 
 func loadPostgresTables(ctx context.Context, db *sql.DB, schemaName string) (map[string]*ir.Model, error) {
@@ -652,6 +810,441 @@ ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`, schemaName)
 	return nil
 }
 
+func loadMySQLTables(ctx context.Context, db *sql.DB) (map[string]*ir.Model, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'
+ORDER BY table_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	models := make(map[string]*ir.Model)
+	for rows.Next() {
+		var tableName string
+		if err := rows.Scan(&tableName); err != nil {
+			return nil, err
+		}
+		models[tableName] = &ir.Model{Name: tableName, DBName: tableName}
+	}
+	return models, rows.Err()
+}
+
+func loadMySQLColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+	rows, err := db.QueryContext(ctx, `
+SELECT table_name, column_name, is_nullable, data_type, column_type, column_default, extra
+FROM information_schema.columns
+WHERE table_schema = DATABASE()
+ORDER BY table_name, ordinal_position`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var tableName, columnName, isNullable, dataType, columnType, extra string
+		var columnDefault sql.NullString
+		if err := rows.Scan(&tableName, &columnName, &isNullable, &dataType, &columnType, &columnDefault, &extra); err != nil {
+			return err
+		}
+		model := models[tableName]
+		if model == nil {
+			continue
+		}
+		field := &ir.Field{
+			Name:       columnName,
+			DBName:     columnName,
+			Type:       ir.FieldKindScalar,
+			ScalarType: mysqlScalarType(dataType, columnType),
+			IsOptional: isNullable == "YES",
+			Default:    mysqlDefaultValue(columnDefault.String, extra),
+		}
+		model.Fields = append(model.Fields, field)
+	}
+	return rows.Err()
+}
+
+func loadMySQLPrimaryKeys(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+	rows, err := db.QueryContext(ctx, `
+SELECT table_name, column_name
+FROM information_schema.key_column_usage
+WHERE table_schema = DATABASE()
+  AND constraint_name = 'PRIMARY'
+ORDER BY table_name, ordinal_position`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	grouped := map[string][]string{}
+	for rows.Next() {
+		var tableName, columnName string
+		if err := rows.Scan(&tableName, &columnName); err != nil {
+			return err
+		}
+		grouped[tableName] = append(grouped[tableName], columnName)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for tableName, fields := range grouped {
+		model := models[tableName]
+		if model == nil {
+			continue
+		}
+		model.PrimaryKey = &ir.PrimaryKey{Fields: fields, IsComposite: len(fields) > 1}
+		if len(fields) == 1 {
+			if field := findFieldByColumn(model, fields[0]); field != nil {
+				field.IsID = true
+			}
+		}
+	}
+	return nil
+}
+
+func loadMySQLUniqueConstraints(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+	rows, err := db.QueryContext(ctx, `
+SELECT tc.table_name, tc.constraint_name, kcu.column_name
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON tc.constraint_schema = kcu.constraint_schema
+ AND tc.constraint_name = kcu.constraint_name
+ AND tc.table_name = kcu.table_name
+WHERE tc.table_schema = DATABASE()
+  AND tc.constraint_type = 'UNIQUE'
+ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type uniqueKey struct {
+		table string
+		name  string
+	}
+	grouped := map[uniqueKey][]string{}
+	for rows.Next() {
+		var tableName, constraintName, columnName string
+		if err := rows.Scan(&tableName, &constraintName, &columnName); err != nil {
+			return err
+		}
+		key := uniqueKey{table: tableName, name: constraintName}
+		grouped[key] = append(grouped[key], columnName)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for key, fields := range grouped {
+		model := models[key.table]
+		if model == nil {
+			continue
+		}
+		if len(fields) == 1 {
+			if field := findFieldByColumn(model, fields[0]); field != nil {
+				field.IsUnique = true
+				continue
+			}
+		}
+		model.UniqueConstraints = append(model.UniqueConstraints, &ir.UniqueConstraint{Name: key.name, Fields: fields})
+	}
+	return nil
+}
+
+func loadMySQLIndexes(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+	rows, err := db.QueryContext(ctx, `
+SELECT table_name, index_name, column_name, seq_in_index
+FROM information_schema.statistics
+WHERE table_schema = DATABASE()
+  AND non_unique = 1
+ORDER BY table_name, index_name, seq_in_index`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type indexKey struct {
+		table string
+		name  string
+	}
+	grouped := map[indexKey][]string{}
+	for rows.Next() {
+		var tableName, indexName, columnName string
+		var seq int
+		if err := rows.Scan(&tableName, &indexName, &columnName, &seq); err != nil {
+			return err
+		}
+		key := indexKey{table: tableName, name: indexName}
+		grouped[key] = append(grouped[key], columnName)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for key, fields := range grouped {
+		model := models[key.table]
+		if model == nil {
+			continue
+		}
+		model.Indexes = append(model.Indexes, &ir.Index{Name: key.name, Fields: fields})
+	}
+	return nil
+}
+
+func loadMySQLForeignKeys(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+	rows, err := db.QueryContext(ctx, `
+SELECT
+  kcu.table_name,
+  kcu.constraint_name,
+  kcu.column_name,
+  kcu.referenced_table_name,
+  kcu.referenced_column_name,
+  rc.delete_rule,
+  rc.update_rule
+FROM information_schema.key_column_usage kcu
+JOIN information_schema.referential_constraints rc
+  ON kcu.constraint_schema = rc.constraint_schema
+ AND kcu.constraint_name = rc.constraint_name
+WHERE kcu.table_schema = DATABASE()
+  AND kcu.referenced_table_name IS NOT NULL
+ORDER BY kcu.table_name, kcu.constraint_name, kcu.ordinal_position`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type fkKey struct {
+		table string
+		name  string
+	}
+	grouped := map[fkKey]*ir.Relation{}
+	for rows.Next() {
+		var tableName, constraintName, columnName, foreignTable, foreignColumn, onDelete, onUpdate string
+		if err := rows.Scan(&tableName, &constraintName, &columnName, &foreignTable, &foreignColumn, &onDelete, &onUpdate); err != nil {
+			return err
+		}
+		key := fkKey{table: tableName, name: constraintName}
+		rel := grouped[key]
+		if rel == nil {
+			rel = &ir.Relation{Name: constraintName, FromModel: tableName, ToModel: foreignTable, OnDelete: onDelete, OnUpdate: onUpdate}
+			grouped[key] = rel
+		}
+		rel.Fields = append(rel.Fields, columnName)
+		rel.References = append(rel.References, foreignColumn)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for key, rel := range grouped {
+		model := models[key.table]
+		if model == nil {
+			continue
+		}
+		model.Relations = append(model.Relations, rel)
+	}
+	return nil
+}
+
+func loadSQLiteTables(ctx context.Context, db *sql.DB) (map[string]*ir.Model, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT name
+FROM sqlite_master
+WHERE type = 'table'
+  AND name NOT LIKE 'sqlite_%'
+ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	models := make(map[string]*ir.Model)
+	for rows.Next() {
+		var tableName string
+		if err := rows.Scan(&tableName); err != nil {
+			return nil, err
+		}
+		models[tableName] = &ir.Model{Name: tableName, DBName: tableName}
+	}
+	return models, rows.Err()
+}
+
+func loadSQLiteColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+	for tableName, model := range models {
+		rows, err := db.QueryContext(ctx, `SELECT cid, name, type, "notnull", dflt_value, pk FROM pragma_table_info(?)`, tableName)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var cid int
+			var columnName, dataType string
+			var notNull, pk int
+			var defaultValue sql.NullString
+			if err := rows.Scan(&cid, &columnName, &dataType, &notNull, &defaultValue, &pk); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			field := &ir.Field{
+				Name:       columnName,
+				DBName:     columnName,
+				Type:       ir.FieldKindScalar,
+				ScalarType: sqliteScalarType(dataType),
+				IsOptional: notNull == 0 && pk == 0,
+				IsID:       pk > 0,
+				Default:    sqliteDefaultValue(defaultValue.String),
+			}
+			model.Fields = append(model.Fields, field)
+			if pk > 0 {
+				if model.PrimaryKey == nil {
+					model.PrimaryKey = &ir.PrimaryKey{}
+				}
+				model.PrimaryKey.Fields = append(model.PrimaryKey.Fields, columnName)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if model.PrimaryKey != nil {
+			model.PrimaryKey.IsComposite = len(model.PrimaryKey.Fields) > 1
+		}
+	}
+	return nil
+}
+
+func loadSQLiteIndexes(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+	type sqliteIndex struct {
+		name    string
+		unique  bool
+		origin  string
+		partial bool
+	}
+
+	for tableName, model := range models {
+		rows, err := db.QueryContext(ctx, `SELECT seq, name, "unique", origin, partial FROM pragma_index_list(?)`, tableName)
+		if err != nil {
+			return err
+		}
+		var indexes []sqliteIndex
+		for rows.Next() {
+			var seq int
+			var indexName, origin string
+			var unique, partial int
+			if err := rows.Scan(&seq, &indexName, &unique, &origin, &partial); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if origin == "pk" {
+				continue
+			}
+			indexes = append(indexes, sqliteIndex{
+				name:    indexName,
+				unique:  unique == 1,
+				origin:  origin,
+				partial: partial == 1,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+
+		for _, idx := range indexes {
+			fields, err := loadSQLiteIndexColumns(ctx, db, idx.name)
+			if err != nil {
+				return err
+			}
+			if idx.unique {
+				if len(fields) == 1 {
+					if field := findFieldByColumn(model, fields[0]); field != nil {
+						field.IsUnique = true
+						continue
+					}
+				}
+				model.UniqueConstraints = append(model.UniqueConstraints, &ir.UniqueConstraint{Name: idx.name, Fields: fields})
+				continue
+			}
+			model.Indexes = append(model.Indexes, &ir.Index{Name: idx.name, Fields: fields})
+		}
+	}
+	return nil
+}
+
+func loadSQLiteIndexColumns(ctx context.Context, db *sql.DB, indexName string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `SELECT seqno, cid, name FROM pragma_index_info(?)`, indexName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var fields []string
+	for rows.Next() {
+		var seqno, cid int
+		var columnName string
+		if err := rows.Scan(&seqno, &cid, &columnName); err != nil {
+			return nil, err
+		}
+		fields = append(fields, columnName)
+	}
+	return fields, rows.Err()
+}
+
+func loadSQLiteForeignKeys(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+	for tableName, model := range models {
+		rows, err := db.QueryContext(ctx, `SELECT id, seq, "table", "from", "to", on_update, on_delete, match FROM pragma_foreign_key_list(?)`, tableName)
+		if err != nil {
+			return err
+		}
+		grouped := map[int]*ir.Relation{}
+		for rows.Next() {
+			var id, seq int
+			var refTable, fromColumn, toColumn, onUpdate, onDelete, match string
+			if err := rows.Scan(&id, &seq, &refTable, &fromColumn, &toColumn, &onUpdate, &onDelete, &match); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			rel := grouped[id]
+			if rel == nil {
+				rel = &ir.Relation{
+					Name:      fmt.Sprintf("fk_%s_%s", tableName, fromColumn),
+					FromModel: tableName,
+					ToModel:   refTable,
+					OnDelete:  onDelete,
+					OnUpdate:  onUpdate,
+				}
+				grouped[id] = rel
+			}
+			rel.Fields = append(rel.Fields, fromColumn)
+			rel.References = append(rel.References, toColumn)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		keys := make([]int, 0, len(grouped))
+		for key := range grouped {
+			keys = append(keys, key)
+		}
+		sort.Ints(keys)
+		for _, key := range keys {
+			model.Relations = append(model.Relations, grouped[key])
+		}
+	}
+	return nil
+}
+
 func postgresScalarType(dataType, udtName string) string {
 	upperType := strings.ToUpper(dataType)
 	upperUDT := strings.ToUpper(udtName)
@@ -695,6 +1288,136 @@ func postgresDefaultValue(def string) *ir.DefaultValue {
 	default:
 		return &ir.DefaultValue{Value: strings.Trim(def, "'"), IsString: true}
 	}
+}
+
+func mysqlScalarType(dataType, columnType string) string {
+	upperType := strings.ToUpper(strings.TrimSpace(dataType))
+	upperColumn := strings.ToUpper(strings.TrimSpace(columnType))
+	switch {
+	case strings.Contains(upperColumn, "CHAR(36)"):
+		return "UUID"
+	case strings.Contains(upperType, "BIGINT"):
+		return "BigInt"
+	case strings.Contains(upperType, "TINYINT") && strings.Contains(upperColumn, "TINYINT(1)"):
+		return "Boolean"
+	case strings.Contains(upperType, "INT"), strings.Contains(upperType, "SMALLINT"), strings.Contains(upperType, "MEDIUMINT"), strings.Contains(upperType, "TINYINT"):
+		return "Int"
+	case strings.Contains(upperType, "DOUBLE"), strings.Contains(upperType, "FLOAT"):
+		return "Float"
+	case strings.Contains(upperType, "DECIMAL"), strings.Contains(upperType, "NUMERIC"):
+		return "Decimal"
+	case strings.Contains(upperType, "BOOL"):
+		return "Boolean"
+	case strings.Contains(upperType, "DATETIME"), strings.Contains(upperType, "TIMESTAMP"), strings.Contains(upperType, "DATE"), strings.Contains(upperType, "TIME"):
+		return "DateTime"
+	case strings.Contains(upperType, "BLOB"), strings.Contains(upperType, "BINARY"):
+		return "Bytes"
+	case strings.Contains(upperType, "JSON"):
+		return "Json"
+	default:
+		return "String"
+	}
+}
+
+func mysqlDefaultValue(def, extra string) *ir.DefaultValue {
+	def = strings.TrimSpace(def)
+	extra = strings.ToLower(strings.TrimSpace(extra))
+	if strings.Contains(extra, "auto_increment") {
+		return &ir.DefaultValue{IsFunction: true, FuncName: "autoincrement"}
+	}
+	if def == "" {
+		return nil
+	}
+	lower := strings.ToLower(def)
+	switch {
+	case strings.Contains(lower, "uuid"):
+		return &ir.DefaultValue{IsFunction: true, FuncName: "uuid"}
+	case strings.Contains(lower, "current_timestamp"), strings.Contains(lower, "now()"):
+		return &ir.DefaultValue{IsFunction: true, FuncName: "now"}
+	default:
+		return literalDefaultValue(def)
+	}
+}
+
+func sqliteScalarType(dataType string) string {
+	upperType := strings.ToUpper(strings.TrimSpace(dataType))
+	switch {
+	case strings.Contains(upperType, "BIGINT"):
+		return "BigInt"
+	case strings.Contains(upperType, "INT"):
+		return "Int"
+	case strings.Contains(upperType, "REAL"), strings.Contains(upperType, "DOUBLE"), strings.Contains(upperType, "FLOAT"):
+		return "Float"
+	case strings.Contains(upperType, "DECIMAL"), strings.Contains(upperType, "NUMERIC"):
+		return "Decimal"
+	case strings.Contains(upperType, "BOOL"):
+		return "Boolean"
+	case strings.Contains(upperType, "DATE"), strings.Contains(upperType, "TIME"):
+		return "DateTime"
+	case strings.Contains(upperType, "BLOB"), strings.Contains(upperType, "BINARY"):
+		return "Bytes"
+	case strings.Contains(upperType, "JSON"):
+		return "Json"
+	default:
+		return "String"
+	}
+}
+
+func sqliteDefaultValue(def string) *ir.DefaultValue {
+	def = strings.TrimSpace(def)
+	if def == "" {
+		return nil
+	}
+	lower := strings.ToLower(def)
+	switch {
+	case strings.Contains(lower, "randomblob"):
+		return &ir.DefaultValue{IsFunction: true, FuncName: "uuid"}
+	case strings.Contains(lower, "datetime('now')"), strings.Contains(lower, "current_timestamp"):
+		return &ir.DefaultValue{IsFunction: true, FuncName: "now"}
+	default:
+		return literalDefaultValue(def)
+	}
+}
+
+func literalDefaultValue(def string) *ir.DefaultValue {
+	unquoted := strings.Trim(def, "'\"")
+	lower := strings.ToLower(unquoted)
+	switch lower {
+	case "true":
+		return &ir.DefaultValue{Value: "true", IsBool: true}
+	case "false":
+		return &ir.DefaultValue{Value: "false", IsBool: true}
+	}
+	if lower == "1" {
+		return &ir.DefaultValue{Value: "true", IsBool: true}
+	}
+	if lower == "0" {
+		return &ir.DefaultValue{Value: "false", IsBool: true}
+	}
+	if isNumericLiteral(unquoted) {
+		return &ir.DefaultValue{Value: unquoted, IsNumber: true}
+	}
+	return &ir.DefaultValue{Value: unquoted, IsString: true}
+}
+
+func isNumericLiteral(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, ch := range s {
+		if ch >= '0' && ch <= '9' {
+			continue
+		}
+		if ch == '.' || (ch == '-' && i == 0) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func sqliteQuoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 func parsePostgresTextArray(input string) []string {
