@@ -594,9 +594,10 @@ func scanRowsToStructs[T any](rows *sql.Rows) ([]T, error) {
 	return results, rows.Err()
 }
 
+var likePatternReplacer = strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_")
+
 func escapeLikePattern(s string) string {
-	replacer := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_")
-	return replacer.Replace(s)
+	return likePatternReplacer.Replace(s)
 }
 
 // Raw executes a custom SELECT query and scans rows into T using db tags.

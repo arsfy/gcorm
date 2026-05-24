@@ -35,11 +35,18 @@ func TestGeneratedClientBulkCreateAndRawRuntime(t *testing.T) {
 		t.Fatalf("write generated runtime test: %v", err)
 	}
 
-	cmd := exec.Command("go", "test", "./gen/...")
+	args := []string{"test", "./gen/..."}
+	if os.Getenv("GCO_RUN_GENERATED_BENCH") == "1" {
+		args = []string{"test", "-run", "^$", "-bench", "BenchmarkGenerated", "-benchmem", "./gen/..."}
+	}
+	cmd := exec.Command("go", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("generated client tests failed: %v\n%s", err, out)
+	}
+	if os.Getenv("GCO_RUN_GENERATED_BENCH") == "1" {
+		t.Logf("generated client benchmarks:\n%s", out)
 	}
 }
 
@@ -219,6 +226,59 @@ func TestRawScansStructsByDBTag(t *testing.T) {
 	}
 	if posts[0].Id != "p1" || posts[0].Title != "First" || !posts[0].Published || posts[0].AuthorId != "u1" {
 		t.Fatalf("post = %#v", posts[0])
+	}
+}
+
+func BenchmarkGeneratedFindManyEquals(b *testing.B) {
+	db, err := sql.Open("capture_runtime", "")
+	if err != nil {
+		b.Fatal(err)
+	}
+	c := client.New(db)
+	defer c.Close()
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		posts, err := c.Post.Query().
+			Where(
+				query.Post.AuthorId.Equals("u1"),
+				query.Post.Published.Equals(true),
+			).
+			Take(10).
+			Do(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(posts) != 1 {
+			b.Fatalf("len(posts) = %d", len(posts))
+		}
+	}
+}
+
+func BenchmarkGeneratedFindManyContainsEscaped(b *testing.B) {
+	db, err := sql.Open("capture_runtime", "")
+	if err != nil {
+		b.Fatal(err)
+	}
+	c := client.New(db)
+	defer c.Close()
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		posts, err := c.Post.Query().
+			Where(query.Post.Title.Contains("50%_off\\sale")).
+			Take(10).
+			Do(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(posts) != 1 {
+			b.Fatalf("len(posts) = %d", len(posts))
+		}
 	}
 }
 `
