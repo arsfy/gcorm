@@ -386,6 +386,77 @@ func TestIndexWithFieldReferences(t *testing.T) {
 	requireNoErrors(t, r)
 }
 
+func TestIndexWithPredicateAndColumnOptions(t *testing.T) {
+	doc := &ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "Announcement",
+			Fields: []ast.FieldDecl{
+				{Name: "id", Type: ast.FieldType{Name: "Int"}},
+				{Name: "status", Type: ast.FieldType{Name: "Int"}},
+				{Name: "publishedAt", Type: ast.FieldType{Name: "DateTime", IsOptional: true}},
+			},
+			Attributes: []ast.Attribute{{
+				Name:         "index",
+				IsModelLevel: true,
+				Args: []ast.AttributeArg{
+					posArg(arrayLit(ident("status"), ident("publishedAt"))),
+					namedArg("name", strLit("IDX_ANNOUNCEMENTS_USER")),
+					namedArg("where", strLit("status = 1 AND published_at IS NOT NULL")),
+					namedArg("sort", arrayLit(ident("Desc"), ident("Asc"))),
+					namedArg("nulls", arrayLit(ident("Last"), ident("Last"))),
+					namedArg("opclass", arrayLit(strLit("int8_ops"), strLit("timestamptz_ops"))),
+					namedArg("collate", arrayLit(strLit("pg_catalog.default"), strLit("pg_catalog.default"))),
+				},
+			}},
+		}},
+	}
+	r := Validate(doc)
+	requireNoErrors(t, r)
+}
+
+func TestIndexOptionLengthValidation(t *testing.T) {
+	doc := &ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "User",
+			Fields: []ast.FieldDecl{
+				{Name: "id", Type: ast.FieldType{Name: "Int"}},
+				{Name: "email", Type: ast.FieldType{Name: "String"}},
+			},
+			Attributes: []ast.Attribute{{
+				Name:         "index",
+				IsModelLevel: true,
+				Args: []ast.AttributeArg{
+					posArg(arrayLit(ident("id"), ident("email"))),
+					namedArg("sort", arrayLit(ident("Asc"), ident("Desc"), ident("Asc"))),
+				},
+			}},
+		}},
+	}
+	r := Validate(doc)
+	requireErrors(t, r, "expected 1 or 2")
+}
+
+func TestIndexOptionValueValidation(t *testing.T) {
+	doc := &ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "User",
+			Fields: []ast.FieldDecl{
+				{Name: "id", Type: ast.FieldType{Name: "Int"}},
+			},
+			Attributes: []ast.Attribute{{
+				Name:         "index",
+				IsModelLevel: true,
+				Args: []ast.AttributeArg{
+					posArg(arrayLit(ident("id"))),
+					namedArg("sort", arrayLit(ident("Sideways"))),
+				},
+			}},
+		}},
+	}
+	r := Validate(doc)
+	requireErrors(t, r, "Asc or Desc")
+}
+
 func TestValidateDocumentSetCrossFileReferences(t *testing.T) {
 	ds := &ast.DocumentSet{
 		Documents: []*ast.Document{

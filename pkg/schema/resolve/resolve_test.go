@@ -390,6 +390,66 @@ func TestResolveIndex(t *testing.T) {
 	}
 }
 
+func TestResolveIndexPredicateAndColumnOptions(t *testing.T) {
+	ds := docSet(&ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "Announcement",
+			Fields: []ast.FieldDecl{
+				{Name: "id", Type: ast.FieldType{Name: "Int"}},
+				{Name: "status", Type: ast.FieldType{Name: "Int"}},
+				{Name: "publishedAt", Type: ast.FieldType{Name: "DateTime", IsOptional: true}},
+			},
+			Attributes: []ast.Attribute{
+				{Name: "index", IsModelLevel: true, Args: []ast.AttributeArg{
+					{Value: ast.ArrayLiteral{Elements: []ast.Expression{
+						ast.Identifier{Name: "status"},
+						ast.Identifier{Name: "publishedAt"},
+					}}},
+					{Name: "name", Value: ast.StringLiteral{Value: "IDX_ANNOUNCEMENTS_USER"}},
+					{Name: "where", Value: ast.StringLiteral{Value: "status = 1 AND published_at IS NOT NULL"}},
+					{Name: "sort", Value: ast.ArrayLiteral{Elements: []ast.Expression{
+						ast.Identifier{Name: "Desc"},
+						ast.Identifier{Name: "Asc"},
+					}}},
+					{Name: "nulls", Value: ast.ArrayLiteral{Elements: []ast.Expression{
+						ast.Identifier{Name: "Last"},
+						ast.Identifier{Name: "Last"},
+					}}},
+					{Name: "opclass", Value: ast.ArrayLiteral{Elements: []ast.Expression{
+						ast.StringLiteral{Value: "int8_ops"},
+						ast.StringLiteral{Value: "timestamptz_ops"},
+					}}},
+					{Name: "collate", Value: ast.ArrayLiteral{Elements: []ast.Expression{
+						ast.StringLiteral{Value: "pg_catalog.default"},
+						ast.StringLiteral{Value: "pg_catalog.default"},
+					}}},
+				}},
+			},
+		}},
+	})
+
+	schema, errs := Resolve(ds)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	idx := schema.Models[0].Indexes[0]
+	if idx.Where != "status = 1 AND published_at IS NOT NULL" {
+		t.Fatalf("where = %q", idx.Where)
+	}
+	if len(idx.Columns) != 2 {
+		t.Fatalf("columns = %d, want 2", len(idx.Columns))
+	}
+	if idx.Columns[0].Field != "status" || idx.Columns[0].Sort != "DESC" || idx.Columns[0].Nulls != "LAST" || idx.Columns[0].OpClass != "int8_ops" {
+		t.Fatalf("first column = %+v", idx.Columns[0])
+	}
+	if idx.Columns[1].Field != "publishedAt" || idx.Columns[1].Sort != "ASC" || idx.Columns[1].Nulls != "LAST" || idx.Columns[1].OpClass != "timestamptz_ops" {
+		t.Fatalf("second column = %+v", idx.Columns[1])
+	}
+	if idx.Columns[0].Collation != "pg_catalog.default" || idx.Columns[1].Collation != "pg_catalog.default" {
+		t.Fatalf("collations = %+v", idx.Columns)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 9. Resolve @@id composite
 // ---------------------------------------------------------------------------

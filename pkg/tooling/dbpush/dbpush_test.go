@@ -252,6 +252,43 @@ func TestRiskyChanges(t *testing.T) {
 	}
 }
 
+func TestParsePostgresIndexColumnDef(t *testing.T) {
+	col := parsePostgresIndexColumnDef("published_at", `"published_at" COLLATE "pg_catalog"."default" timestamptz_ops ASC NULLS LAST`)
+
+	if col.Field != "published_at" {
+		t.Fatalf("field = %q", col.Field)
+	}
+	if col.Collation != "pg_catalog.default" {
+		t.Fatalf("collation = %q", col.Collation)
+	}
+	if col.OpClass != "timestamptz_ops" {
+		t.Fatalf("opclass = %q", col.OpClass)
+	}
+	if col.Sort != "ASC" {
+		t.Fatalf("sort = %q", col.Sort)
+	}
+	if col.Nulls != "LAST" {
+		t.Fatalf("nulls = %q", col.Nulls)
+	}
+}
+
+func TestParsePostgresIndexColumns(t *testing.T) {
+	cols := parsePostgresIndexColumns(
+		[]string{"status", "published_at"},
+		[]string{`status int8_ops DESC`, `"published_at" timestamptz_ops ASC NULLS LAST`},
+	)
+
+	if len(cols) != 2 {
+		t.Fatalf("columns = %d, want 2", len(cols))
+	}
+	if cols[0].Field != "status" || cols[0].OpClass != "int8_ops" || cols[0].Sort != "DESC" {
+		t.Fatalf("first column = %+v", cols[0])
+	}
+	if cols[1].Field != "published_at" || cols[1].OpClass != "timestamptz_ops" || cols[1].Sort != "ASC" || cols[1].Nulls != "LAST" {
+		t.Fatalf("second column = %+v", cols[1])
+	}
+}
+
 func TestIntrospectSQLite(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {

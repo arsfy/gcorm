@@ -225,38 +225,79 @@ func compareIndexes(cs *Changeset, model string, oldM, newM *ir.Model) {
 		case inNew && !inOld:
 			cs.add(Change{
 				Type: AddIndex, Model: model, NewValue: ni.Name,
-				Details: map[string]string{
-					"fields": strings.Join(ni.Fields, ","),
-					"unique": boolStr(ni.IsUnique),
-				},
+				Details: indexDetails(ni),
 			})
 		case inOld && !inNew:
 			cs.add(Change{
 				Type: DropIndex, Model: model, OldValue: oi.Name,
-				Details: map[string]string{
-					"fields": strings.Join(oi.Fields, ","),
-					"unique": boolStr(oi.IsUnique),
-				},
+				Details: indexDetails(oi),
 			})
 		default:
-			if strings.Join(oi.Fields, ",") != strings.Join(ni.Fields, ",") || oi.IsUnique != ni.IsUnique {
+			if indexSignature(oi) != indexSignature(ni) {
 				cs.add(Change{
 					Type: DropIndex, Model: model, OldValue: oi.Name,
-					Details: map[string]string{
-						"fields": strings.Join(oi.Fields, ","),
-						"unique": boolStr(oi.IsUnique),
-					},
+					Details: indexDetails(oi),
 				})
 				cs.add(Change{
 					Type: AddIndex, Model: model, NewValue: ni.Name,
-					Details: map[string]string{
-						"fields": strings.Join(ni.Fields, ","),
-						"unique": boolStr(ni.IsUnique),
-					},
+					Details: indexDetails(ni),
 				})
 			}
 		}
 	}
+}
+
+func indexDetails(idx *ir.Index) map[string]string {
+	details := map[string]string{
+		"fields": strings.Join(idx.Fields, ","),
+		"unique": boolStr(idx.IsUnique),
+	}
+	if idx.Where != "" {
+		details["where"] = idx.Where
+	}
+	cols := effectiveIndexColumns(idx)
+	details["sorts"] = strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return c.Sort }), ",")
+	details["nulls"] = strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return c.Nulls }), ",")
+	details["opclasses"] = strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return c.OpClass }), ",")
+	details["collations"] = strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return c.Collation }), ",")
+	return details
+}
+
+func indexSignature(idx *ir.Index) string {
+	if idx == nil {
+		return ""
+	}
+	return strings.Join([]string{
+		strings.Join(idx.Fields, ","),
+		boolStr(idx.IsUnique),
+		idx.Where,
+		strings.Join(indexColumnValues(effectiveIndexColumns(idx), func(c ir.IndexColumn) string { return c.Sort }), ","),
+		strings.Join(indexColumnValues(effectiveIndexColumns(idx), func(c ir.IndexColumn) string { return c.Nulls }), ","),
+		strings.Join(indexColumnValues(effectiveIndexColumns(idx), func(c ir.IndexColumn) string { return c.OpClass }), ","),
+		strings.Join(indexColumnValues(effectiveIndexColumns(idx), func(c ir.IndexColumn) string { return c.Collation }), ","),
+	}, "\x00")
+}
+
+func indexColumnValues(cols []ir.IndexColumn, pick func(ir.IndexColumn) string) []string {
+	values := make([]string, len(cols))
+	for i, col := range cols {
+		values[i] = pick(col)
+	}
+	return values
+}
+
+func effectiveIndexColumns(idx *ir.Index) []ir.IndexColumn {
+	if idx == nil {
+		return nil
+	}
+	if len(idx.Columns) > 0 {
+		return idx.Columns
+	}
+	cols := make([]ir.IndexColumn, len(idx.Fields))
+	for i, field := range idx.Fields {
+		cols[i] = ir.IndexColumn{Field: field}
+	}
+	return cols
 }
 
 func mapIndexes(model *ir.Model, idxs []*ir.Index) map[string]*ir.Index {
@@ -566,8 +607,19 @@ func normalizedIndex(model *ir.Model, idx *ir.Index) *ir.Index {
 	}
 	clone := *idx
 	clone.Fields = normalizeFieldNames(model, idx.Fields)
+	clone.Columns = normalizeIndexColumns(model, idx)
 	clone.Name = effectiveIndexName(model, &clone)
 	return &clone
+}
+
+func normalizeIndexColumns(model *ir.Model, idx *ir.Index) []ir.IndexColumn {
+	cols := effectiveIndexColumns(idx)
+	out := make([]ir.IndexColumn, len(cols))
+	for i, col := range cols {
+		out[i] = col
+		out[i].Field = resolveColumnName(model, col.Field)
+	}
+	return out
 }
 
 func normalizedUnique(model *ir.Model, uc *ir.UniqueConstraint) *ir.UniqueConstraint {

@@ -177,6 +177,43 @@ func TestDiff_AddIndex(t *testing.T) {
 	}
 }
 
+func TestDiff_IndexOptionsTriggerRecreate(t *testing.T) {
+	userOld := testModel("User", testField("id", "Int"), testField("email", "String"))
+	userOld.Indexes = []*ir.Index{{
+		Name:   "idx_email",
+		Fields: []string{"email"},
+		Columns: []ir.IndexColumn{{
+			Field: "email",
+			Sort:  "ASC",
+		}},
+	}}
+
+	userNew := testModel("User", testField("id", "Int"), testField("email", "String"))
+	userNew.Indexes = []*ir.Index{{
+		Name:   "idx_email",
+		Fields: []string{"email"},
+		Where:  "email IS NOT NULL",
+		Columns: []ir.IndexColumn{{
+			Field:   "email",
+			Sort:    "DESC",
+			Nulls:   "LAST",
+			OpClass: "text_ops",
+		}},
+	}}
+
+	cs := Diff(testSchema(userOld), testSchema(userNew))
+	if len(cs.Changes) != 2 || cs.Changes[0].Type != DropIndex || cs.Changes[1].Type != AddIndex {
+		t.Fatalf("expected drop/add index for option change, got: %+v", cs.Changes)
+	}
+	add := cs.Changes[1]
+	if add.Details["where"] != "email IS NOT NULL" {
+		t.Fatalf("where detail = %q", add.Details["where"])
+	}
+	if add.Details["sorts"] != "DESC" || add.Details["nulls"] != "LAST" || add.Details["opclasses"] != "text_ops" {
+		t.Fatalf("details = %+v", add.Details)
+	}
+}
+
 func TestDiff_DefaultIndexNameMatchesIntrospectedIndex(t *testing.T) {
 	oldPost := testModel("Post", testField("id", "Int"), testField("change", "String"))
 	oldPost.DBName = "posts"
@@ -589,6 +626,66 @@ func TestDDLDropIndexUsesIfExists(t *testing.T) {
 	mysql := DDLGenerator{Dialect: "mysql"}.dropIndexSQL(change)
 	if mysql != "DROP INDEX `idx_post_tags_post_id_tag_id` ON `post_tags`;" {
 		t.Fatalf("mysql drop index SQL = %q", mysql)
+	}
+}
+
+func TestDDLCreateIndexWithPredicateAndColumnOptions(t *testing.T) {
+	announcement := testModel(
+		"Announcement",
+		testField("id", "Int"),
+		testField("status", "Int"),
+		testFieldOptional("publishedAt", "DateTime"),
+	)
+	announcement.DBName = "announcements"
+	announcement.Fields[2].DBName = "published_at"
+	announcement.Indexes = []*ir.Index{{
+		Name:   "IDX_ANNOUNCEMENTS_USER",
+		Fields: []string{"status", "publishedAt"},
+		Where:  "status = 1 AND published_at IS NOT NULL",
+		Columns: []ir.IndexColumn{
+			{
+				Field:     "status",
+				Sort:      "DESC",
+				Nulls:     "LAST",
+				OpClass:   "int8_ops",
+				Collation: "pg_catalog.default",
+			},
+			{
+				Field:     "publishedAt",
+				Sort:      "ASC",
+				Nulls:     "LAST",
+				OpClass:   "timestamptz_ops",
+				Collation: "pg_catalog.default",
+			},
+		},
+	}}
+	cs := Diff(nil, testSchema(announcement))
+	sql := DDLGenerator{Dialect: "postgresql", Schema: cs.New}.GenerateUp(cs)
+
+	want := `CREATE INDEX "IDX_ANNOUNCEMENTS_USER" ON "announcements" ("status" COLLATE "pg_catalog"."default" int8_ops DESC NULLS LAST, "published_at" COLLATE "pg_catalog"."default" timestamptz_ops ASC NULLS LAST) WHERE status = 1 AND published_at IS NOT NULL;`
+	if !strings.Contains(sql, want) {
+		t.Fatalf("missing index SQL:\nwant: %s\n got:\n%s", want, sql)
+	}
+}
+
+func TestDDLAddIndexWithPredicateAndColumnOptions(t *testing.T) {
+	change := Change{
+		Type:     AddIndex,
+		Model:    "interaction_click_events",
+		NewValue: "idx_ihce_retry",
+		Details: map[string]string{
+			"fields":    "clickhouse_recorded_at",
+			"sorts":     "ASC",
+			"nulls":     "LAST",
+			"opclasses": "timestamptz_ops",
+			"where":     "clickhouse_recorded_at IS NULL",
+		},
+	}
+
+	sql := DDLGenerator{Dialect: "postgresql"}.addIndexSQL(change)
+	want := `CREATE INDEX "idx_ihce_retry" ON "interaction_click_events" ("clickhouse_recorded_at" timestamptz_ops ASC NULLS LAST) WHERE clickhouse_recorded_at IS NULL;`
+	if sql != want {
+		t.Fatalf("add index SQL = %q\nwant %q", sql, want)
 	}
 }
 

@@ -302,6 +302,40 @@ func TestParseModelLevelAttributes(t *testing.T) {
 	}
 }
 
+func TestParseIndexWithPredicateAndColumnOptions(t *testing.T) {
+	src := `model Announcement {
+  id          Int
+  status      Int
+  publishedAt DateTime?
+
+  @@index([status, publishedAt], name: "IDX_ANNOUNCEMENTS_USER", where: "status = 1 AND published_at IS NOT NULL", sort: [Desc, Asc], nulls: [Last, Last], opclass: ["int8_ops", "timestamptz_ops"], collate: ["pg_catalog.default", "pg_catalog.default"])
+}`
+	doc, err := Parse("test.gcorm", []byte(src))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	attr := doc.Models[0].Attributes[0]
+	if attr.Name != "index" {
+		t.Fatalf("attr name = %q, want index", attr.Name)
+	}
+	if len(attr.Args) != 7 {
+		t.Fatalf("args = %d, want 7", len(attr.Args))
+	}
+	if _, ok := attr.Args[0].Value.(ast.ArrayLiteral); !ok {
+		t.Fatalf("fields arg = %T, want ArrayLiteral", attr.Args[0].Value)
+	}
+	if attr.Args[2].Name != "where" {
+		t.Fatalf("arg[2].Name = %q, want where", attr.Args[2].Name)
+	}
+	where, ok := attr.Args[2].Value.(ast.StringLiteral)
+	if !ok {
+		t.Fatalf("where arg = %T, want StringLiteral", attr.Args[2].Value)
+	}
+	if where.Value != "status = 1 AND published_at IS NOT NULL" {
+		t.Fatalf("where = %q", where.Value)
+	}
+}
+
 func TestParseEnum(t *testing.T) {
 	src := `enum Role {
   USER

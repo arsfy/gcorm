@@ -359,9 +359,53 @@ func (r *resolver) resolveIndex(attr ast.Attribute, isUnique bool) *ir.Index {
 			idx.Fields = exprToStringSlice(arg.Value)
 		case "name":
 			idx.Name = exprToString(arg.Value)
+		case "where":
+			idx.Where = exprToString(arg.Value)
 		}
 	}
+	idx.Columns = resolveIndexColumns(idx.Fields, attr.Args)
 	return idx
+}
+
+func resolveIndexColumns(fields []string, args []ast.AttributeArg) []ir.IndexColumn {
+	cols := make([]ir.IndexColumn, len(fields))
+	for i, f := range fields {
+		cols[i] = ir.IndexColumn{Field: f}
+	}
+	for _, arg := range args {
+		values := exprToStringSlice(arg.Value)
+		for i := range cols {
+			value := indexOptionAt(values, i)
+			switch arg.Name {
+			case "sort", "order":
+				cols[i].Sort = normalizeIndexKeyword(value)
+			case "nulls":
+				cols[i].Nulls = normalizeIndexKeyword(value)
+			case "opclass", "opclasses", "ops":
+				cols[i].OpClass = value
+			case "collate", "collation":
+				cols[i].Collation = value
+			}
+		}
+	}
+	return cols
+}
+
+func indexOptionAt(values []string, idx int) string {
+	if len(values) == 0 {
+		return ""
+	}
+	if len(values) == 1 {
+		return values[0]
+	}
+	if idx < len(values) {
+		return values[idx]
+	}
+	return ""
+}
+
+func normalizeIndexKeyword(v string) string {
+	return strings.ToUpper(strings.TrimSpace(v))
 }
 
 // ---------------------------------------------------------------------------

@@ -440,19 +440,23 @@ func (v *validator) validateModelAttribute(a ast.Attribute, m ast.ModelDecl, fie
 			v.addError(a.Span.Start, "@@id argument must be an array")
 		}
 	case "index":
-		if len(a.Args) < 1 {
+		fieldArg, ok := indexFieldsArg(a)
+		if !ok {
 			v.addError(a.Span.Start, "@@index requires at least one argument")
-		} else if arr, ok := a.Args[0].Value.(ast.ArrayLiteral); ok {
+		} else if arr, ok := fieldArg.Value.(ast.ArrayLiteral); ok {
 			for _, elem := range arr.Elements {
 				if id, ok := elem.(ast.Identifier); ok {
 					if !fieldNames[id.Name] {
 						v.addError(id.Span.Start, fmt.Sprintf(
 							"@@index references unknown field %q in model %q", id.Name, m.Name))
 					}
+				} else {
+					v.addError(elem.ExprSpan().Start, "@@index fields must be identifiers")
 				}
 			}
+			v.validateIndexOptions(a, len(arr.Elements))
 		} else {
-			v.addError(a.Span.Start, "@@index first argument must be an array")
+			v.addError(fieldArg.Span.Start, "@@index fields argument must be an array")
 		}
 	case "map":
 		if len(a.Args) != 1 {
@@ -460,6 +464,71 @@ func (v *validator) validateModelAttribute(a ast.Attribute, m ast.ModelDecl, fie
 		} else if _, ok := a.Args[0].Value.(ast.StringLiteral); !ok {
 			v.addError(a.Span.Start, "@@map argument must be a string")
 		}
+	}
+}
+
+func indexFieldsArg(a ast.Attribute) (ast.AttributeArg, bool) {
+	for _, arg := range a.Args {
+		if arg.Name == "" || arg.Name == "fields" {
+			return arg, true
+		}
+	}
+	return ast.AttributeArg{}, false
+}
+
+func (v *validator) validateIndexOptions(a ast.Attribute, fieldCount int) {
+	for _, arg := range a.Args {
+		switch arg.Name {
+		case "", "fields":
+			continue
+		case "name", "where":
+			if _, ok := arg.Value.(ast.StringLiteral); !ok {
+				v.addError(arg.Span.Start, "@@index "+arg.Name+" must be a string")
+			}
+		case "sort", "order":
+			v.validateIndexOptionValues(arg, fieldCount, map[string]bool{"ASC": true, "DESC": true}, "@@index "+arg.Name+" values must be Asc or Desc")
+		case "nulls":
+			v.validateIndexOptionValues(arg, fieldCount, map[string]bool{"FIRST": true, "LAST": true}, "@@index nulls values must be First or Last")
+		case "opclass", "opclasses", "ops", "collate", "collation":
+			v.validateIndexOptionValues(arg, fieldCount, nil, "")
+		default:
+			v.addWarning(arg.Span.Start, fmt.Sprintf("unknown @@index argument %q", arg.Name))
+		}
+	}
+}
+
+func (v *validator) validateIndexOptionValues(arg ast.AttributeArg, fieldCount int, allowed map[string]bool, message string) {
+	values := indexOptionExprs(arg.Value)
+	if len(values) > 1 && len(values) != fieldCount {
+		v.addError(arg.Span.Start, fmt.Sprintf("@@index %s option has %d value(s), expected 1 or %d", arg.Name, len(values), fieldCount))
+		return
+	}
+	for _, expr := range values {
+		value := strings.ToUpper(strings.TrimSpace(indexOptionValue(expr)))
+		if value == "" {
+			continue
+		}
+		if allowed != nil && !allowed[value] {
+			v.addError(expr.ExprSpan().Start, message)
+		}
+	}
+}
+
+func indexOptionExprs(expr ast.Expression) []ast.Expression {
+	if arr, ok := expr.(ast.ArrayLiteral); ok {
+		return arr.Elements
+	}
+	return []ast.Expression{expr}
+}
+
+func indexOptionValue(expr ast.Expression) string {
+	switch v := expr.(type) {
+	case ast.Identifier:
+		return v.Name
+	case ast.StringLiteral:
+		return v.Value
+	default:
+		return ""
 	}
 }
 

@@ -703,7 +703,9 @@ SELECT
   t.relname AS table_name,
   i.relname AS index_name,
   ix.indisunique,
-  array_agg(a.attname ORDER BY keys.ord) AS columns
+  array_agg(a.attname ORDER BY keys.ord) AS columns,
+  array_agg(pg_get_indexdef(ix.indexrelid, keys.ord::int, false) ORDER BY keys.ord) AS column_defs,
+  pg_get_expr(ix.indpred, ix.indrelid) AS predicate
 FROM pg_class t
 JOIN pg_namespace ns ON ns.oid = t.relnamespace
 JOIN pg_index ix ON t.oid = ix.indrelid
@@ -715,7 +717,7 @@ WHERE ns.nspname = $1
   AND t.relkind = 'r'
   AND NOT ix.indisprimary
   AND c.oid IS NULL
-GROUP BY t.relname, i.relname, ix.indisunique
+GROUP BY t.relname, i.relname, ix.indisunique, ix.indpred, ix.indrelid
 ORDER BY t.relname, i.relname`, schemaName)
 	if err != nil {
 		return err
@@ -725,17 +727,21 @@ ORDER BY t.relname, i.relname`, schemaName)
 	for rows.Next() {
 		var tableName, indexName string
 		var isUnique bool
-		var columns []byte
-		if err := rows.Scan(&tableName, &indexName, &isUnique, &columns); err != nil {
+		var columns, columnDefs []byte
+		var predicate sql.NullString
+		if err := rows.Scan(&tableName, &indexName, &isUnique, &columns, &columnDefs, &predicate); err != nil {
 			return err
 		}
 		model := models[tableName]
 		if model == nil {
 			continue
 		}
+		fields := parsePostgresTextArray(string(columns))
 		model.Indexes = append(model.Indexes, &ir.Index{
 			Name:     indexName,
-			Fields:   parsePostgresTextArray(string(columns)),
+			Fields:   fields,
+			Columns:  parsePostgresIndexColumns(fields, parsePostgresTextArray(string(columnDefs))),
+			Where:    strings.TrimSpace(predicate.String),
 			IsUnique: isUnique,
 		})
 	}
@@ -1431,6 +1437,65 @@ func parsePostgresTextArray(input string) []string {
 		out = append(out, strings.Trim(part, `"`))
 	}
 	return out
+}
+
+func parsePostgresIndexColumns(fields, defs []string) []ir.IndexColumn {
+	cols := make([]ir.IndexColumn, len(fields))
+	for i, field := range fields {
+		cols[i] = ir.IndexColumn{Field: field}
+		if i < len(defs) {
+			cols[i] = parsePostgresIndexColumnDef(field, defs[i])
+		}
+	}
+	return cols
+}
+
+func parsePostgresIndexColumnDef(field, def string) ir.IndexColumn {
+	col := ir.IndexColumn{Field: field}
+	rest := strings.TrimSpace(def)
+	quotedField := `"` + strings.ReplaceAll(field, `"`, `""`) + `"`
+	switch {
+	case strings.HasPrefix(rest, quotedField):
+		rest = strings.TrimSpace(strings.TrimPrefix(rest, quotedField))
+	case strings.HasPrefix(rest, field):
+		rest = strings.TrimSpace(strings.TrimPrefix(rest, field))
+	}
+	tokens := strings.Fields(rest)
+	for i := 0; i < len(tokens); i++ {
+		token := strings.Trim(tokens[i], ",")
+		upper := strings.ToUpper(token)
+		switch upper {
+		case "COLLATE":
+			if i+1 < len(tokens) {
+				col.Collation = normalizePostgresIdentifierPath(tokens[i+1])
+				i++
+			}
+		case "ASC", "DESC":
+			col.Sort = upper
+		case "NULLS":
+			if i+1 < len(tokens) {
+				next := strings.ToUpper(strings.Trim(tokens[i+1], ","))
+				if next == "FIRST" || next == "LAST" {
+					col.Nulls = next
+					i++
+				}
+			}
+		default:
+			if col.OpClass == "" {
+				col.OpClass = token
+			}
+		}
+	}
+	return col
+}
+
+func normalizePostgresIdentifierPath(s string) string {
+	s = strings.Trim(s, ",")
+	parts := strings.Split(s, ".")
+	for i, part := range parts {
+		parts[i] = strings.Trim(part, `"`)
+	}
+	return strings.Join(parts, ".")
 }
 
 func findFieldByColumn(model *ir.Model, column string) *ir.Field {

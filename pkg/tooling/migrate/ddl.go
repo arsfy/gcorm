@@ -151,7 +151,6 @@ func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
 	b.WriteString("\n);")
 
 	for _, idx := range model.Indexes {
-		fields := g.quoteIDs(normalizeFieldNames(model, idx.Fields))
 		name := idx.Name
 		if name == "" {
 			name = fmt.Sprintf("idx_%s_%s", model.TableName(), strings.Join(normalizeFieldNames(model, idx.Fields), "_"))
@@ -160,8 +159,8 @@ func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
 		if idx.IsUnique {
 			unique = "UNIQUE "
 		}
-		b.WriteString(fmt.Sprintf("\nCREATE %sINDEX %s ON %s (%s);",
-			unique, g.quoteID(name), g.quoteID(model.TableName()), strings.Join(fields, ", ")))
+		b.WriteString("\n")
+		b.WriteString(g.createIndexSQL(name, model.TableName(), unique, g.indexColumnsSQL(model, idx), idx.Where))
 	}
 	return b.String()
 }
@@ -249,13 +248,105 @@ func (g DDLGenerator) addIndexSQL(c Change) string {
 	if name == "" {
 		name = fmt.Sprintf("idx_%s_%s", c.Model, c.Details["fields"])
 	}
-	fields := g.quoteIDs(strings.Split(c.Details["fields"], ","))
 	unique := ""
 	if c.Details["unique"] == "true" {
 		unique = "UNIQUE "
 	}
-	return fmt.Sprintf("CREATE %sINDEX %s ON %s (%s);",
-		unique, g.quoteID(name), g.quoteID(c.Model), strings.Join(fields, ", "))
+	return g.createIndexSQL(name, c.Model, unique, g.indexColumnsFromDetails(c.Details), c.Details["where"])
+}
+
+func (g DDLGenerator) createIndexSQL(name, tableName, unique, columns, where string) string {
+	if strings.TrimSpace(where) != "" && g.Dialect == "mysql" {
+		return fmt.Sprintf("-- MySQL: partial indexes are not supported for index %s", name)
+	}
+	sql := fmt.Sprintf("CREATE %sINDEX %s ON %s (%s)",
+		unique, g.quoteID(name), g.quoteID(tableName), columns)
+	if strings.TrimSpace(where) != "" {
+		sql += " WHERE " + strings.TrimSpace(where)
+	}
+	return sql + ";"
+}
+
+func (g DDLGenerator) indexColumnsSQL(model *ir.Model, idx *ir.Index) string {
+	cols := effectiveIndexColumns(idx)
+	parts := make([]string, 0, len(cols))
+	for _, col := range cols {
+		dbField := resolveColumnName(model, col.Field)
+		parts = append(parts, g.indexColumnSQL(ir.IndexColumn{
+			Field:     dbField,
+			Sort:      col.Sort,
+			Nulls:     col.Nulls,
+			OpClass:   col.OpClass,
+			Collation: col.Collation,
+		}))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func (g DDLGenerator) indexColumnsFromDetails(details map[string]string) string {
+	fields := splitDetailList(details["fields"])
+	sorts := splitDetailList(details["sorts"])
+	nulls := splitDetailList(details["nulls"])
+	opclasses := splitDetailList(details["opclasses"])
+	collations := splitDetailList(details["collations"])
+	parts := make([]string, 0, len(fields))
+	for i, field := range fields {
+		parts = append(parts, g.indexColumnSQL(ir.IndexColumn{
+			Field:     field,
+			Sort:      detailAt(sorts, i),
+			Nulls:     detailAt(nulls, i),
+			OpClass:   detailAt(opclasses, i),
+			Collation: detailAt(collations, i),
+		}))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func (g DDLGenerator) indexColumnSQL(col ir.IndexColumn) string {
+	sql := g.quoteID(col.Field)
+	if col.Collation != "" {
+		sql += " COLLATE " + g.collationSQL(col.Collation)
+	}
+	if col.OpClass != "" && g.Dialect == "postgresql" {
+		sql += " " + col.OpClass
+	}
+	if col.Sort != "" {
+		sql += " " + strings.ToUpper(col.Sort)
+	}
+	if col.Nulls != "" && g.Dialect != "mysql" {
+		sql += " NULLS " + strings.ToUpper(col.Nulls)
+	}
+	return sql
+}
+
+func (g DDLGenerator) collationSQL(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if g.Dialect != "postgresql" || strings.Contains(name, `"`) {
+		return name
+	}
+	parts := strings.Split(name, ".")
+	quoted := make([]string, len(parts))
+	for i, part := range parts {
+		quoted[i] = g.quoteID(part)
+	}
+	return strings.Join(quoted, ".")
+}
+
+func splitDetailList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
+}
+
+func detailAt(values []string, idx int) string {
+	if idx < len(values) {
+		return values[idx]
+	}
+	return ""
 }
 
 func (g DDLGenerator) dropIndexSQL(c Change) string {

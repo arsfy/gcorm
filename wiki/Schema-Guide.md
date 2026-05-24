@@ -159,6 +159,48 @@ Common model attributes:
 - `@@map("table_name")`: map model to a database table name.
 - `@@schema("name")`: PostgreSQL schema name.
 
+## Advanced Indexes
+
+`@@index` supports partial indexes and per-column index options:
+
+```gcorm
+model Announcement {
+  id          Int
+  status      Int
+  publishedAt DateTime?
+
+  @@index(
+    [status, publishedAt],
+    name: "idx_announcements_user",
+    where: "status = 1 AND published_at IS NOT NULL",
+    sort: [Desc, Asc],
+    nulls: [Last, Last],
+    opclass: ["int8_ops", "timestamptz_ops"],
+    collate: ["pg_catalog.default", "pg_catalog.default"]
+  )
+}
+```
+
+Index arguments:
+
+- `name`: explicit database index name.
+- `where`: raw SQL predicate for a partial or filtered index.
+- `sort` or `order`: `Asc` or `Desc`, either one value or one value per field.
+- `nulls`: `First` or `Last`, either one value or one value per field.
+- `opclass`, `opclasses`, or `ops`: PostgreSQL operator class names.
+- `collate` or `collation`: collation names, such as `pg_catalog.default`.
+
+Single-column example:
+
+```gcorm
+@@index([clickhouseRecordedAt], name: "idx_ihce_retry", where: "clickhouse_recorded_at IS NULL")
+```
+
+`where` is database SQL, not a GCORM expression. Use database column names in
+the predicate. Partial indexes are supported by PostgreSQL and SQLite. MySQL
+does not support partial indexes, so GCORM will not emit a valid MySQL partial
+index for schemas that use `where`.
+
 ## Relations
 
 One-to-many:
@@ -250,4 +292,3 @@ model User {
   @@map("users")
 }
 ```
-
