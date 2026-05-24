@@ -861,9 +861,7 @@ func (g DDLGenerator) arrayDefaultExpr(d *ir.DefaultValue) string {
 			return "'[]'"
 		}
 		parts := make([]string, len(values))
-		for i, value := range values {
-			parts[i] = value
-		}
+		copy(parts, values)
 		return "'" + "[" + strings.Join(parts, ",") + "]" + "'"
 	}
 }
