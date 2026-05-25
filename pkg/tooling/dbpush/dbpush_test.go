@@ -303,6 +303,89 @@ func TestPostgresDefaultValueNormalizesIdentityAndCasts(t *testing.T) {
 	}
 }
 
+func TestDatabaseScalarTypeMappings(t *testing.T) {
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{name: "postgres uuid", got: postgresScalarType("uuid", "uuid"), want: "UUID"},
+		{name: "postgres float4", got: postgresScalarType("real", "float4"), want: "Float"},
+		{name: "postgres numeric", got: postgresScalarType("numeric", "numeric"), want: "Decimal"},
+		{name: "postgres bool", got: postgresScalarType("boolean", "bool"), want: "Boolean"},
+		{name: "postgres timestamptz", got: postgresScalarType("timestamp with time zone", "timestamptz"), want: "DateTime"},
+		{name: "postgres bytea", got: postgresScalarType("bytea", "bytea"), want: "Bytes"},
+		{name: "postgres jsonb", got: postgresScalarType("jsonb", "jsonb"), want: "Json"},
+		{name: "mysql uuid char", got: mysqlScalarType("char", "char(36)"), want: "UUID"},
+		{name: "mysql tinyint boolean", got: mysqlScalarType("tinyint", "tinyint(1)"), want: "Boolean"},
+		{name: "mysql mediumint", got: mysqlScalarType("mediumint", "mediumint"), want: "Int"},
+		{name: "mysql decimal", got: mysqlScalarType("decimal", "decimal(10,2)"), want: "Decimal"},
+		{name: "mysql blob", got: mysqlScalarType("blob", "blob"), want: "Bytes"},
+		{name: "mysql json", got: mysqlScalarType("json", "json"), want: "Json"},
+		{name: "sqlite real", got: sqliteScalarType("REAL"), want: "Float"},
+		{name: "sqlite numeric", got: sqliteScalarType("NUMERIC"), want: "Decimal"},
+		{name: "sqlite bool", got: sqliteScalarType("BOOLEAN"), want: "Boolean"},
+		{name: "sqlite datetime", got: sqliteScalarType("DATETIME"), want: "DateTime"},
+		{name: "sqlite blob", got: sqliteScalarType("BLOB"), want: "Bytes"},
+		{name: "sqlite json", got: sqliteScalarType("JSON"), want: "Json"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Fatalf("mapping = %q, want %q", tt.got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDatabaseDefaultValueMappings(t *testing.T) {
+	mysqlAuto := mysqlDefaultValue("", "auto_increment")
+	if mysqlAuto == nil || !mysqlAuto.IsFunction || mysqlAuto.FuncName != "autoincrement" {
+		t.Fatalf("mysql auto increment default = %#v", mysqlAuto)
+	}
+
+	mysqlNow := mysqlDefaultValue("CURRENT_TIMESTAMP", "")
+	if mysqlNow == nil || !mysqlNow.IsFunction || mysqlNow.FuncName != "now" {
+		t.Fatalf("mysql timestamp default = %#v", mysqlNow)
+	}
+
+	mysqlBool := mysqlDefaultValue("1", "")
+	if mysqlBool == nil || !mysqlBool.IsBool || mysqlBool.Value != "true" {
+		t.Fatalf("mysql bool default = %#v", mysqlBool)
+	}
+
+	sqliteUUID := sqliteDefaultValue("(lower(hex(randomblob(16))))")
+	if sqliteUUID == nil || !sqliteUUID.IsFunction || sqliteUUID.FuncName != "uuid" {
+		t.Fatalf("sqlite uuid default = %#v", sqliteUUID)
+	}
+
+	sqliteNow := sqliteDefaultValue("CURRENT_TIMESTAMP")
+	if sqliteNow == nil || !sqliteNow.IsFunction || sqliteNow.FuncName != "now" {
+		t.Fatalf("sqlite timestamp default = %#v", sqliteNow)
+	}
+
+	sqliteString := sqliteDefaultValue("'draft'")
+	if sqliteString == nil || !sqliteString.IsString || sqliteString.Value != "draft" {
+		t.Fatalf("sqlite string default = %#v", sqliteString)
+	}
+}
+
+func TestPostgresTextArrayAndIdentifierQuoting(t *testing.T) {
+	if got := parsePostgresTextArray(`{id,"created_at",status}`); strings.Join(got, ",") != "id,created_at,status" {
+		t.Fatalf("parsePostgresTextArray() = %#v", got)
+	}
+	if got := parsePostgresTextArray("{}"); got != nil {
+		t.Fatalf("parsePostgresTextArray(empty) = %#v, want nil", got)
+	}
+	if got := postgresQuoteIdent(`weird"name`); got != `"weird""name"` {
+		t.Fatalf("postgresQuoteIdent() = %q", got)
+	}
+	if got := sqliteQuoteIdent(`weird"name`); got != `"weird""name"` {
+		t.Fatalf("sqliteQuoteIdent() = %q", got)
+	}
+}
+
 func TestParsePostgresIndexColumnDef(t *testing.T) {
 	col := parsePostgresIndexColumnDef("published_at", `"published_at" COLLATE "pg_catalog"."default" timestamptz_ops ASC NULLS LAST`)
 

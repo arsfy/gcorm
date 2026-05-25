@@ -1020,3 +1020,108 @@ func TestDDLDestructiveWarnings(t *testing.T) {
 		t.Errorf("expected at least 2 WARNING comments, got:\n%s", down)
 	}
 }
+
+func TestDDLAlterNullSQLByDialect(t *testing.T) {
+	tests := []struct {
+		name    string
+		dialect string
+		change  Change
+		want    string
+	}{
+		{
+			name:    "postgres set not null",
+			dialect: "postgresql",
+			change:  Change{Type: AlterNull, Model: "users", Field: "email", NewValue: "required"},
+			want:    `ALTER TABLE "users" ALTER COLUMN "email" SET NOT NULL;`,
+		},
+		{
+			name:    "postgres drop not null",
+			dialect: "postgresql",
+			change:  Change{Type: AlterNull, Model: "users", Field: "email", NewValue: "optional"},
+			want:    `ALTER TABLE "users" ALTER COLUMN "email" DROP NOT NULL;`,
+		},
+		{
+			name:    "mysql set null with known type",
+			dialect: "mysql",
+			change:  Change{Type: AlterNull, Model: "users", Field: "age", NewValue: "Int"},
+			want:    "ALTER TABLE `users` MODIFY COLUMN `age` INT NOT NULL;",
+		},
+		{
+			name:    "mysql drop not null with placeholder type",
+			dialect: "mysql",
+			change:  Change{Type: AlterNull, Model: "users", Field: "bio", NewValue: "optional"},
+			want:    "ALTER TABLE `users` MODIFY COLUMN `bio` /* current_type */ NULL;",
+		},
+		{
+			name:    "sqlite unsupported",
+			dialect: "sqlite",
+			change:  Change{Type: AlterNull, Model: "users", Field: "email", NewValue: "optional"},
+			want:    "-- SQLite: nullability change not supported inline for users.email",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DDLGenerator{Dialect: tt.dialect}.alterNullSQL(tt.change)
+			if got != tt.want {
+				t.Fatalf("alterNullSQL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDDLArrayDefaultExprByDialect(t *testing.T) {
+	def := &ir.DefaultValue{IsArray: true, ArrayValue: []string{"1", "two"}}
+
+	tests := []struct {
+		dialect string
+		want    string
+	}{
+		{dialect: "postgresql", want: "ARRAY[1, 'two']"},
+		{dialect: "mysql", want: "(JSON_ARRAY(1, 'two'))"},
+		{dialect: "sqlite", want: "'[1,two]'"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.dialect, func(t *testing.T) {
+			got := DDLGenerator{Dialect: tt.dialect}.arrayDefaultExpr(def)
+			if got != tt.want {
+				t.Fatalf("arrayDefaultExpr() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDDLDefaultFunctionParsingAndFallback(t *testing.T) {
+	name, args, ok := parseDefaultFunction("dbgenerated(nextval('users_id_seq'), 42)")
+	if !ok || name != "dbgenerated" || len(args) != 2 || args[0] != "nextval('users_id_seq')" || args[1] != "42" {
+		t.Fatalf("parseDefaultFunction() = %q, %#v, %v", name, args, ok)
+	}
+
+	if _, _, ok := parseDefaultFunction("not-a-func()"); ok {
+		t.Fatal("parseDefaultFunction() accepted invalid function name")
+	}
+
+	gen := DDLGenerator{Dialect: "unknown"}
+	if got := gen.defaultExpr("custom()"); got != "custom()" {
+		t.Fatalf("defaultExpr(custom()) = %q, want custom()", got)
+	}
+	if got := gen.defaultExpr("hello"); got != "'hello'" {
+		t.Fatalf("defaultExpr(hello) = %q, want quoted string", got)
+	}
+	if got := gen.defaultExpr("-12.5"); got != "-12.5" {
+		t.Fatalf("defaultExpr(-12.5) = %q, want numeric literal", got)
+	}
+}
+
+func TestDDLUnsupportedChangeComments(t *testing.T) {
+	change := Change{Type: ChangeType("RenameTable"), Model: "users"}
+	gen := DDLGenerator{Dialect: "postgresql"}
+
+	if got := gen.changeToUp(change, &Changeset{}); got != "-- unsupported change type: RenameTable" {
+		t.Fatalf("changeToUp() = %q", got)
+	}
+	if got := gen.changeToDown(change, &Changeset{}); got != "-- unsupported reverse for change type: RenameTable" {
+		t.Fatalf("changeToDown() = %q", got)
+	}
+}
