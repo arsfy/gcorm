@@ -1095,6 +1095,11 @@ ORDER BY name`)
 
 func loadSQLiteColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
 	for tableName, model := range models {
+		autoIncrementColumns, err := loadSQLiteAutoIncrementColumns(ctx, db, tableName)
+		if err != nil {
+			return err
+		}
+
 		rows, err := db.QueryContext(ctx, `SELECT cid, name, type, "notnull", dflt_value, pk FROM pragma_table_info(?)`, tableName)
 		if err != nil {
 			return err
@@ -1108,6 +1113,10 @@ func loadSQLiteColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Mo
 				_ = rows.Close()
 				return err
 			}
+			def := sqliteDefaultValue(defaultValue.String)
+			if pk > 0 && autoIncrementColumns[columnName] {
+				def = &ir.DefaultValue{IsFunction: true, FuncName: "autoincrement"}
+			}
 			field := &ir.Field{
 				Name:       columnName,
 				DBName:     columnName,
@@ -1115,7 +1124,7 @@ func loadSQLiteColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Mo
 				ScalarType: sqliteScalarType(dataType),
 				IsOptional: notNull == 0 && pk == 0,
 				IsID:       pk > 0,
-				Default:    sqliteDefaultValue(defaultValue.String),
+				Default:    def,
 			}
 			model.Fields = append(model.Fields, field)
 			if pk > 0 {
@@ -1137,6 +1146,117 @@ func loadSQLiteColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Mo
 		}
 	}
 	return nil
+}
+
+func loadSQLiteAutoIncrementColumns(ctx context.Context, db *sql.DB, tableName string) (map[string]bool, error) {
+	var createSQL sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, tableName).Scan(&createSQL); err != nil {
+		return nil, err
+	}
+	return sqliteAutoIncrementColumns(createSQL.String), nil
+}
+
+func sqliteAutoIncrementColumns(createSQL string) map[string]bool {
+	columns := map[string]bool{}
+	open := strings.Index(createSQL, "(")
+	close := strings.LastIndex(createSQL, ")")
+	if open < 0 || close <= open {
+		return columns
+	}
+
+	for _, def := range splitSQLiteColumnDefs(createSQL[open+1 : close]) {
+		name, rest := parseSQLiteColumnDef(def)
+		if name == "" {
+			continue
+		}
+		upperRest := strings.ToUpper(rest)
+		if strings.Contains(upperRest, "PRIMARY KEY") && strings.Contains(upperRest, "AUTOINCREMENT") {
+			columns[name] = true
+		}
+	}
+	return columns
+}
+
+func splitSQLiteColumnDefs(body string) []string {
+	var defs []string
+	start := 0
+	depth := 0
+	var quote rune
+	for i, r := range body {
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"', '`':
+			quote = r
+		case '[':
+			quote = ']'
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				defs = append(defs, body[start:i])
+				start = i + 1
+			}
+		}
+	}
+	defs = append(defs, body[start:])
+	return defs
+}
+
+func parseSQLiteColumnDef(def string) (string, string) {
+	def = strings.TrimSpace(def)
+	if def == "" {
+		return "", ""
+	}
+	upper := strings.ToUpper(def)
+	for _, prefix := range []string{"CONSTRAINT ", "PRIMARY ", "FOREIGN ", "UNIQUE ", "CHECK "} {
+		if strings.HasPrefix(upper, prefix) {
+			return "", ""
+		}
+	}
+
+	switch def[0] {
+	case '"', '`':
+		name, rest := readDelimitedSQLiteIdentifier(def, def[0], def[0])
+		return name, rest
+	case '[':
+		name, rest := readDelimitedSQLiteIdentifier(def, '[', ']')
+		return name, rest
+	default:
+		for i, r := range def {
+			if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+				return def[:i], def[i:]
+			}
+		}
+		return def, ""
+	}
+}
+
+func readDelimitedSQLiteIdentifier(def string, open, close byte) (string, string) {
+	if len(def) == 0 || def[0] != open {
+		return "", def
+	}
+	var b strings.Builder
+	for i := 1; i < len(def); i++ {
+		if def[i] == close {
+			if close == '"' && i+1 < len(def) && def[i+1] == '"' {
+				b.WriteByte('"')
+				i++
+				continue
+			}
+			return b.String(), def[i+1:]
+		}
+		b.WriteByte(def[i])
+	}
+	return "", def
 }
 
 func loadSQLiteIndexes(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {

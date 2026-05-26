@@ -516,6 +516,29 @@ func TestDDLGenerateUp_PostgreSQLAutoIncrementIsColumnClause(t *testing.T) {
 	}
 }
 
+func TestDDLGenerateUp_SQLiteAutoIncrementPrimaryKeyIsInline(t *testing.T) {
+	table := testModel("provider",
+		testFieldWithDefault("id", "Int", &ir.DefaultValue{IsFunction: true, FuncName: "autoincrement"}),
+		testField("provider", "String"),
+	)
+	cs := &Changeset{
+		Changes: []Change{{Type: CreateTable, Model: "provider", Rollback: SafeRollback}},
+		New:     testSchema(table),
+	}
+
+	sql := DDLGenerator{Dialect: "sqlite", Schema: cs.New}.GenerateUp(cs)
+
+	if !strings.Contains(sql, `"id" INTEGER PRIMARY KEY AUTOINCREMENT`) {
+		t.Fatalf("expected SQLite autoincrement primary key to be inline, got:\n%s", sql)
+	}
+	if strings.Contains(sql, `"id" INTEGER AUTOINCREMENT`) {
+		t.Fatalf("unexpected standalone AUTOINCREMENT clause:\n%s", sql)
+	}
+	if strings.Contains(sql, `PRIMARY KEY ("id")`) {
+		t.Fatalf("unexpected duplicate table-level primary key:\n%s", sql)
+	}
+}
+
 func TestDDLAlterDefaultPostgreSQLAutoIncrementUsesIdentity(t *testing.T) {
 	change := Change{
 		Type:     AlterDefault,

@@ -584,6 +584,54 @@ model Post {
 	}
 }
 
+func TestRunSQLiteDBPushCreatesAutoIncrementPrimaryKey(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dev.db")
+	schemaPath := filepath.Join(dir, "schema.gcorm")
+	schema := `datasource db {
+  provider = "sqlite"
+  url      = "file:` + filepath.ToSlash(dbPath) + `"
+}
+
+generator client {
+  provider = "gco-go"
+  output   = "./gen"
+}
+
+model Provider {
+  id        Int    @id @default(autoincrement())
+  provider  String
+  name      String
+  data      String
+}
+`
+	if err := os.WriteFile(schemaPath, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Run([]string{"--schema", schemaPath}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var createSQL string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'Provider'`).Scan(&createSQL); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(createSQL, `"id" INTEGER PRIMARY KEY AUTOINCREMENT`) {
+		t.Fatalf("create SQL missing inline autoincrement primary key:\n%s", createSQL)
+	}
+
+	if err := Run([]string{"--schema", schemaPath}); err != nil {
+		t.Fatalf("second Run() error = %v", err)
+	}
+}
+
 func findTestModel(schema *ir.Schema, name string) *ir.Model {
 	for _, model := range schema.Models {
 		if model.TableName() == name {

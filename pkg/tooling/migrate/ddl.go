@@ -106,10 +106,11 @@ func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
 
 	var cols []string
 	for _, f := range model.ScalarFields() {
-		cols = append(cols, "  "+g.columnDef(f))
+		cols = append(cols, "  "+g.columnDefForTable(model, f))
 	}
 
-	if model.PrimaryKey != nil && len(model.PrimaryKey.Fields) > 0 {
+	inlinePKColumn := g.sqliteInlineAutoIncrementPrimaryKeyColumn(model)
+	if model.PrimaryKey != nil && len(model.PrimaryKey.Fields) > 0 && inlinePKColumn == "" {
 		quoted := g.quoteIDs(normalizeFieldNames(model, model.PrimaryKey.Fields))
 		cols = append(cols, fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(quoted, ", ")))
 	}
@@ -776,7 +777,15 @@ func (g DDLGenerator) sqlTypeSignature(typeName string) string {
 // ---------------------------------------------------------------------------
 
 func (g DDLGenerator) columnDef(f *ir.Field) string {
+	return g.columnDefForTable(nil, f)
+}
+
+func (g DDLGenerator) columnDefForTable(model *ir.Model, f *ir.Field) string {
 	name := columnName(f)
+	if g.sqliteInlineAutoIncrementPrimaryKeyColumn(model) == name {
+		return strings.Join([]string{g.quoteID(name), "INTEGER", "PRIMARY KEY", "AUTOINCREMENT"}, " ")
+	}
+
 	var parts []string
 	parts = append(parts, g.quoteID(name))
 	parts = append(parts, g.columnSQLType(f))
@@ -798,6 +807,20 @@ func (g DDLGenerator) columnDef(f *ir.Field) string {
 	}
 
 	return strings.Join(parts, " ")
+}
+
+func (g DDLGenerator) sqliteInlineAutoIncrementPrimaryKeyColumn(model *ir.Model) string {
+	if g.Dialect != "sqlite" || model == nil || model.PrimaryKey == nil || len(model.PrimaryKey.Fields) != 1 {
+		return ""
+	}
+
+	pkColumn := normalizeFieldNames(model, model.PrimaryKey.Fields)[0]
+	for _, f := range model.ScalarFields() {
+		if columnName(f) == pkColumn && g.isAutoIncrementField(f) {
+			return pkColumn
+		}
+	}
+	return ""
 }
 
 func (g DDLGenerator) isAutoIncrementField(f *ir.Field) bool {
