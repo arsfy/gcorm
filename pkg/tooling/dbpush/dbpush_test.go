@@ -301,6 +301,16 @@ func TestPostgresDefaultValueNormalizesIdentityAndCasts(t *testing.T) {
 	if array == nil || !array.IsArray || len(array.ArrayValue) != 0 {
 		t.Fatalf("array default = %#v, want empty array", array)
 	}
+
+	textArray := postgresDefaultValue("'{openid,email,profile}'::text[]", false)
+	if textArray == nil || !textArray.IsArray || strings.Join(textArray.ArrayValue, ",") != "openid,email,profile" {
+		t.Fatalf("text array default = %#v, want openid,email,profile", textArray)
+	}
+
+	arrayExpr := postgresDefaultValue("ARRAY['openid'::text, 'email'::text, 'profile'::text]", false)
+	if arrayExpr == nil || !arrayExpr.IsArray || strings.Join(arrayExpr.ArrayValue, ",") != "openid,email,profile" {
+		t.Fatalf("ARRAY default = %#v, want openid,email,profile", arrayExpr)
+	}
 }
 
 func TestDatabaseScalarTypeMappings(t *testing.T) {

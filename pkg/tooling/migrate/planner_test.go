@@ -574,6 +574,40 @@ func TestDDLAlterDefaultUsesDialectMapping(t *testing.T) {
 	}
 }
 
+func TestDDLAlterDefaultPostgreSQLArrayUsesStructuredDefault(t *testing.T) {
+	oldModel := testModel("OIDCProvider",
+		testField("id", "String"),
+	)
+	oldModel.DBName = "oidc_providers"
+	scopes := testField("scopes", "String")
+	scopes.IsList = true
+	scopes.Default = &ir.DefaultValue{IsArray: true, ArrayValue: []string{"openid", "email", "profile"}}
+	newModel := testModel("OIDCProvider",
+		testField("id", "String"),
+		scopes,
+	)
+	newModel.DBName = "oidc_providers"
+	cs := &Changeset{
+		Changes: []Change{{
+			Type:     AlterDefault,
+			Model:    "oidc_providers",
+			Field:    "scopes",
+			NewValue: "[openid,email,profile]",
+		}},
+		Old: testSchema(oldModel),
+		New: testSchema(newModel),
+	}
+
+	sql := DDLGenerator{Dialect: "postgresql", Schema: cs.New}.GenerateUp(cs)
+
+	if !strings.Contains(sql, `ALTER TABLE "oidc_providers" ALTER COLUMN "scopes" SET DEFAULT ARRAY['openid', 'email', 'profile'];`) {
+		t.Fatalf("expected PostgreSQL array default mapping, got:\n%s", sql)
+	}
+	if strings.Contains(sql, `"'[openid,email,profile]'"`) || strings.Contains(sql, `'[openid,email,profile]'`) {
+		t.Fatalf("unexpected string literal array default:\n%s", sql)
+	}
+}
+
 func TestDiffAddsForeignKeysForNewTables(t *testing.T) {
 	user := testModel("User", testField("id", "String"))
 	user.DBName = "users"

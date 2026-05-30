@@ -247,9 +247,9 @@ func (g DDLGenerator) alterDefaultSQL(c Change) string {
 
 	switch g.Dialect {
 	case "postgresql":
-		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;", tbl, col, g.defaultExpr(c.NewValue))
+		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;", tbl, col, g.defaultExprForChange(c))
 	case "mysql":
-		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;", tbl, col, g.defaultExpr(c.NewValue))
+		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;", tbl, col, g.defaultExprForChange(c))
 	default:
 		return fmt.Sprintf("-- SQLite: SET DEFAULT not supported inline for %s.%s", c.Model, c.Field)
 	}
@@ -860,6 +860,13 @@ func (g DDLGenerator) defaultExprForField(f *ir.Field) string {
 		return g.arrayDefaultExpr(f.Default)
 	}
 	return g.defaultExpr(formatDefault(f.Default))
+}
+
+func (g DDLGenerator) defaultExprForChange(c Change) string {
+	if f := findField(g.Schema, c.Model, c.Field); f != nil && f.Default != nil {
+		return g.defaultExprForField(f)
+	}
+	return g.defaultExpr(c.NewValue)
 }
 
 func (g DDLGenerator) arrayDefaultExpr(d *ir.DefaultValue) string {

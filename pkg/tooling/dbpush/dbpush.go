@@ -1496,12 +1496,66 @@ func postgresDefaultValue(def string, isIdentity bool) *ir.DefaultValue {
 		return &ir.DefaultValue{IsFunction: true, FuncName: "now"}
 	case strings.HasPrefix(lower, "'{}'::"):
 		return &ir.DefaultValue{IsArray: true}
+	case strings.HasPrefix(lower, "'{") && strings.Contains(lower, "}'::") && strings.HasSuffix(lower, "[]"):
+		return &ir.DefaultValue{IsArray: true, ArrayValue: parsePostgresTextArray(strings.Trim(def[:strings.Index(def, "::")], "'"))}
 	case strings.HasPrefix(lower, "array["):
-		return &ir.DefaultValue{Value: strings.TrimSpace(def), IsString: true}
+		return &ir.DefaultValue{IsArray: true, ArrayValue: parsePostgresArrayDefault(def)}
 	default:
 		value := normalizePostgresLiteralDefault(def)
 		return &ir.DefaultValue{Value: value, IsString: !isNumericLiteral(value) && value != "true" && value != "false", IsNumber: isNumericLiteral(value), IsBool: value == "true" || value == "false"}
 	}
+}
+
+func parsePostgresArrayDefault(def string) []string {
+	def = strings.TrimSpace(def)
+	lower := strings.ToLower(def)
+	if !strings.HasPrefix(lower, "array[") {
+		return nil
+	}
+	closeIdx := strings.LastIndex(def, "]")
+	if closeIdx < len("array[") {
+		return nil
+	}
+	body := def[len("array["):closeIdx]
+	parts := splitPostgresArrayDefaultElements(body)
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		value := normalizePostgresLiteralDefault(strings.TrimSpace(part))
+		values = append(values, value)
+	}
+	return values
+}
+
+func splitPostgresArrayDefaultElements(body string) []string {
+	var parts []string
+	start := 0
+	depth := 0
+	var quote rune
+	for i, r := range body {
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch r {
+		case '\'':
+			quote = r
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				parts = append(parts, body[start:i])
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, body[start:])
+	return parts
 }
 
 func normalizePostgresLiteralDefault(def string) string {
