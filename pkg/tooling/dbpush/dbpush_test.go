@@ -369,6 +369,16 @@ func TestDatabaseDefaultValueMappings(t *testing.T) {
 	if sqliteString == nil || !sqliteString.IsString || sqliteString.Value != "draft" {
 		t.Fatalf("sqlite string default = %#v", sqliteString)
 	}
+
+	sqliteSmallIntZero := sqliteDefaultValueForScalar("(0)", "SmallInt")
+	if sqliteSmallIntZero == nil || !sqliteSmallIntZero.IsNumber || sqliteSmallIntZero.Value != "0" {
+		t.Fatalf("sqlite smallint zero default = %#v, want numeric 0", sqliteSmallIntZero)
+	}
+
+	sqliteBoolFalse := sqliteDefaultValueForScalar("(0)", "Boolean")
+	if sqliteBoolFalse == nil || !sqliteBoolFalse.IsBool || sqliteBoolFalse.Value != "false" {
+		t.Fatalf("sqlite bool false default = %#v", sqliteBoolFalse)
+	}
 }
 
 func TestPostgresTextArrayAndIdentifierQuoting(t *testing.T) {
@@ -599,10 +609,23 @@ generator client {
 }
 
 model Provider {
-  id        Int    @id @default(autoincrement())
+  id        Int      @id @default(autoincrement())
   provider  String
   name      String
-  data      String
+  status    SmallInt @default(0)
+  data      Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Usage {
+  id            Int      @id @default(autoincrement())
+  weeklyUsage   BigInt
+  windowUsage   Decimal
+  weeklyResetAt DateTime
+  windowResetAt DateTime
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 }
 `
 	if err := os.WriteFile(schemaPath, []byte(schema), 0o644); err != nil {
@@ -629,6 +652,50 @@ model Provider {
 
 	if err := Run([]string{"--schema", schemaPath}); err != nil {
 		t.Fatalf("second Run() error = %v", err)
+	}
+}
+
+func TestRunSQLiteDBPushBooleanStorageCanBecomeSmallIntDefaultZero(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dev.db")
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE "Provider" (
+  "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+  "status" INTEGER NOT NULL DEFAULT 0
+)`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	schemaPath := filepath.Join(dir, "schema.gcorm")
+	schema := `datasource db {
+  provider = "sqlite"
+  url      = "file:` + filepath.ToSlash(dbPath) + `"
+}
+
+generator client {
+  provider = "gco-go"
+  output   = "./gen"
+}
+
+model Provider {
+  id     Int      @id @default(autoincrement())
+  status SmallInt @default(0)
+}
+`
+	if err := os.WriteFile(schemaPath, []byte(schema), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Run([]string{"--schema", schemaPath}); err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
 }
 

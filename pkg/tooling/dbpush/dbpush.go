@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -483,7 +484,7 @@ func introspectDatabase(ctx context.Context, db *sql.DB, provider string, target
 	case "mysql":
 		return introspectMySQL(ctx, db)
 	case "sqlite":
-		return introspectSQLite(ctx, db)
+		return introspectSQLiteWithTarget(ctx, db, targetSchema)
 	default:
 		return nil, fmt.Errorf("unsupported provider %q", provider)
 	}
@@ -517,13 +518,17 @@ func introspectMySQL(ctx context.Context, db *sql.DB) (*ir.Schema, error) {
 }
 
 func introspectSQLite(ctx context.Context, db *sql.DB) (*ir.Schema, error) {
+	return introspectSQLiteWithTarget(ctx, db, nil)
+}
+
+func introspectSQLiteWithTarget(ctx context.Context, db *sql.DB, targetSchema *ir.Schema) (*ir.Schema, error) {
 	schema := &ir.Schema{Datasource: &ir.Datasource{Provider: "sqlite"}}
 
 	models, err := loadSQLiteTables(ctx, db)
 	if err != nil {
 		return nil, err
 	}
-	if err := loadSQLiteColumns(ctx, db, models); err != nil {
+	if err := loadSQLiteColumns(ctx, db, models, targetSchema); err != nil {
 		return nil, err
 	}
 	if err := loadSQLiteIndexes(ctx, db, models); err != nil {
@@ -1093,12 +1098,13 @@ ORDER BY name`)
 	return models, rows.Err()
 }
 
-func loadSQLiteColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+func loadSQLiteColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Model, targetSchema *ir.Schema) error {
 	for tableName, model := range models {
 		autoIncrementColumns, err := loadSQLiteAutoIncrementColumns(ctx, db, tableName)
 		if err != nil {
 			return err
 		}
+		targetModel := findSQLiteTargetModel(targetSchema, tableName)
 
 		rows, err := db.QueryContext(ctx, `SELECT cid, name, type, "notnull", dflt_value, pk FROM pragma_table_info(?)`, tableName)
 		if err != nil {
@@ -1113,7 +1119,9 @@ func loadSQLiteColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Mo
 				_ = rows.Close()
 				return err
 			}
-			def := sqliteDefaultValue(defaultValue.String)
+			targetField := findSQLiteTargetField(targetModel, columnName)
+			scalarType := sqliteScalarTypeForTarget(dataType, targetField)
+			def := sqliteDefaultValueForScalar(defaultValue.String, scalarType)
 			if pk > 0 && autoIncrementColumns[columnName] {
 				def = &ir.DefaultValue{IsFunction: true, FuncName: "autoincrement"}
 			}
@@ -1121,7 +1129,8 @@ func loadSQLiteColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Mo
 				Name:       columnName,
 				DBName:     columnName,
 				Type:       ir.FieldKindScalar,
-				ScalarType: sqliteScalarType(dataType),
+				ScalarType: scalarType,
+				IsList:     targetField != nil && targetField.IsList && sqliteTypeCompatibleWithTarget(dataType, targetField),
 				IsOptional: notNull == 0 && pk == 0,
 				IsID:       pk > 0,
 				Default:    def,
@@ -1257,6 +1266,51 @@ func readDelimitedSQLiteIdentifier(def string, open, close byte) (string, string
 		b.WriteByte(def[i])
 	}
 	return "", def
+}
+
+func findSQLiteTargetModel(schema *ir.Schema, tableName string) *ir.Model {
+	if schema == nil {
+		return nil
+	}
+	for _, model := range schema.Models {
+		if model.TableName() == tableName {
+			return model
+		}
+	}
+	return nil
+}
+
+func findSQLiteTargetField(model *ir.Model, columnName string) *ir.Field {
+	if model == nil {
+		return nil
+	}
+	for _, field := range model.Fields {
+		if field.Type == ir.FieldKindRelation {
+			continue
+		}
+		if sqliteFieldColumnName(field) == columnName {
+			return field
+		}
+	}
+	return nil
+}
+
+func sqliteFieldColumnName(field *ir.Field) string {
+	if field.DBName != "" {
+		return field.DBName
+	}
+	return sqliteToSnakeCase(field.Name)
+}
+
+func sqliteToSnakeCase(s string) string {
+	var result []rune
+	for i, r := range s {
+		if unicode.IsUpper(r) && i > 0 {
+			result = append(result, '_')
+		}
+		result = append(result, unicode.ToLower(r))
+	}
+	return string(result)
 }
 
 func loadSQLiteIndexes(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
@@ -1539,11 +1593,55 @@ func sqliteScalarType(dataType string) string {
 	}
 }
 
+func sqliteScalarTypeForTarget(dataType string, targetField *ir.Field) string {
+	if targetField != nil && sqliteTypeCompatibleWithTarget(dataType, targetField) {
+		return targetField.ScalarType
+	}
+	return sqliteScalarType(dataType)
+}
+
+func sqliteTypeCompatibleWithTarget(dataType string, targetField *ir.Field) bool {
+	if targetField == nil {
+		return false
+	}
+	upperType := strings.ToUpper(strings.TrimSpace(dataType))
+	if targetField.IsList {
+		return strings.Contains(upperType, "TEXT")
+	}
+
+	switch targetField.ScalarType {
+	case "String", "Decimal", "DateTime", "Json", "UUID":
+		return strings.Contains(upperType, "TEXT") ||
+			strings.Contains(upperType, "CHAR") ||
+			strings.Contains(upperType, "CLOB") ||
+			strings.Contains(upperType, "DECIMAL") ||
+			strings.Contains(upperType, "NUMERIC") ||
+			strings.Contains(upperType, "DATE") ||
+			strings.Contains(upperType, "TIME") ||
+			strings.Contains(upperType, "JSON")
+	case "Int", "SmallInt", "BigInt", "Boolean":
+		return strings.Contains(upperType, "INT") || strings.Contains(upperType, "BOOL")
+	case "Float":
+		return strings.Contains(upperType, "REAL") ||
+			strings.Contains(upperType, "DOUBLE") ||
+			strings.Contains(upperType, "FLOAT")
+	case "Bytes":
+		return strings.Contains(upperType, "BLOB") || strings.Contains(upperType, "BINARY")
+	default:
+		return false
+	}
+}
+
 func sqliteDefaultValue(def string) *ir.DefaultValue {
+	return sqliteDefaultValueForScalar(def, "")
+}
+
+func sqliteDefaultValueForScalar(def, scalarType string) *ir.DefaultValue {
 	def = strings.TrimSpace(def)
 	if def == "" {
 		return nil
 	}
+	def = trimDefaultParens(def)
 	lower := strings.ToLower(def)
 	switch {
 	case strings.Contains(lower, "randomblob"):
@@ -1551,8 +1649,59 @@ func sqliteDefaultValue(def string) *ir.DefaultValue {
 	case strings.Contains(lower, "datetime('now')"), strings.Contains(lower, "current_timestamp"):
 		return &ir.DefaultValue{IsFunction: true, FuncName: "now"}
 	default:
+		if scalarType != "Boolean" {
+			if value := numericLiteralDefaultValue(def); value != nil {
+				return value
+			}
+		}
 		return literalDefaultValue(def)
 	}
+}
+
+func trimDefaultParens(def string) string {
+	for hasWrappingDefaultParens(def) {
+		def = strings.TrimSpace(def[1 : len(def)-1])
+	}
+	return def
+}
+
+func hasWrappingDefaultParens(s string) bool {
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return false
+	}
+	depth := 0
+	var quote rune
+	for i, r := range s {
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"', '`':
+			quote = r
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && i != len(s)-1 {
+				return false
+			}
+		}
+		if depth < 0 {
+			return false
+		}
+	}
+	return depth == 0
+}
+
+func numericLiteralDefaultValue(def string) *ir.DefaultValue {
+	unquoted := strings.Trim(def, "'\"")
+	if isNumericLiteral(unquoted) {
+		return &ir.DefaultValue{Value: unquoted, IsNumber: true}
+	}
+	return nil
 }
 
 func literalDefaultValue(def string) *ir.DefaultValue {
