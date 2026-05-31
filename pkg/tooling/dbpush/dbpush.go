@@ -15,10 +15,6 @@ import (
 	"strings"
 	"unicode"
 
-	_ "github.com/go-sql-driver/mysql"
-	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "modernc.org/sqlite"
-
 	"github.com/arsfy/gcorm/pkg/schema/ir"
 	"github.com/arsfy/gcorm/pkg/tooling/internal/buildinfo"
 	"github.com/arsfy/gcorm/pkg/tooling/internal/schemautil"

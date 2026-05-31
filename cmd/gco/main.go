@@ -17,6 +17,10 @@ import (
 	"github.com/arsfy/gcorm/pkg/tooling/initcmd"
 	"github.com/arsfy/gcorm/pkg/tooling/introspect"
 	"github.com/arsfy/gcorm/pkg/tooling/migrate"
+
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "modernc.org/sqlite"
 )
 
 var Version = "dev"

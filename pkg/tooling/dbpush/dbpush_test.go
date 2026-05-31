@@ -12,6 +12,8 @@ import (
 
 	"github.com/arsfy/gcorm/pkg/schema/ir"
 	"github.com/arsfy/gcorm/pkg/tooling/migrate"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestResolveURLUsesSchemaDatasourceURL(t *testing.T) {
