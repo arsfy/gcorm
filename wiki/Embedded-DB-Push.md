@@ -106,14 +106,14 @@ On every run, `dbpush.Push`:
 5. Refuses destructive or review-required changes unless
    `AllowDestructive` is true.
 6. Executes supported SQL in a transaction.
-7. Records a row in `gco_schema_pushes` after a successful non-noop push.
+7. Records a row in `__gco_schema_pushes` after a successful non-noop push.
 
 If the live database already matches the embedded schema, the result has
 `Noop=true` and no SQL is executed.
 
 ## Metadata Table
 
-Successful non-noop pushes create and write to `gco_schema_pushes`. The table
+Successful non-noop pushes create and write to `__gco_schema_pushes`. The table
 stores:
 
 - Schema hash.
@@ -123,8 +123,8 @@ stores:
 - Applied time.
 - GCORM tool version.
 
-GCORM ignores `gco_schema_pushes` and `gco_migrations` during introspection, so
-metadata tables do not appear as drift from the `.gcorm` schema.
+GCORM ignores `__gco_schema_pushes` and `__gco_migrations` during introspection,
+so metadata tables do not appear as drift from the `.gcorm` schema.
 
 The metadata table is for audit and visibility. Live database introspection is
 still the source of truth for deciding what SQL to apply.
@@ -142,7 +142,7 @@ result, err := dbpush.Push(ctx, db, dbpush.Options{
 })
 ```
 
-`DryRun` does not create user tables and does not write `gco_schema_pushes`.
+`DryRun` does not create user tables and does not write `__gco_schema_pushes`.
 
 ## Production Guidance
 

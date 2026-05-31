@@ -24,7 +24,10 @@ import (
 	"github.com/arsfy/gcorm/pkg/tooling/migrate"
 )
 
-const schemaPushesTable = "gco_schema_pushes"
+const (
+	schemaPushesTable = "__gco_schema_pushes"
+	migrationsTable   = "__gco_migrations"
+)
 
 type sqlRunner interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
@@ -163,6 +166,9 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 	if !isSupportedProvider(provider) {
 		return nil, fmt.Errorf("db push supports postgresql, mysql, and sqlite; got %q", provider)
 	}
+	if err := validateNoInternalTableConflict(targetSchema); err != nil {
+		return nil, err
+	}
 	if provider == "mysql" {
 		return pushCompiledMySQL(ctx, db, targetSchema, schemaHash, dsn, opts)
 	}
@@ -215,19 +221,12 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 		}
 	}
 
-	if provider == "postgresql" {
-		schemaName := resolveSchemaName(targetSchema, dsn)
-		if _, err := tx.ExecContext(ctx, "SET LOCAL search_path TO "+postgresQuoteIdent(schemaName)); err != nil {
-			return nil, fmt.Errorf("set search_path to %q: %w", schemaName, err)
-		}
-	}
-
 	if err := ensureSchemaPushesTable(ctx, tx, provider); err != nil {
 		return nil, err
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return nil, fmt.Errorf("execute SQL %q: %w", stmt, err)
+			return nil, fmt.Errorf("execute SQL %s: %w", statementSummary(stmt), err)
 		}
 	}
 	if err := insertSchemaPushRecord(ctx, tx, provider, schemaHash, len(targetSchema.Models), len(cs.Changes)); err != nil {
@@ -301,7 +300,7 @@ func pushCompiledMySQL(ctx context.Context, db *sql.DB, targetSchema *ir.Schema,
 	}
 	for _, stmt := range stmts {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
-			return nil, fmt.Errorf("execute SQL %q: %w", stmt, err)
+			return nil, fmt.Errorf("execute SQL %s: %w", statementSummary(stmt), err)
 		}
 	}
 	if err := insertSchemaPushRecord(ctx, conn, "mysql", schemaHash, len(targetSchema.Models), len(cs.Changes)); err != nil {
@@ -532,6 +531,27 @@ func riskyChanges(cs *migrate.Changeset) []string {
 	return out
 }
 
+func statementSummary(stmt string) string {
+	stmt = strings.TrimSpace(stmt)
+	if stmt == "" {
+		return "<empty statement>"
+	}
+	fields := strings.Fields(stmt)
+	if len(fields) == 0 {
+		return "<empty statement>"
+	}
+
+	limit := 4
+	if len(fields) < limit {
+		limit = len(fields)
+	}
+	summary := strings.Join(fields[:limit], " ")
+	if len(summary) > 120 {
+		summary = summary[:120] + "..."
+	}
+	return summary
+}
+
 func splitStatements(sqlText string) ([]string, []string) {
 	parts := splitSQLStatements(sqlText)
 	stmts := make([]string, 0, len(parts))
@@ -727,17 +747,17 @@ func ensureSchemaPushesTable(ctx context.Context, runner sqlRunner, provider str
 func createSchemaPushesTableSQL(provider string) string {
 	switch provider {
 	case "mysql":
-		return `CREATE TABLE IF NOT EXISTS gco_schema_pushes (
+		return `CREATE TABLE IF NOT EXISTS __gco_schema_pushes (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 	schema_hash VARCHAR(64) NOT NULL,
 	provider VARCHAR(32) NOT NULL,
 	model_count BIGINT NOT NULL,
 	change_count BIGINT NOT NULL,
 	applied_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-	tool_version VARCHAR(50) NOT NULL
+	tool_version VARCHAR(255) NOT NULL
 )`
 	case "sqlite":
-		return `CREATE TABLE IF NOT EXISTS gco_schema_pushes (
+		return `CREATE TABLE IF NOT EXISTS __gco_schema_pushes (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	schema_hash TEXT NOT NULL,
 	provider TEXT NOT NULL,
@@ -747,7 +767,7 @@ func createSchemaPushesTableSQL(provider string) string {
 	tool_version TEXT NOT NULL
 )`
 	default:
-		return `CREATE TABLE IF NOT EXISTS gco_schema_pushes (
+		return `CREATE TABLE IF NOT EXISTS __gco_schema_pushes (
 	id BIGSERIAL PRIMARY KEY,
 	schema_hash TEXT NOT NULL,
 	provider TEXT NOT NULL,
@@ -760,10 +780,10 @@ func createSchemaPushesTableSQL(provider string) string {
 }
 
 func insertSchemaPushRecord(ctx context.Context, runner sqlRunner, provider, schemaHash string, modelCount, changeCount int) error {
-	stmt := `INSERT INTO gco_schema_pushes (schema_hash, provider, model_count, change_count, tool_version) VALUES (?, ?, ?, ?, ?)`
+	stmt := `INSERT INTO __gco_schema_pushes (schema_hash, provider, model_count, change_count, tool_version) VALUES (?, ?, ?, ?, ?)`
 	args := []any{schemaHash, provider, modelCount, changeCount, buildinfo.Version()}
 	if provider == "postgresql" {
-		stmt = `INSERT INTO gco_schema_pushes (schema_hash, provider, model_count, change_count, tool_version) VALUES ($1, $2, $3, $4, $5)`
+		stmt = `INSERT INTO __gco_schema_pushes (schema_hash, provider, model_count, change_count, tool_version) VALUES ($1, $2, $3, $4, $5)`
 	}
 	if _, err := runner.ExecContext(ctx, stmt, args...); err != nil {
 		return fmt.Errorf("record db push metadata: %w", err)
@@ -773,11 +793,23 @@ func insertSchemaPushRecord(ctx context.Context, runner sqlRunner, provider, sch
 
 func isInternalTable(tableName string) bool {
 	switch tableName {
-	case schemaPushesTable, "gco_migrations":
+	case schemaPushesTable, migrationsTable:
 		return true
 	default:
 		return false
 	}
+}
+
+func validateNoInternalTableConflict(schema *ir.Schema) error {
+	if schema == nil {
+		return nil
+	}
+	for _, model := range schema.Models {
+		if isInternalTable(model.TableName()) {
+			return fmt.Errorf("db push: model %s maps to reserved GCORM internal table %q", model.Name, model.TableName())
+		}
+	}
+	return nil
 }
 
 func introspectPostgres(ctx context.Context, db sqlRunner, schemaName string) (*ir.Schema, error) {
@@ -2152,10 +2184,6 @@ func isNumericLiteral(s string) bool {
 }
 
 func sqliteQuoteIdent(name string) string {
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
-}
-
-func postgresQuoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 

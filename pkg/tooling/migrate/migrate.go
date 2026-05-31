@@ -449,7 +449,7 @@ func checksumString(s string) string {
 func CreateMigrationsTable(dialect string) string {
 	switch dialect {
 	case "postgresql":
-		return `CREATE TABLE IF NOT EXISTS gco_migrations (
+		return `CREATE TABLE IF NOT EXISTS __gco_migrations (
 	id TEXT PRIMARY KEY,
 	checksum TEXT NOT NULL,
 	applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -458,7 +458,7 @@ func CreateMigrationsTable(dialect string) string {
 	tool_version TEXT NOT NULL
 );`
 	case "mysql":
-		return `CREATE TABLE IF NOT EXISTS gco_migrations (
+		return `CREATE TABLE IF NOT EXISTS __gco_migrations (
 	id VARCHAR(255) PRIMARY KEY,
 	checksum VARCHAR(255) NOT NULL,
 	applied_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -467,7 +467,7 @@ func CreateMigrationsTable(dialect string) string {
 	tool_version VARCHAR(50) NOT NULL
 );`
 	default: // sqlite
-		return `CREATE TABLE IF NOT EXISTS gco_migrations (
+		return `CREATE TABLE IF NOT EXISTS __gco_migrations (
 	id TEXT PRIMARY KEY,
 	checksum TEXT NOT NULL,
 	applied_at TEXT NOT NULL DEFAULT (datetime('now')),

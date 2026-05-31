@@ -262,6 +262,26 @@ CREATE TABLE "events" ("payload" TEXT DEFAULT $$a;b$$);
 	}
 }
 
+func TestStatementSummaryRedactsValues(t *testing.T) {
+	stmt := `ALTER TABLE "users" ADD COLUMN "api_key" TEXT DEFAULT 'internal_api_key_xxx';`
+	got := statementSummary(stmt)
+	if strings.Contains(got, "internal_api_key_xxx") || strings.Contains(got, "DEFAULT") {
+		t.Fatalf("statementSummary leaked sensitive SQL: %q", got)
+	}
+	if got != `ALTER TABLE "users" ADD` {
+		t.Fatalf("statementSummary() = %q", got)
+	}
+}
+
+func TestValidateNoInternalTableConflict(t *testing.T) {
+	schema := &ir.Schema{
+		Models: []*ir.Model{{Name: "PushLog", DBName: schemaPushesTable}},
+	}
+	if err := validateNoInternalTableConflict(schema); err == nil {
+		t.Fatal("expected reserved table conflict")
+	}
+}
+
 func TestRiskyChanges(t *testing.T) {
 	cs := &migrate.Changeset{
 		Changes: []migrate.Change{
@@ -427,9 +447,6 @@ func TestPostgresTextArrayAndIdentifierQuoting(t *testing.T) {
 	}
 	if got := parsePostgresTextArray("{}"); got != nil {
 		t.Fatalf("parsePostgresTextArray(empty) = %#v, want nil", got)
-	}
-	if got := postgresQuoteIdent(`weird"name`); got != `"weird""name"` {
-		t.Fatalf("postgresQuoteIdent() = %q", got)
 	}
 	if got := sqliteQuoteIdent(`weird"name`); got != `"weird""name"` {
 		t.Fatalf("sqliteQuoteIdent() = %q", got)
@@ -679,7 +696,7 @@ model User {
 	if count != 1 {
 		t.Fatalf("User table count = %d, want 1", count)
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM gco_schema_pushes`).Scan(&count); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM __gco_schema_pushes`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 {
@@ -698,7 +715,7 @@ model User {
 	if !noop.Noop || noop.ChangeCount != 0 {
 		t.Fatalf("second Push() result = %#v, want noop", noop)
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM gco_schema_pushes`).Scan(&count); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM __gco_schema_pushes`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 {
@@ -736,14 +753,14 @@ model User {
 	if count != 1 {
 		t.Fatalf("name column count = %d, want 1", count)
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM gco_schema_pushes`).Scan(&count); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM __gco_schema_pushes`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 2 {
 		t.Fatalf("metadata row count after update = %d, want 2", count)
 	}
 
-	hashRows, err := db.Query(`SELECT schema_hash FROM gco_schema_pushes ORDER BY id`)
+	hashRows, err := db.Query(`SELECT schema_hash FROM __gco_schema_pushes ORDER BY id`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -811,7 +828,7 @@ model User {
 	if count != 0 {
 		t.Fatalf("User table count = %d, want 0", count)
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'gco_schema_pushes'`).Scan(&count); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '__gco_schema_pushes'`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {

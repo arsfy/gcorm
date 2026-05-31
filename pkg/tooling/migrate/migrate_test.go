@@ -376,7 +376,7 @@ func TestChecksumString(t *testing.T) {
 func TestCreateMigrationsTable(t *testing.T) {
 	for _, dialect := range []string{"postgresql", "mysql", "sqlite"} {
 		sql := CreateMigrationsTable(dialect)
-		if !strings.Contains(sql, "gco_migrations") {
+		if !strings.Contains(sql, "__gco_migrations") {
 			t.Errorf("%s: missing table name", dialect)
 		}
 		if !strings.Contains(sql, "checksum") {
