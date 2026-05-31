@@ -16,10 +16,11 @@ files, and push schema changes directly to a database.
 4. [Generated Client](Generated-Client.md)
 5. [Querying](Querying.md)
 6. [DB Push](DB-Push.md)
-7. [Migrations](Migrations.md)
-8. [Security](Security.md)
-9. [Performance](Performance.md)
-10. [Troubleshooting](Troubleshooting.md)
+7. [Embedded DB Push](Embedded-DB-Push.md)
+8. [Migrations](Migrations.md)
+9. [Security](Security.md)
+10. [Performance](Performance.md)
+11. [Troubleshooting](Troubleshooting.md)
 
 ## Reference Pages
 
@@ -53,3 +54,5 @@ gco migrate diff --name init
 Use `gco db push` for direct schema synchronization in development and controlled
 environments.
 
+For production binaries that embed `.gcorm` files and call `dbpush.Push`, see
+[Embedded DB Push](Embedded-DB-Push.md).

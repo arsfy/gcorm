@@ -202,11 +202,17 @@ Create a migration from the current schema:
 gco migrate diff --name init --schema schema
 ```
 
-This creates a timestamped directory under `migrations/` containing:
+The diff command creates a timestamped directory under `migrations/` containing:
 
 - `up.sql`
 - `down.sql`
 - `manifest.json`
+
+Generate full initialization SQL for an empty database:
+
+```sh
+gco migrate init-sql --schema schema --output init.sql
+```
 
 Development and deployment helpers are available:
 

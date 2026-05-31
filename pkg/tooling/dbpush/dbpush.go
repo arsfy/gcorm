@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/url"
 	"os"
@@ -17,12 +18,57 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 
-	"github.com/arsfy/gcorm/internal/config"
-	"github.com/arsfy/gcorm/pkg/schema/compiler"
 	"github.com/arsfy/gcorm/pkg/schema/ir"
-	"github.com/arsfy/gcorm/pkg/schema/parser"
+	"github.com/arsfy/gcorm/pkg/tooling/internal/buildinfo"
+	"github.com/arsfy/gcorm/pkg/tooling/internal/schemautil"
 	"github.com/arsfy/gcorm/pkg/tooling/migrate"
 )
+
+const schemaPushesTable = "gco_schema_pushes"
+
+// Options configures an importable db push operation.
+type Options struct {
+	SchemaFS         fs.FS
+	SchemaRoot       string
+	DatabaseURL      string
+	AllowDestructive bool
+	Lock             bool
+	DryRun           bool
+}
+
+// Result summarizes a db push operation.
+type Result struct {
+	Provider    string
+	SchemaHash  string
+	ModelCount  int
+	ChangeCount int
+	Statements  []string
+	Noop        bool
+}
+
+// Push compiles embedded .gcorm schema files, compares them to the live
+// database, and applies the generated DDL.
+func Push(ctx context.Context, db *sql.DB, opts Options) (*Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if db == nil {
+		return nil, fmt.Errorf("db push: nil database")
+	}
+	if opts.SchemaFS == nil {
+		return nil, fmt.Errorf("db push: SchemaFS is required")
+	}
+
+	loaded, err := schemautil.LoadFS(opts.SchemaFS, opts.SchemaRoot)
+	if err != nil {
+		return nil, err
+	}
+	dsn, _, err := resolveURL(opts.DatabaseURL, loaded.Schema)
+	if err != nil {
+		return nil, err
+	}
+	return pushCompiled(ctx, db, loaded.Schema, loaded.Hash, dsn, opts)
+}
 
 // Run executes `gco db push`.
 func Run(args []string) error {
@@ -53,10 +99,11 @@ func Run(args []string) error {
 		}
 	}
 
-	targetSchema, err := loadTargetSchema(schemaPath, configPath)
+	loaded, err := schemautil.LoadFromConfig(schemaPath, configPath)
 	if err != nil {
 		return err
 	}
+	targetSchema := loaded.Schema
 
 	dsn, source, err := resolveURL(explicitURL, targetSchema)
 	if err != nil {
@@ -82,110 +129,111 @@ func Run(args []string) error {
 		return fmt.Errorf("ping database: %w", err)
 	}
 
+	result, err := pushCompiled(ctx, db, targetSchema, loaded.Hash, dsn, Options{
+		DatabaseURL:      explicitURL,
+		AllowDestructive: force,
+		Lock:             true,
+	})
+	if err != nil {
+		return err
+	}
+	if result.Noop {
+		fmt.Printf("db push: schema compiled with %d model(s). No database changes detected.\n", result.ModelCount)
+		return nil
+	}
+	if len(result.Statements) == 0 {
+		fmt.Printf("db push: schema compiled with %d model(s). No executable SQL generated.\n", result.ModelCount)
+		return nil
+	}
+	fmt.Printf("db push: schema compiled with %d model(s). Applied %d change(s) using connection URL from %s.\n", result.ModelCount, result.ChangeCount, source)
+	return nil
+}
+
+func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, schemaHash, dsn string, opts Options) (*Result, error) {
+	provider := "postgresql"
+	if targetSchema.Datasource != nil && targetSchema.Datasource.Provider != "" {
+		provider = targetSchema.Datasource.Provider
+	}
+	if !isSupportedProvider(provider) {
+		return nil, fmt.Errorf("db push supports postgresql, mysql, and sqlite; got %q", provider)
+	}
+
 	currentSchema, err := introspectDatabase(ctx, db, provider, targetSchema, dsn)
 	if err != nil {
-		return fmt.Errorf("introspect database: %w", err)
+		return nil, fmt.Errorf("introspect database: %w", err)
 	}
 
 	cs := migrate.Diff(currentSchema, targetSchema)
+	result := &Result{
+		Provider:    provider,
+		SchemaHash:  schemaHash,
+		ModelCount:  len(targetSchema.Models),
+		ChangeCount: len(cs.Changes),
+	}
 	if len(cs.Changes) == 0 {
-		fmt.Printf("db push: schema compiled with %d model(s). No database changes detected.\n", len(targetSchema.Models))
-		return nil
+		result.Noop = true
+		return result, nil
 	}
 
 	risky := riskyChanges(cs)
-	if len(risky) > 0 && !force {
-		return fmt.Errorf("db push refused to apply %d potentially destructive change(s) without --force:\n%s", len(risky), strings.Join(risky, "\n"))
+	if len(risky) > 0 && !opts.AllowDestructive {
+		return nil, fmt.Errorf("db push refused to apply %d potentially destructive change(s) without --force:\n%s", len(risky), strings.Join(risky, "\n"))
 	}
 
 	gen := migrate.DDLGenerator{Dialect: provider, Schema: targetSchema}
 	sqlText := gen.GenerateUp(cs)
 	stmts, unsupported := splitStatements(sqlText)
 	if len(unsupported) > 0 {
-		return fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
+		return nil, fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
 	}
+	result.Statements = append(result.Statements, stmts...)
 	if len(stmts) == 0 {
-		fmt.Printf("db push: schema compiled with %d model(s). No executable SQL generated.\n", len(targetSchema.Models))
-		return nil
+		return result, nil
+	}
+	if opts.DryRun {
+		return result, nil
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+		return nil, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
+
+	if opts.Lock {
+		if err := lockPushTransaction(ctx, tx, provider); err != nil {
+			return nil, err
+		}
+	}
 
 	if provider == "postgresql" {
 		schemaName := resolveSchemaName(targetSchema, dsn)
 		if _, err := tx.ExecContext(ctx, "SET LOCAL search_path TO "+postgresQuoteIdent(schemaName)); err != nil {
-			return fmt.Errorf("set search_path to %q: %w", schemaName, err)
+			return nil, fmt.Errorf("set search_path to %q: %w", schemaName, err)
 		}
 	}
 
 	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("execute SQL %q: %w", stmt, err)
+			return nil, fmt.Errorf("execute SQL %q: %w", stmt, err)
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit transaction: %w", err)
-	}
-
-	fmt.Printf("db push: schema compiled with %d model(s). Applied %d change(s) using connection URL from %s.\n", len(targetSchema.Models), len(cs.Changes), source)
-	return nil
-}
-
-func loadTargetSchema(schemaPath, configPath string) (*ir.Schema, error) {
-	cfg, _, err := config.Load(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("load config: %w", err)
-	}
-
-	cwd, err := os.Getwd()
-	if err != nil {
+	if err := ensureSchemaPushesTable(ctx, tx, provider); err != nil {
 		return nil, err
 	}
-
-	var roots []string
-	if schemaPath != "" {
-		roots = []string{schemaPath}
-	} else {
-		roots, err = config.DiscoverSchemaRoots(cfg, cwd)
-		if err != nil {
+	if err := insertSchemaPushRecord(ctx, tx, provider, schemaHash, len(targetSchema.Models), len(cs.Changes)); err != nil {
+		return nil, err
+	}
+	if opts.Lock && provider == "mysql" {
+		if err := unlockMySQLPush(ctx, tx); err != nil {
 			return nil, err
 		}
 	}
-
-	files, err := config.DiscoverSchemaFiles(roots)
-	if err != nil {
-		return nil, err
-	}
-	if len(files) == 0 {
-		return nil, fmt.Errorf("no .gcorm schema files found in %v", roots)
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit transaction: %w", err)
 	}
 
-	fileContents := make(map[string][]byte, len(files))
-	for _, f := range files {
-		data, readErr := os.ReadFile(f)
-		if readErr != nil {
-			return nil, fmt.Errorf("read %s: %w", f, readErr)
-		}
-		fileContents[f] = data
-	}
-
-	ds, parseErr := parser.ParseMulti(fileContents)
-	if parseErr != nil {
-		return nil, fmt.Errorf("parse error: %w", parseErr)
-	}
-
-	result := compiler.Compile(ds)
-	if len(result.Errors) > 0 {
-		return nil, fmt.Errorf("schema compilation failed with %d error(s)", len(result.Errors))
-	}
-	if result.Schema == nil {
-		return nil, fmt.Errorf("no schema produced")
-	}
-	return result.Schema, nil
+	return result, nil
 }
 
 func resolveURL(explicitURL string, schema *ir.Schema) (string, string, error) {
@@ -438,6 +486,100 @@ func splitStatements(sqlText string) ([]string, []string) {
 	return stmts, unsupported
 }
 
+func lockPushTransaction(ctx context.Context, tx *sql.Tx, provider string) error {
+	switch provider {
+	case "postgresql":
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(2824262875)`); err != nil {
+			return fmt.Errorf("acquire db push lock: %w", err)
+		}
+	case "mysql":
+		var got int
+		if err := tx.QueryRowContext(ctx, `SELECT GET_LOCK('gco_dbpush', 60)`).Scan(&got); err != nil {
+			return fmt.Errorf("acquire db push lock: %w", err)
+		}
+		if got != 1 {
+			return fmt.Errorf("acquire db push lock: timed out")
+		}
+	case "sqlite":
+		// SQLite serializes schema writes through the transaction itself.
+	default:
+		return fmt.Errorf("db push lock unsupported for provider %q", provider)
+	}
+	return nil
+}
+
+func unlockMySQLPush(ctx context.Context, tx *sql.Tx) error {
+	var released sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT RELEASE_LOCK('gco_dbpush')`).Scan(&released); err != nil {
+		return fmt.Errorf("release db push lock: %w", err)
+	}
+	return nil
+}
+
+func ensureSchemaPushesTable(ctx context.Context, tx *sql.Tx, provider string) error {
+	_, err := tx.ExecContext(ctx, createSchemaPushesTableSQL(provider))
+	if err != nil {
+		return fmt.Errorf("create %s table: %w", schemaPushesTable, err)
+	}
+	return nil
+}
+
+func createSchemaPushesTableSQL(provider string) string {
+	switch provider {
+	case "mysql":
+		return `CREATE TABLE IF NOT EXISTS gco_schema_pushes (
+	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+	schema_hash VARCHAR(64) NOT NULL,
+	provider VARCHAR(32) NOT NULL,
+	model_count BIGINT NOT NULL,
+	change_count BIGINT NOT NULL,
+	applied_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	tool_version VARCHAR(50) NOT NULL
+)`
+	case "sqlite":
+		return `CREATE TABLE IF NOT EXISTS gco_schema_pushes (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	schema_hash TEXT NOT NULL,
+	provider TEXT NOT NULL,
+	model_count INTEGER NOT NULL,
+	change_count INTEGER NOT NULL,
+	applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+	tool_version TEXT NOT NULL
+)`
+	default:
+		return `CREATE TABLE IF NOT EXISTS gco_schema_pushes (
+	id BIGSERIAL PRIMARY KEY,
+	schema_hash TEXT NOT NULL,
+	provider TEXT NOT NULL,
+	model_count BIGINT NOT NULL,
+	change_count BIGINT NOT NULL,
+	applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	tool_version TEXT NOT NULL
+)`
+	}
+}
+
+func insertSchemaPushRecord(ctx context.Context, tx *sql.Tx, provider, schemaHash string, modelCount, changeCount int) error {
+	stmt := `INSERT INTO gco_schema_pushes (schema_hash, provider, model_count, change_count, tool_version) VALUES (?, ?, ?, ?, ?)`
+	args := []any{schemaHash, provider, modelCount, changeCount, buildinfo.Version()}
+	if provider == "postgresql" {
+		stmt = `INSERT INTO gco_schema_pushes (schema_hash, provider, model_count, change_count, tool_version) VALUES ($1, $2, $3, $4, $5)`
+	}
+	if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+		return fmt.Errorf("record db push metadata: %w", err)
+	}
+	return nil
+}
+
+func isInternalTable(tableName string) bool {
+	switch tableName {
+	case schemaPushesTable, "gco_migrations":
+		return true
+	default:
+		return false
+	}
+}
+
 func introspectPostgres(ctx context.Context, db *sql.DB, schemaName string) (*ir.Schema, error) {
 	schema := &ir.Schema{
 		Datasource: &ir.Datasource{
@@ -569,6 +711,9 @@ ORDER BY table_name`, schemaName)
 		var tableName string
 		if err := rows.Scan(&tableName); err != nil {
 			return nil, err
+		}
+		if isInternalTable(tableName) {
+			continue
 		}
 		models[tableName] = &ir.Model{
 			Name:   tableName,
@@ -854,6 +999,9 @@ ORDER BY table_name`)
 		if err := rows.Scan(&tableName); err != nil {
 			return nil, err
 		}
+		if isInternalTable(tableName) {
+			continue
+		}
 		models[tableName] = &ir.Model{Name: tableName, DBName: tableName}
 	}
 	return models, rows.Err()
@@ -1092,6 +1240,9 @@ ORDER BY name`)
 		var tableName string
 		if err := rows.Scan(&tableName); err != nil {
 			return nil, err
+		}
+		if isInternalTable(tableName) {
+			continue
 		}
 		models[tableName] = &ir.Model{Name: tableName, DBName: tableName}
 	}

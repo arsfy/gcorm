@@ -94,6 +94,7 @@ Commands:
   introspect   Generate schema from existing database
   migrate      Manage database migrations
     diff       Generate migration from schema diff
+    init-sql   Generate full initialization SQL from schema
     dev        Apply migrations in development mode
     deploy     Apply migrations in production mode
     resolve    Resolve migration state

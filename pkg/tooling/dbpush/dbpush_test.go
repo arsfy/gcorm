@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/arsfy/gcorm/pkg/schema/ir"
 	"github.com/arsfy/gcorm/pkg/tooling/migrate"
@@ -606,6 +607,191 @@ model Post {
 	}
 	if refTable != "User" || fromColumn != "author_id" || toColumn != "id" || onDelete != "CASCADE" {
 		t.Fatalf("foreign key = %s %s %s %s", refTable, fromColumn, toColumn, onDelete)
+	}
+}
+
+func TestPushEmbeddedSQLiteInitialNoopAndFollowUp(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "embedded.db")
+	dsn := "file:" + filepath.ToSlash(dbPath)
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	initialFS := fstest.MapFS{
+		"schema/main.gcorm": {Data: []byte(`datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id    String @id
+  email String @unique
+}
+`)},
+	}
+
+	ctx := context.Background()
+	result, err := Push(ctx, db, Options{
+		SchemaFS:    initialFS,
+		SchemaRoot:  "schema",
+		DatabaseURL: dsn,
+		Lock:        true,
+	})
+	if err != nil {
+		t.Fatalf("Push() error = %v", err)
+	}
+	if result.Noop || result.ChangeCount == 0 || len(result.Statements) == 0 {
+		t.Fatalf("initial Push() result = %#v, want applied changes", result)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'User'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("User table count = %d, want 1", count)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM gco_schema_pushes`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("metadata row count = %d, want 1", count)
+	}
+
+	noop, err := Push(ctx, db, Options{
+		SchemaFS:    initialFS,
+		SchemaRoot:  "schema",
+		DatabaseURL: dsn,
+		Lock:        true,
+	})
+	if err != nil {
+		t.Fatalf("second Push() error = %v", err)
+	}
+	if !noop.Noop || noop.ChangeCount != 0 {
+		t.Fatalf("second Push() result = %#v, want noop", noop)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM gco_schema_pushes`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("metadata row count after noop = %d, want 1", count)
+	}
+
+	updatedFS := fstest.MapFS{
+		"schema/main.gcorm": {Data: []byte(`datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id    String @id
+  email String @unique
+  name  String?
+}
+`)},
+	}
+	updated, err := Push(ctx, db, Options{
+		SchemaFS:    updatedFS,
+		SchemaRoot:  "schema",
+		DatabaseURL: dsn,
+		Lock:        true,
+	})
+	if err != nil {
+		t.Fatalf("updated Push() error = %v", err)
+	}
+	if updated.Noop || updated.ChangeCount == 0 {
+		t.Fatalf("updated Push() result = %#v, want applied change", updated)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('User') WHERE name = 'name'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("name column count = %d, want 1", count)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM gco_schema_pushes`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("metadata row count after update = %d, want 2", count)
+	}
+
+	hashRows, err := db.Query(`SELECT schema_hash FROM gco_schema_pushes ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hashRows.Close()
+	var hashes []string
+	for hashRows.Next() {
+		var hash string
+		if err := hashRows.Scan(&hash); err != nil {
+			t.Fatal(err)
+		}
+		hashes = append(hashes, hash)
+	}
+	if err := hashRows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(hashes) != 2 {
+		t.Fatalf("schema hash count = %d, want 2", len(hashes))
+	}
+	if hashes[0] == hashes[1] {
+		t.Fatalf("schema hashes should differ after schema change: %v", hashes)
+	}
+}
+
+func TestPushEmbeddedSQLiteDryRunDoesNotApply(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dryrun.db")
+	dsn := "file:" + filepath.ToSlash(dbPath)
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	schemaFS := fstest.MapFS{
+		"schema/main.gcorm": {Data: []byte(`datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id    String @id
+  email String @unique
+}
+`)},
+	}
+
+	result, err := Push(context.Background(), db, Options{
+		SchemaFS:    schemaFS,
+		SchemaRoot:  "schema",
+		DatabaseURL: dsn,
+		DryRun:      true,
+	})
+	if err != nil {
+		t.Fatalf("Push() error = %v", err)
+	}
+	if result.Noop || len(result.Statements) == 0 {
+		t.Fatalf("dry-run result = %#v, want planned statements", result)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'User'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("User table count = %d, want 0", count)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'gco_schema_pushes'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("metadata table count = %d, want 0", count)
 	}
 }
 

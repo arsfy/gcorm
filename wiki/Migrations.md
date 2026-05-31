@@ -25,6 +25,27 @@ Use a custom directory:
 gco migrate diff --name add_posts --dir db/migrations
 ```
 
+## Generate Initialization SQL
+
+Generate a complete SQL file for initializing an empty database from the current
+schema:
+
+```sh
+gco migrate init-sql --schema schema --output init.sql
+```
+
+If `--output` is omitted, SQL is written to stdout:
+
+```sh
+gco migrate init-sql --schema schema > init.sql
+```
+
+This command does not create a migration directory and does not connect to a
+database.
+
+For production binaries that initialize or synchronize a live database directly
+from embedded `.gcorm` files, see [Embedded DB Push](Embedded-DB-Push.md).
+
 ## Manifest
 
 `manifest.json` records metadata such as:
@@ -99,5 +120,5 @@ carefully before applying it to a database that contains important data.
 Use migrations when you need review, repeatability, and audit history.
 
 Use `db push` when you want direct schema synchronization and can accept the
-risks of applying generated SQL immediately.
-
+risks of applying generated SQL immediately. For a CLI-free production flow,
+embed `.gcorm` files and call `dbpush.Push` from an explicit migrator job.

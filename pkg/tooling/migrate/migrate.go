@@ -9,12 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/arsfy/gcorm/internal/config"
-	"github.com/arsfy/gcorm/pkg/schema/compiler"
 	"github.com/arsfy/gcorm/pkg/schema/ir"
-	"github.com/arsfy/gcorm/pkg/schema/parser"
+	"github.com/arsfy/gcorm/pkg/tooling/internal/schemautil"
 )
 
 // MigrationManifest describes a single migration.
@@ -51,12 +51,14 @@ type MigrationRecord struct {
 // Run executes the migrate subcommand.
 func Run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("missing migrate subcommand (diff, dev, deploy, resolve)")
+		return fmt.Errorf("missing migrate subcommand (diff, dev, deploy, resolve, init-sql)")
 	}
 
 	switch args[0] {
 	case "diff":
 		return runDiff(args[1:])
+	case "init-sql":
+		return runInitSQL(args[1:])
 	case "dev":
 		return runDev(args[1:])
 	case "deploy":
@@ -108,50 +110,11 @@ func runDiff(args []string) error {
 		migrationDir = cfg.MigrationDir
 	}
 
-	// Discover schema files.
-	var roots []string
-	if schemaPath != "" {
-		roots = []string{schemaPath}
-	} else {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return fmt.Errorf("get working directory: %w", err)
-		}
-		roots, err = config.DiscoverSchemaRoots(cfg, cwd)
-		if err != nil {
-			return fmt.Errorf("discover schema roots: %w", err)
-		}
-	}
-
-	schemaFiles, err := config.DiscoverSchemaFiles(roots)
+	loaded, err := schemautil.LoadFromConfig(schemaPath, configPath)
 	if err != nil {
-		return fmt.Errorf("discover schema files: %w", err)
+		return err
 	}
-	if len(schemaFiles) == 0 {
-		return fmt.Errorf("no .gcorm schema files found in %v", roots)
-	}
-
-	// Read and parse schema files.
-	files := make(map[string][]byte, len(schemaFiles))
-	for _, f := range schemaFiles {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			return fmt.Errorf("read schema file %s: %w", f, err)
-		}
-		files[f] = data
-	}
-
-	ds, err := parser.ParseMulti(files)
-	if err != nil {
-		return fmt.Errorf("parse schema: %w", err)
-	}
-
-	result := compiler.Compile(ds)
-	if result.HasErrors() {
-		return fmt.Errorf("compile schema: %v", result.Errors[0])
-	}
-
-	newSchema := result.Schema
+	newSchema := loaded.Schema
 
 	// Load previous schema (nil when no prior migrations exist).
 	prevSchema := loadPreviousSchema(migrationDir)
@@ -241,6 +204,62 @@ func runDiff(args []string) error {
 		}
 		fmt.Println()
 	}
+	return nil
+}
+
+func runInitSQL(args []string) error {
+	schemaPath := ""
+	configPath := ""
+	outputPath := ""
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--schema":
+			if i+1 < len(args) {
+				schemaPath = args[i+1]
+				i++
+			}
+		case "--config":
+			if i+1 < len(args) {
+				configPath = args[i+1]
+				i++
+			}
+		case "--output", "-o":
+			if i+1 < len(args) {
+				outputPath = args[i+1]
+				i++
+			}
+		}
+	}
+
+	loaded, err := schemautil.LoadFromConfig(schemaPath, configPath)
+	if err != nil {
+		return err
+	}
+	newSchema := loaded.Schema
+
+	cs := Diff(nil, newSchema)
+	dialect := detectDialectFromSchema(newSchema)
+	gen := DDLGenerator{Dialect: dialect, Schema: newSchema}
+	sqlText := strings.TrimRight(gen.GenerateUp(cs), "\n")
+	if sqlText != "" {
+		sqlText += "\n"
+	}
+
+	if outputPath == "" {
+		fmt.Print(sqlText)
+		return nil
+	}
+
+	if dir := filepath.Dir(outputPath); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create output directory: %w", err)
+		}
+	}
+	if err := os.WriteFile(outputPath, []byte(sqlText), 0o644); err != nil {
+		return fmt.Errorf("write init SQL: %w", err)
+	}
+	fmt.Printf("Wrote init SQL for %d model(s) to %s\n", len(newSchema.Models), outputPath)
 	return nil
 }
 

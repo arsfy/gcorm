@@ -124,6 +124,22 @@ Generated files:
 - `down.sql`
 - `manifest.json`
 
+## gco migrate init-sql
+
+Generate full initialization SQL from the current schema without creating a
+migration directory.
+
+```sh
+gco migrate init-sql --schema schema --output init.sql
+gco migrate init-sql --schema schema > init.sql
+```
+
+Flags:
+
+- `--schema <path>`
+- `--config <path>`
+- `--output <path>`, `-o <path>`
+
 ## gco migrate dev
 
 Create a development migration using the same diff path as `migrate diff`.
@@ -195,4 +211,3 @@ gco help
 gco --help
 gco -h
 ```
-

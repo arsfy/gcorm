@@ -38,6 +38,9 @@ Use a config file:
 gco db push --config gco.config.yaml
 ```
 
+For production binaries that embed `.gcorm` files and call `dbpush.Push`
+directly, see [Embedded DB Push](Embedded-DB-Push.md).
+
 ## Connection URL Resolution
 
 GCORM resolves the database URL in this order:
@@ -89,11 +92,13 @@ Good fit:
 - Test databases.
 - Disposable preview databases.
 - Small internal tools where direct schema sync is acceptable.
+- Explicit production migrator jobs that embed trusted `.gcorm` files and use
+  [Embedded DB Push](Embedded-DB-Push.md).
 
 Use migrations instead when:
 
 - You need a reviewed SQL history.
-- You deploy to production.
+- Production policy requires reviewed SQL files.
 - Multiple application versions may run during deploys.
 - Data backfills or custom SQL are required.
 
@@ -121,4 +126,3 @@ SQLite:
 `db push` applies generated SQL. It is not a substitute for hand-reviewed
 production migration planning. If generated SQL includes an unsupported pattern,
 the command reports an error instead of executing that SQL.
-

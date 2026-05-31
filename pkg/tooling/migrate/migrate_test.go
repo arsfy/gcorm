@@ -188,6 +188,74 @@ func TestRunDiffNoChanges(t *testing.T) {
 	}
 }
 
+func TestRunInitSQLWritesFullInitializationSQL(t *testing.T) {
+	schema := `datasource db {
+  provider = "sqlite"
+  url      = "file:dev.db"
+}
+
+model User {
+  id    String @id
+  email String @unique
+  name  String?
+  posts Post[]
+}
+
+model Post {
+  id       String @id
+  title    String
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id], onDelete: CASCADE)
+
+  @@index([authorId])
+}
+`
+	schemaDir := writeTestSchema(t, schema)
+	outPath := filepath.Join(t.TempDir(), "db", "init.sql")
+
+	if err := runInitSQL([]string{"--schema", schemaDir, "--output", outPath}); err != nil {
+		t.Fatalf("runInitSQL() error: %v", err)
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read init sql: %v", err)
+	}
+	sql := string(data)
+	for _, want := range []string{
+		`CREATE TABLE "User"`,
+		`CREATE TABLE "Post"`,
+		`FOREIGN KEY ("author_id") REFERENCES "User" ("id") ON DELETE CASCADE`,
+		`CREATE INDEX "idx_Post_author_id" ON "Post" ("author_id")`,
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("init sql missing %q:\n%s", want, sql)
+		}
+	}
+}
+
+func TestRunInitSQLDoesNotCreateMigrationDirectory(t *testing.T) {
+	schemaDir := writeTestSchema(t, testSchemaGCO)
+	dir := t.TempDir()
+	outPath := filepath.Join(dir, "init.sql")
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWD)
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runInitSQL([]string{"--schema", schemaDir, "--output", outPath}); err != nil {
+		t.Fatalf("runInitSQL() error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "migrations")); !os.IsNotExist(err) {
+		t.Fatalf("migrations directory should not be created, stat err=%v", err)
+	}
+}
+
 func TestRunSubcommands(t *testing.T) {
 	// runDeploy with no migrations dir should not error.
 	if err := runDeploy(nil); err != nil {
