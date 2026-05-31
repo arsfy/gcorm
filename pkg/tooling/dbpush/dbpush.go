@@ -1494,7 +1494,7 @@ func postgresDefaultValue(def string, isIdentity bool) *ir.DefaultValue {
 		return &ir.DefaultValue{IsFunction: true, FuncName: "uuid"}
 	case strings.Contains(lower, "now()"), strings.Contains(lower, "current_timestamp"):
 		return &ir.DefaultValue{IsFunction: true, FuncName: "now"}
-	case strings.HasPrefix(lower, "'{}'::"):
+	case strings.HasPrefix(lower, "'{}'::") && postgresDefaultCastIsArray(lower):
 		return &ir.DefaultValue{IsArray: true}
 	case strings.HasPrefix(lower, "'{") && strings.Contains(lower, "}'::") && strings.HasSuffix(lower, "[]"):
 		return &ir.DefaultValue{IsArray: true, ArrayValue: parsePostgresTextArray(strings.Trim(def[:strings.Index(def, "::")], "'"))}
@@ -1504,6 +1504,14 @@ func postgresDefaultValue(def string, isIdentity bool) *ir.DefaultValue {
 		value := normalizePostgresLiteralDefault(def)
 		return &ir.DefaultValue{Value: value, IsString: !isNumericLiteral(value) && value != "true" && value != "false", IsNumber: isNumericLiteral(value), IsBool: value == "true" || value == "false"}
 	}
+}
+
+func postgresDefaultCastIsArray(def string) bool {
+	castIdx := strings.Index(def, "::")
+	if castIdx < 0 {
+		return false
+	}
+	return strings.HasSuffix(strings.TrimSpace(def[castIdx+len("::"):]), "[]")
 }
 
 func parsePostgresArrayDefault(def string) []string {

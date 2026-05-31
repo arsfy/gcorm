@@ -292,6 +292,11 @@ func TestPostgresDefaultValueNormalizesIdentityAndCasts(t *testing.T) {
 		t.Fatalf("json default = %#v, want [] string", json)
 	}
 
+	jsonObject := postgresDefaultValue("'{}'::jsonb", false)
+	if jsonObject == nil || !jsonObject.IsString || jsonObject.Value != "{}" {
+		t.Fatalf("json object default = %#v, want {} string", jsonObject)
+	}
+
 	number := postgresDefaultValue("0", false)
 	if number == nil || !number.IsNumber || number.Value != "0" {
 		t.Fatalf("numeric default = %#v, want numeric 0", number)
