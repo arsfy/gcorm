@@ -26,6 +26,12 @@ import (
 
 const schemaPushesTable = "gco_schema_pushes"
 
+type sqlRunner interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 // Options configures an importable db push operation.
 type Options struct {
 	SchemaFS         fs.FS
@@ -157,6 +163,9 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 	if !isSupportedProvider(provider) {
 		return nil, fmt.Errorf("db push supports postgresql, mysql, and sqlite; got %q", provider)
 	}
+	if provider == "mysql" {
+		return pushCompiledMySQL(ctx, db, targetSchema, schemaHash, dsn, opts)
+	}
 
 	currentSchema, err := introspectDatabase(ctx, db, provider, targetSchema, dsn)
 	if err != nil {
@@ -213,26 +222,91 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 		}
 	}
 
+	if err := ensureSchemaPushesTable(ctx, tx, provider); err != nil {
+		return nil, err
+	}
 	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return nil, fmt.Errorf("execute SQL %q: %w", stmt, err)
 		}
 	}
-	if err := ensureSchemaPushesTable(ctx, tx, provider); err != nil {
-		return nil, err
-	}
 	if err := insertSchemaPushRecord(ctx, tx, provider, schemaHash, len(targetSchema.Models), len(cs.Changes)); err != nil {
 		return nil, err
-	}
-	if opts.Lock && provider == "mysql" {
-		if err := unlockMySQLPush(ctx, tx); err != nil {
-			return nil, err
-		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit transaction: %w", err)
 	}
 
+	return result, nil
+}
+
+func pushCompiledMySQL(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, schemaHash, dsn string, opts Options) (result *Result, err error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire mysql connection: %w", err)
+	}
+	defer conn.Close()
+
+	locked := false
+	if opts.Lock {
+		if err := acquireMySQLPushLock(ctx, conn); err != nil {
+			return nil, err
+		}
+		locked = true
+	}
+	defer func() {
+		if locked {
+			unlockErr := releaseMySQLPushLock(ctx, conn)
+			if err == nil && unlockErr != nil {
+				err = unlockErr
+			}
+		}
+	}()
+
+	currentSchema, err := introspectDatabase(ctx, conn, "mysql", targetSchema, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("introspect database: %w", err)
+	}
+
+	cs := migrate.Diff(currentSchema, targetSchema)
+	result = &Result{
+		Provider:    "mysql",
+		SchemaHash:  schemaHash,
+		ModelCount:  len(targetSchema.Models),
+		ChangeCount: len(cs.Changes),
+	}
+	if len(cs.Changes) == 0 {
+		result.Noop = true
+		return result, nil
+	}
+
+	risky := riskyChanges(cs)
+	if len(risky) > 0 && !opts.AllowDestructive {
+		return nil, fmt.Errorf("db push refused to apply %d potentially destructive change(s) without --force:\n%s", len(risky), strings.Join(risky, "\n"))
+	}
+
+	gen := migrate.DDLGenerator{Dialect: "mysql", Schema: targetSchema}
+	sqlText := gen.GenerateUp(cs)
+	stmts, unsupported := splitStatements(sqlText)
+	if len(unsupported) > 0 {
+		return nil, fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
+	}
+	result.Statements = append(result.Statements, stmts...)
+	if len(stmts) == 0 || opts.DryRun {
+		return result, nil
+	}
+
+	if err := ensureSchemaPushesTable(ctx, conn, "mysql"); err != nil {
+		return nil, err
+	}
+	for _, stmt := range stmts {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return nil, fmt.Errorf("execute SQL %q: %w", stmt, err)
+		}
+	}
+	if err := insertSchemaPushRecord(ctx, conn, "mysql", schemaHash, len(targetSchema.Models), len(cs.Changes)); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -459,7 +533,7 @@ func riskyChanges(cs *migrate.Changeset) []string {
 }
 
 func splitStatements(sqlText string) ([]string, []string) {
-	parts := strings.Split(sqlText, ";")
+	parts := splitSQLStatements(sqlText)
 	stmts := make([]string, 0, len(parts))
 	var unsupported []string
 
@@ -486,19 +560,134 @@ func splitStatements(sqlText string) ([]string, []string) {
 	return stmts, unsupported
 }
 
+func splitSQLStatements(sqlText string) []string {
+	var parts []string
+	var b strings.Builder
+	state := "normal"
+	dollarTag := ""
+
+	for i := 0; i < len(sqlText); i++ {
+		c := sqlText[i]
+
+		switch state {
+		case "single":
+			b.WriteByte(c)
+			if c == '\'' {
+				if i+1 < len(sqlText) && sqlText[i+1] == '\'' {
+					i++
+					b.WriteByte(sqlText[i])
+					continue
+				}
+				state = "normal"
+			}
+		case "double":
+			b.WriteByte(c)
+			if c == '"' {
+				if i+1 < len(sqlText) && sqlText[i+1] == '"' {
+					i++
+					b.WriteByte(sqlText[i])
+					continue
+				}
+				state = "normal"
+			}
+		case "backtick":
+			b.WriteByte(c)
+			if c == '`' {
+				state = "normal"
+			}
+		case "bracket":
+			b.WriteByte(c)
+			if c == ']' {
+				state = "normal"
+			}
+		case "lineComment":
+			b.WriteByte(c)
+			if c == '\n' {
+				state = "normal"
+			}
+		case "blockComment":
+			b.WriteByte(c)
+			if c == '*' && i+1 < len(sqlText) && sqlText[i+1] == '/' {
+				i++
+				b.WriteByte(sqlText[i])
+				state = "normal"
+			}
+		case "dollar":
+			if dollarTag != "" && strings.HasPrefix(sqlText[i:], dollarTag) {
+				b.WriteString(dollarTag)
+				i += len(dollarTag) - 1
+				state = "normal"
+				dollarTag = ""
+				continue
+			}
+			b.WriteByte(c)
+		default:
+			switch {
+			case c == ';':
+				parts = append(parts, b.String())
+				b.Reset()
+			case c == '\'':
+				b.WriteByte(c)
+				state = "single"
+			case c == '"':
+				b.WriteByte(c)
+				state = "double"
+			case c == '`':
+				b.WriteByte(c)
+				state = "backtick"
+			case c == '[':
+				b.WriteByte(c)
+				state = "bracket"
+			case c == '-' && i+1 < len(sqlText) && sqlText[i+1] == '-':
+				b.WriteByte(c)
+				i++
+				b.WriteByte(sqlText[i])
+				state = "lineComment"
+			case c == '/' && i+1 < len(sqlText) && sqlText[i+1] == '*':
+				b.WriteByte(c)
+				i++
+				b.WriteByte(sqlText[i])
+				state = "blockComment"
+			case c == '$':
+				tag := readDollarQuoteTag(sqlText[i:])
+				if tag != "" {
+					b.WriteString(tag)
+					i += len(tag) - 1
+					dollarTag = tag
+					state = "dollar"
+					continue
+				}
+				b.WriteByte(c)
+			default:
+				b.WriteByte(c)
+			}
+		}
+	}
+	parts = append(parts, b.String())
+	return parts
+}
+
+func readDollarQuoteTag(s string) string {
+	if len(s) < 2 || s[0] != '$' {
+		return ""
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if c == '$' {
+			return s[:i+1]
+		}
+		if !(c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
+			return ""
+		}
+	}
+	return ""
+}
+
 func lockPushTransaction(ctx context.Context, tx *sql.Tx, provider string) error {
 	switch provider {
 	case "postgresql":
 		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(2824262875)`); err != nil {
 			return fmt.Errorf("acquire db push lock: %w", err)
-		}
-	case "mysql":
-		var got int
-		if err := tx.QueryRowContext(ctx, `SELECT GET_LOCK('gco_dbpush', 60)`).Scan(&got); err != nil {
-			return fmt.Errorf("acquire db push lock: %w", err)
-		}
-		if got != 1 {
-			return fmt.Errorf("acquire db push lock: timed out")
 		}
 	case "sqlite":
 		// SQLite serializes schema writes through the transaction itself.
@@ -508,16 +697,27 @@ func lockPushTransaction(ctx context.Context, tx *sql.Tx, provider string) error
 	return nil
 }
 
-func unlockMySQLPush(ctx context.Context, tx *sql.Tx) error {
+func acquireMySQLPushLock(ctx context.Context, conn *sql.Conn) error {
+	var got int
+	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK('gco_dbpush', 60)`).Scan(&got); err != nil {
+		return fmt.Errorf("acquire db push lock: %w", err)
+	}
+	if got != 1 {
+		return fmt.Errorf("acquire db push lock: timed out")
+	}
+	return nil
+}
+
+func releaseMySQLPushLock(ctx context.Context, conn *sql.Conn) error {
 	var released sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT RELEASE_LOCK('gco_dbpush')`).Scan(&released); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT RELEASE_LOCK('gco_dbpush')`).Scan(&released); err != nil {
 		return fmt.Errorf("release db push lock: %w", err)
 	}
 	return nil
 }
 
-func ensureSchemaPushesTable(ctx context.Context, tx *sql.Tx, provider string) error {
-	_, err := tx.ExecContext(ctx, createSchemaPushesTableSQL(provider))
+func ensureSchemaPushesTable(ctx context.Context, runner sqlRunner, provider string) error {
+	_, err := runner.ExecContext(ctx, createSchemaPushesTableSQL(provider))
 	if err != nil {
 		return fmt.Errorf("create %s table: %w", schemaPushesTable, err)
 	}
@@ -559,13 +759,13 @@ func createSchemaPushesTableSQL(provider string) string {
 	}
 }
 
-func insertSchemaPushRecord(ctx context.Context, tx *sql.Tx, provider, schemaHash string, modelCount, changeCount int) error {
+func insertSchemaPushRecord(ctx context.Context, runner sqlRunner, provider, schemaHash string, modelCount, changeCount int) error {
 	stmt := `INSERT INTO gco_schema_pushes (schema_hash, provider, model_count, change_count, tool_version) VALUES (?, ?, ?, ?, ?)`
 	args := []any{schemaHash, provider, modelCount, changeCount, buildinfo.Version()}
 	if provider == "postgresql" {
 		stmt = `INSERT INTO gco_schema_pushes (schema_hash, provider, model_count, change_count, tool_version) VALUES ($1, $2, $3, $4, $5)`
 	}
-	if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+	if _, err := runner.ExecContext(ctx, stmt, args...); err != nil {
 		return fmt.Errorf("record db push metadata: %w", err)
 	}
 	return nil
@@ -580,7 +780,7 @@ func isInternalTable(tableName string) bool {
 	}
 }
 
-func introspectPostgres(ctx context.Context, db *sql.DB, schemaName string) (*ir.Schema, error) {
+func introspectPostgres(ctx context.Context, db sqlRunner, schemaName string) (*ir.Schema, error) {
 	schema := &ir.Schema{
 		Datasource: &ir.Datasource{
 			Provider: "postgresql",
@@ -619,7 +819,7 @@ func introspectPostgres(ctx context.Context, db *sql.DB, schemaName string) (*ir
 	return schema, nil
 }
 
-func introspectDatabase(ctx context.Context, db *sql.DB, provider string, targetSchema *ir.Schema, dsn string) (*ir.Schema, error) {
+func introspectDatabase(ctx context.Context, db sqlRunner, provider string, targetSchema *ir.Schema, dsn string) (*ir.Schema, error) {
 	switch provider {
 	case "postgresql":
 		return introspectPostgres(ctx, db, resolveSchemaName(targetSchema, dsn))
@@ -632,7 +832,7 @@ func introspectDatabase(ctx context.Context, db *sql.DB, provider string, target
 	}
 }
 
-func introspectMySQL(ctx context.Context, db *sql.DB) (*ir.Schema, error) {
+func introspectMySQL(ctx context.Context, db sqlRunner) (*ir.Schema, error) {
 	schema := &ir.Schema{Datasource: &ir.Datasource{Provider: "mysql"}}
 
 	models, err := loadMySQLTables(ctx, db)
@@ -659,11 +859,11 @@ func introspectMySQL(ctx context.Context, db *sql.DB) (*ir.Schema, error) {
 	return schema, nil
 }
 
-func introspectSQLite(ctx context.Context, db *sql.DB) (*ir.Schema, error) {
+func introspectSQLite(ctx context.Context, db sqlRunner) (*ir.Schema, error) {
 	return introspectSQLiteWithTarget(ctx, db, nil)
 }
 
-func introspectSQLiteWithTarget(ctx context.Context, db *sql.DB, targetSchema *ir.Schema) (*ir.Schema, error) {
+func introspectSQLiteWithTarget(ctx context.Context, db sqlRunner, targetSchema *ir.Schema) (*ir.Schema, error) {
 	schema := &ir.Schema{Datasource: &ir.Datasource{Provider: "sqlite"}}
 
 	models, err := loadSQLiteTables(ctx, db)
@@ -695,7 +895,7 @@ func appendSortedModels(schema *ir.Schema, models map[string]*ir.Model) {
 	}
 }
 
-func loadPostgresTables(ctx context.Context, db *sql.DB, schemaName string) (map[string]*ir.Model, error) {
+func loadPostgresTables(ctx context.Context, db sqlRunner, schemaName string) (map[string]*ir.Model, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT table_name
 FROM information_schema.tables
@@ -724,7 +924,7 @@ ORDER BY table_name`, schemaName)
 	return models, rows.Err()
 }
 
-func loadPostgresColumns(ctx context.Context, db *sql.DB, schemaName string, models map[string]*ir.Model) error {
+func loadPostgresColumns(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT table_name, column_name, is_nullable, data_type, udt_name, column_default, is_identity
 FROM information_schema.columns
@@ -758,7 +958,7 @@ ORDER BY table_name, ordinal_position`, schemaName)
 	return rows.Err()
 }
 
-func loadPostgresPrimaryKeys(ctx context.Context, db *sql.DB, schemaName string, models map[string]*ir.Model) error {
+func loadPostgresPrimaryKeys(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT tc.table_name, kcu.column_name
 FROM information_schema.table_constraints tc
@@ -804,7 +1004,7 @@ ORDER BY tc.table_name, kcu.ordinal_position`, schemaName)
 	return nil
 }
 
-func loadPostgresUniqueConstraints(ctx context.Context, db *sql.DB, schemaName string, models map[string]*ir.Model) error {
+func loadPostgresUniqueConstraints(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT tc.table_name, tc.constraint_name, kcu.column_name
 FROM information_schema.table_constraints tc
@@ -854,7 +1054,7 @@ ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`, schemaName)
 	return nil
 }
 
-func loadPostgresIndexes(ctx context.Context, db *sql.DB, schemaName string, models map[string]*ir.Model) error {
+func loadPostgresIndexes(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT
   t.relname AS table_name,
@@ -913,7 +1113,7 @@ ORDER BY t.relname, i.relname`, schemaName)
 	return rows.Err()
 }
 
-func loadPostgresForeignKeys(ctx context.Context, db *sql.DB, schemaName string, models map[string]*ir.Model) error {
+func loadPostgresForeignKeys(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT
   tc.table_name,
@@ -982,7 +1182,7 @@ ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`, schemaName)
 	return nil
 }
 
-func loadMySQLTables(ctx context.Context, db *sql.DB) (map[string]*ir.Model, error) {
+func loadMySQLTables(ctx context.Context, db sqlRunner) (map[string]*ir.Model, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT table_name
 FROM information_schema.tables
@@ -1007,7 +1207,7 @@ ORDER BY table_name`)
 	return models, rows.Err()
 }
 
-func loadMySQLColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+func loadMySQLColumns(ctx context.Context, db sqlRunner, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT table_name, column_name, is_nullable, data_type, column_type, column_default, extra
 FROM information_schema.columns
@@ -1041,7 +1241,7 @@ ORDER BY table_name, ordinal_position`)
 	return rows.Err()
 }
 
-func loadMySQLPrimaryKeys(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+func loadMySQLPrimaryKeys(ctx context.Context, db sqlRunner, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT table_name, column_name
 FROM information_schema.key_column_usage
@@ -1080,7 +1280,7 @@ ORDER BY table_name, ordinal_position`)
 	return nil
 }
 
-func loadMySQLUniqueConstraints(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+func loadMySQLUniqueConstraints(ctx context.Context, db sqlRunner, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT tc.table_name, tc.constraint_name, kcu.column_name
 FROM information_schema.table_constraints tc
@@ -1128,7 +1328,7 @@ ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`)
 	return nil
 }
 
-func loadMySQLIndexes(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+func loadMySQLIndexes(ctx context.Context, db sqlRunner, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT table_name, index_name, column_name, seq_in_index
 FROM information_schema.statistics
@@ -1168,7 +1368,7 @@ ORDER BY table_name, index_name, seq_in_index`)
 	return nil
 }
 
-func loadMySQLForeignKeys(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+func loadMySQLForeignKeys(ctx context.Context, db sqlRunner, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT
   kcu.table_name,
@@ -1223,7 +1423,7 @@ ORDER BY kcu.table_name, kcu.constraint_name, kcu.ordinal_position`)
 	return nil
 }
 
-func loadSQLiteTables(ctx context.Context, db *sql.DB) (map[string]*ir.Model, error) {
+func loadSQLiteTables(ctx context.Context, db sqlRunner) (map[string]*ir.Model, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT name
 FROM sqlite_master
@@ -1249,7 +1449,7 @@ ORDER BY name`)
 	return models, rows.Err()
 }
 
-func loadSQLiteColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Model, targetSchema *ir.Schema) error {
+func loadSQLiteColumns(ctx context.Context, db sqlRunner, models map[string]*ir.Model, targetSchema *ir.Schema) error {
 	for tableName, model := range models {
 		autoIncrementColumns, err := loadSQLiteAutoIncrementColumns(ctx, db, tableName)
 		if err != nil {
@@ -1257,48 +1457,47 @@ func loadSQLiteColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Mo
 		}
 		targetModel := findSQLiteTargetModel(targetSchema, tableName)
 
-		rows, err := db.QueryContext(ctx, `SELECT cid, name, type, "notnull", dflt_value, pk FROM pragma_table_info(?)`, tableName)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var cid int
-			var columnName, dataType string
-			var notNull, pk int
-			var defaultValue sql.NullString
-			if err := rows.Scan(&cid, &columnName, &dataType, &notNull, &defaultValue, &pk); err != nil {
-				_ = rows.Close()
+		if err := func() error {
+			rows, err := db.QueryContext(ctx, `SELECT cid, name, type, "notnull", dflt_value, pk FROM pragma_table_info(?)`, tableName)
+			if err != nil {
 				return err
 			}
-			targetField := findSQLiteTargetField(targetModel, columnName)
-			scalarType := sqliteScalarTypeForTarget(dataType, targetField)
-			def := sqliteDefaultValueForScalar(defaultValue.String, scalarType)
-			if pk > 0 && autoIncrementColumns[columnName] {
-				def = &ir.DefaultValue{IsFunction: true, FuncName: "autoincrement"}
-			}
-			field := &ir.Field{
-				Name:       columnName,
-				DBName:     columnName,
-				Type:       ir.FieldKindScalar,
-				ScalarType: scalarType,
-				IsList:     targetField != nil && targetField.IsList && sqliteTypeCompatibleWithTarget(dataType, targetField),
-				IsOptional: notNull == 0 && pk == 0,
-				IsID:       pk > 0,
-				Default:    def,
-			}
-			model.Fields = append(model.Fields, field)
-			if pk > 0 {
-				if model.PrimaryKey == nil {
-					model.PrimaryKey = &ir.PrimaryKey{}
+			defer rows.Close()
+
+			for rows.Next() {
+				var cid int
+				var columnName, dataType string
+				var notNull, pk int
+				var defaultValue sql.NullString
+				if err := rows.Scan(&cid, &columnName, &dataType, &notNull, &defaultValue, &pk); err != nil {
+					return err
 				}
-				model.PrimaryKey.Fields = append(model.PrimaryKey.Fields, columnName)
+				targetField := findSQLiteTargetField(targetModel, columnName)
+				scalarType := sqliteScalarTypeForTarget(dataType, targetField)
+				def := sqliteDefaultValueForScalar(defaultValue.String, scalarType)
+				if pk > 0 && autoIncrementColumns[columnName] {
+					def = &ir.DefaultValue{IsFunction: true, FuncName: "autoincrement"}
+				}
+				field := &ir.Field{
+					Name:       columnName,
+					DBName:     columnName,
+					Type:       ir.FieldKindScalar,
+					ScalarType: scalarType,
+					IsList:     targetField != nil && targetField.IsList && sqliteTypeCompatibleWithTarget(dataType, targetField),
+					IsOptional: notNull == 0 && pk == 0,
+					IsID:       pk > 0,
+					Default:    def,
+				}
+				model.Fields = append(model.Fields, field)
+				if pk > 0 {
+					if model.PrimaryKey == nil {
+						model.PrimaryKey = &ir.PrimaryKey{}
+					}
+					model.PrimaryKey.Fields = append(model.PrimaryKey.Fields, columnName)
+				}
 			}
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return err
-		}
-		if err := rows.Close(); err != nil {
+			return rows.Err()
+		}(); err != nil {
 			return err
 		}
 		if model.PrimaryKey != nil {
@@ -1308,7 +1507,7 @@ func loadSQLiteColumns(ctx context.Context, db *sql.DB, models map[string]*ir.Mo
 	return nil
 }
 
-func loadSQLiteAutoIncrementColumns(ctx context.Context, db *sql.DB, tableName string) (map[string]bool, error) {
+func loadSQLiteAutoIncrementColumns(ctx context.Context, db sqlRunner, tableName string) (map[string]bool, error) {
 	var createSQL sql.NullString
 	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, tableName).Scan(&createSQL); err != nil {
 		return nil, err
@@ -1464,7 +1663,7 @@ func sqliteToSnakeCase(s string) string {
 	return string(result)
 }
 
-func loadSQLiteIndexes(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+func loadSQLiteIndexes(ctx context.Context, db sqlRunner, models map[string]*ir.Model) error {
 	type sqliteIndex struct {
 		name    string
 		unique  bool
@@ -1473,34 +1672,33 @@ func loadSQLiteIndexes(ctx context.Context, db *sql.DB, models map[string]*ir.Mo
 	}
 
 	for tableName, model := range models {
-		rows, err := db.QueryContext(ctx, `SELECT seq, name, "unique", origin, partial FROM pragma_index_list(?)`, tableName)
-		if err != nil {
-			return err
-		}
 		var indexes []sqliteIndex
-		for rows.Next() {
-			var seq int
-			var indexName, origin string
-			var unique, partial int
-			if err := rows.Scan(&seq, &indexName, &unique, &origin, &partial); err != nil {
-				_ = rows.Close()
+		if err := func() error {
+			rows, err := db.QueryContext(ctx, `SELECT seq, name, "unique", origin, partial FROM pragma_index_list(?)`, tableName)
+			if err != nil {
 				return err
 			}
-			if origin == "pk" {
-				continue
+			defer rows.Close()
+
+			for rows.Next() {
+				var seq int
+				var indexName, origin string
+				var unique, partial int
+				if err := rows.Scan(&seq, &indexName, &unique, &origin, &partial); err != nil {
+					return err
+				}
+				if origin == "pk" {
+					continue
+				}
+				indexes = append(indexes, sqliteIndex{
+					name:    indexName,
+					unique:  unique == 1,
+					origin:  origin,
+					partial: partial == 1,
+				})
 			}
-			indexes = append(indexes, sqliteIndex{
-				name:    indexName,
-				unique:  unique == 1,
-				origin:  origin,
-				partial: partial == 1,
-			})
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return err
-		}
-		if err := rows.Close(); err != nil {
+			return rows.Err()
+		}(); err != nil {
 			return err
 		}
 
@@ -1524,7 +1722,7 @@ func loadSQLiteIndexes(ctx context.Context, db *sql.DB, models map[string]*ir.Mo
 	return nil
 }
 
-func loadSQLiteIndexColumns(ctx context.Context, db *sql.DB, indexName string) ([]string, error) {
+func loadSQLiteIndexColumns(ctx context.Context, db sqlRunner, indexName string) ([]string, error) {
 	rows, err := db.QueryContext(ctx, `SELECT seqno, cid, name FROM pragma_index_info(?)`, indexName)
 	if err != nil {
 		return nil, err
@@ -1543,40 +1741,39 @@ func loadSQLiteIndexColumns(ctx context.Context, db *sql.DB, indexName string) (
 	return fields, rows.Err()
 }
 
-func loadSQLiteForeignKeys(ctx context.Context, db *sql.DB, models map[string]*ir.Model) error {
+func loadSQLiteForeignKeys(ctx context.Context, db sqlRunner, models map[string]*ir.Model) error {
 	for tableName, model := range models {
-		rows, err := db.QueryContext(ctx, `SELECT id, seq, "table", "from", "to", on_update, on_delete, match FROM pragma_foreign_key_list(?)`, tableName)
-		if err != nil {
-			return err
-		}
 		grouped := map[int]*ir.Relation{}
-		for rows.Next() {
-			var id, seq int
-			var refTable, fromColumn, toColumn, onUpdate, onDelete, match string
-			if err := rows.Scan(&id, &seq, &refTable, &fromColumn, &toColumn, &onUpdate, &onDelete, &match); err != nil {
-				_ = rows.Close()
+		if err := func() error {
+			rows, err := db.QueryContext(ctx, `SELECT id, seq, "table", "from", "to", on_update, on_delete, match FROM pragma_foreign_key_list(?)`, tableName)
+			if err != nil {
 				return err
 			}
-			rel := grouped[id]
-			if rel == nil {
-				rel = &ir.Relation{
-					Name:           fmt.Sprintf("fk_%s_%s", tableName, fromColumn),
-					ConstraintName: fmt.Sprintf("fk_%s_%s", tableName, fromColumn),
-					FromModel:      tableName,
-					ToModel:        refTable,
-					OnDelete:       onDelete,
-					OnUpdate:       onUpdate,
+			defer rows.Close()
+
+			for rows.Next() {
+				var id, seq int
+				var refTable, fromColumn, toColumn, onUpdate, onDelete, match string
+				if err := rows.Scan(&id, &seq, &refTable, &fromColumn, &toColumn, &onUpdate, &onDelete, &match); err != nil {
+					return err
 				}
-				grouped[id] = rel
+				rel := grouped[id]
+				if rel == nil {
+					rel = &ir.Relation{
+						Name:           fmt.Sprintf("fk_%s_%s", tableName, fromColumn),
+						ConstraintName: fmt.Sprintf("fk_%s_%s", tableName, fromColumn),
+						FromModel:      tableName,
+						ToModel:        refTable,
+						OnDelete:       onDelete,
+						OnUpdate:       onUpdate,
+					}
+					grouped[id] = rel
+				}
+				rel.Fields = append(rel.Fields, fromColumn)
+				rel.References = append(rel.References, toColumn)
 			}
-			rel.Fields = append(rel.Fields, fromColumn)
-			rel.References = append(rel.References, toColumn)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return err
-		}
-		if err := rows.Close(); err != nil {
+			return rows.Err()
+		}(); err != nil {
 			return err
 		}
 		keys := make([]int, 0, len(grouped))

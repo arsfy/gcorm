@@ -238,6 +238,30 @@ ALTER TABLE "users" ADD COLUMN "name" TEXT;
 	}
 }
 
+func TestSplitStatementsIgnoresSemicolonsInsideSQLSyntax(t *testing.T) {
+	stmts, unsupported := splitStatements(`
+CREATE TABLE "users" (
+  "id" INTEGER NOT NULL,
+  "note" TEXT NOT NULL DEFAULT 'a;b'
+);
+/* block comment with ; */
+CREATE INDEX "idx_users_note" ON "users" ("note");
+CREATE TABLE "events" ("payload" TEXT DEFAULT $$a;b$$);
+`)
+	if len(unsupported) != 0 {
+		t.Fatalf("len(unsupported) = %d, want 0: %v", len(unsupported), unsupported)
+	}
+	if len(stmts) != 3 {
+		t.Fatalf("len(stmts) = %d, want 3: %#v", len(stmts), stmts)
+	}
+	if !strings.Contains(stmts[0], `DEFAULT 'a;b'`) {
+		t.Fatalf("first statement lost string default: %q", stmts[0])
+	}
+	if !strings.Contains(stmts[2], `$$a;b$$`) {
+		t.Fatalf("third statement lost dollar-quoted default: %q", stmts[2])
+	}
+}
+
 func TestRiskyChanges(t *testing.T) {
 	cs := &migrate.Changeset{
 		Changes: []migrate.Change{
