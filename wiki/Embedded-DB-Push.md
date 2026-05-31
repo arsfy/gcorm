@@ -104,8 +104,15 @@ On every run, `dbpush.Push`:
 4. Computes a diff from the live database to the target schema.
 5. Refuses destructive or review-required changes unless
    `AllowDestructive` is true.
-6. Executes supported SQL in a transaction.
+6. Executes supported SQL. PostgreSQL and SQLite use a transaction.
 7. Records a row in `__gco_schema_pushes`.
+
+For MySQL, DDL statements are not atomic. MySQL implicitly commits most DDL, so
+a multi-statement push can partially apply if a later statement fails. In that
+case, inspect the database state and rerun `Push` or repair it manually before
+continuing the deployment. On MySQL execution failures, `Push` may return both
+an error and a non-nil `Result`; check `Result.AppliedStatements` to see which
+user DDL statements completed before the error.
 
 If the live database already matches the embedded schema, the result has
 `Noop=true`, no user schema SQL is executed, and a noop metadata row is still
@@ -168,6 +175,8 @@ database to the embedded schema.
 - Locks are enabled by default. Use `DisableLock=true` only for single-process
   test workflows where external serialization is already guaranteed.
 - Keep `AllowDestructive=false` by default.
+- Treat MySQL push failures as potentially partial because MySQL DDL is not
+  transactional.
 - Use a separate database credential with DDL permissions for the migrator.
 - Keep application runtime credentials more restrictive when possible.
 - Back up important databases before applying schema changes.

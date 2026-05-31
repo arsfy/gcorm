@@ -262,6 +262,58 @@ CREATE TABLE "events" ("payload" TEXT DEFAULT $$a;b$$);
 	}
 }
 
+func TestSplitStatementsKeepsCommentMarkersInsideStrings(t *testing.T) {
+	stmts, unsupported := splitStatements(`
+CREATE TABLE "notes" (
+  "id" INTEGER NOT NULL,
+  "body" TEXT DEFAULT 'line1
+-- not a comment
+line2'
+);
+`)
+	if len(unsupported) != 0 {
+		t.Fatalf("len(unsupported) = %d, want 0: %v", len(unsupported), unsupported)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("len(stmts) = %d, want 1: %#v", len(stmts), stmts)
+	}
+	if !strings.Contains(stmts[0], "-- not a comment") {
+		t.Fatalf("statement lost string content: %q", stmts[0])
+	}
+}
+
+func TestSplitStatementsIgnoresSemicolonsAfterBackslashEscapedQuotes(t *testing.T) {
+	stmts, unsupported := splitStatements(`
+CREATE TABLE "notes" ("body" TEXT DEFAULT E'it\'s;a;note');
+CREATE TABLE "users" ("id" INTEGER NOT NULL);
+`)
+	if len(unsupported) != 0 {
+		t.Fatalf("len(unsupported) = %d, want 0: %v", len(unsupported), unsupported)
+	}
+	if len(stmts) != 2 {
+		t.Fatalf("len(stmts) = %d, want 2: %#v", len(stmts), stmts)
+	}
+	if !strings.Contains(stmts[0], `E'it\'s;a;note'`) {
+		t.Fatalf("first statement lost escaped string default: %q", stmts[0])
+	}
+}
+
+func TestSplitStatementsRemovesTopLevelBlockComments(t *testing.T) {
+	stmts, unsupported := splitStatements(`
+/* generated comment with ; */
+CREATE /* inline comment */ TABLE "users" ("id" INTEGER NOT NULL);
+`)
+	if len(unsupported) != 0 {
+		t.Fatalf("len(unsupported) = %d, want 0: %v", len(unsupported), unsupported)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("len(stmts) = %d, want 1: %#v", len(stmts), stmts)
+	}
+	if strings.Contains(stmts[0], "comment") {
+		t.Fatalf("statement kept block comment: %q", stmts[0])
+	}
+}
+
 func TestStatementSummaryRedactsValues(t *testing.T) {
 	stmt := `ALTER TABLE "users" ADD COLUMN "api_key" TEXT DEFAULT 'internal_api_key_xxx';`
 	got := statementSummary(stmt)
@@ -687,6 +739,9 @@ model User {
 	if result.Noop || result.ChangeCount == 0 || len(result.Statements) == 0 {
 		t.Fatalf("initial Push() result = %#v, want applied changes", result)
 	}
+	if len(result.AppliedStatements) != len(result.Statements) {
+		t.Fatalf("initial applied statements = %d, want %d", len(result.AppliedStatements), len(result.Statements))
+	}
 
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'User'`).Scan(&count); err != nil {
@@ -712,6 +767,9 @@ model User {
 	}
 	if !noop.Noop || noop.ChangeCount != 0 {
 		t.Fatalf("second Push() result = %#v, want noop", noop)
+	}
+	if len(noop.AppliedStatements) != 0 {
+		t.Fatalf("noop applied statements = %d, want 0", len(noop.AppliedStatements))
 	}
 	if err := db.QueryRow(`SELECT COUNT(*) FROM __gco_schema_pushes`).Scan(&count); err != nil {
 		t.Fatal(err)
@@ -743,6 +801,9 @@ model User {
 	}
 	if updated.Noop || updated.ChangeCount == 0 {
 		t.Fatalf("updated Push() result = %#v, want applied change", updated)
+	}
+	if len(updated.AppliedStatements) != len(updated.Statements) {
+		t.Fatalf("updated applied statements = %d, want %d", len(updated.AppliedStatements), len(updated.Statements))
 	}
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('User') WHERE name = 'name'`).Scan(&count); err != nil {
 		t.Fatal(err)

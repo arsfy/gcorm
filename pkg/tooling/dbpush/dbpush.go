@@ -3,6 +3,7 @@ package dbpush
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net"
@@ -48,16 +49,20 @@ type Options struct {
 
 // Result summarizes a db push operation.
 type Result struct {
-	Provider    string
-	SchemaHash  string
-	ModelCount  int
-	ChangeCount int
-	Statements  []string
-	Noop        bool
+	Provider          string
+	SchemaHash        string
+	ModelCount        int
+	ChangeCount       int
+	Statements        []string
+	AppliedStatements []string
+	Noop              bool
 }
 
 // Push compiles embedded .gcorm schema files, compares them to the live
-// database, and applies the generated DDL.
+// database, and applies the generated DDL. PostgreSQL and SQLite apply
+// executable DDL in a transaction. MySQL DDL is not atomic: if one statement in
+// a multi-statement push fails, earlier MySQL DDL statements may already be
+// committed by the server.
 func Push(ctx context.Context, db *sql.DB, opts Options) (*Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -126,12 +131,9 @@ func Run(args []string) error {
 		return err
 	}
 
-	provider := "postgresql"
-	if targetSchema.Datasource != nil && targetSchema.Datasource.Provider != "" {
-		provider = targetSchema.Datasource.Provider
-	}
-	if !isSupportedProvider(provider) {
-		return fmt.Errorf("db push supports postgresql, mysql, and sqlite; got %q", provider)
+	provider, err := detectProvider(targetSchema)
+	if err != nil {
+		return err
 	}
 
 	db, err := sql.Open(driverName(provider), dsn)
@@ -165,12 +167,9 @@ func Run(args []string) error {
 }
 
 func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, schemaHash, dsn string, opts Options) (*Result, error) {
-	provider := "postgresql"
-	if targetSchema.Datasource != nil && targetSchema.Datasource.Provider != "" {
-		provider = targetSchema.Datasource.Provider
-	}
-	if !isSupportedProvider(provider) {
-		return nil, fmt.Errorf("db push supports postgresql, mysql, and sqlite; got %q", provider)
+	provider, err := detectProvider(targetSchema)
+	if err != nil {
+		return nil, err
 	}
 	if err := validateNoInternalTableConflict(targetSchema); err != nil {
 		return nil, err
@@ -244,6 +243,7 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit transaction: %w", err)
 	}
+	result.AppliedStatements = append(result.AppliedStatements, stmts...)
 
 	return result, nil
 }
@@ -265,8 +265,8 @@ func pushCompiledMySQL(ctx context.Context, db *sql.DB, targetSchema *ir.Schema,
 	defer func() {
 		if locked {
 			unlockErr := releaseMySQLPushLock(ctx, conn)
-			if err == nil && unlockErr != nil {
-				err = unlockErr
+			if unlockErr != nil {
+				err = errors.Join(err, unlockErr)
 			}
 		}
 	}()
@@ -318,22 +318,20 @@ func pushCompiledMySQL(ctx context.Context, db *sql.DB, targetSchema *ir.Schema,
 	}
 	for _, stmt := range stmts {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
-			return nil, fmt.Errorf("execute SQL %s: %w", statementSummary(stmt), err)
+			return result, fmt.Errorf("execute SQL %s after applying %d MySQL statement(s); earlier DDL may be committed: %w", statementSummary(stmt), len(result.AppliedStatements), err)
 		}
+		result.AppliedStatements = append(result.AppliedStatements, stmt)
 	}
 	if err := insertSchemaPushRecord(ctx, conn, "mysql", schemaHash, len(targetSchema.Models), len(cs.Changes)); err != nil {
-		return nil, err
+		return result, fmt.Errorf("%w; MySQL DDL may already be committed", err)
 	}
 	return result, nil
 }
 
 func planWithoutIntrospection(targetSchema *ir.Schema, schemaHash string) (*Result, error) {
-	provider := "postgresql"
-	if targetSchema.Datasource != nil && targetSchema.Datasource.Provider != "" {
-		provider = targetSchema.Datasource.Provider
-	}
-	if !isSupportedProvider(provider) {
-		return nil, fmt.Errorf("db push supports postgresql, mysql, and sqlite; got %q", provider)
+	provider, err := detectProvider(targetSchema)
+	if err != nil {
+		return nil, err
 	}
 	if err := validateNoInternalTableConflict(targetSchema); err != nil {
 		return nil, err
@@ -432,6 +430,17 @@ func resolveURL(explicitURL string, schema *ir.Schema) (string, string, error) {
 		modelCount = len(schema.Models)
 	}
 	return "", "", fmt.Errorf("db push: schema compiled with %d model(s). Push to database requires a connection URL.\nSet datasource url in your .gcorm schema or provide --url flag.", modelCount)
+}
+
+func detectProvider(schema *ir.Schema) (string, error) {
+	provider := "postgresql"
+	if schema != nil && schema.Datasource != nil && schema.Datasource.Provider != "" {
+		provider = schema.Datasource.Provider
+	}
+	if !isSupportedProvider(provider) {
+		return "", fmt.Errorf("db push supports postgresql, mysql, and sqlite; got %q", provider)
+	}
+	return provider, nil
 }
 
 func isSupportedProvider(provider string) bool {
@@ -639,20 +648,9 @@ func splitStatements(sqlText string) ([]string, []string) {
 	var unsupported []string
 
 	for _, part := range parts {
-		lines := strings.Split(part, "\n")
-		var kept []string
-		for _, line := range lines {
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "" {
-				continue
-			}
-			if strings.HasPrefix(trimmed, "--") {
-				unsupported = append(unsupported, trimmed)
-				continue
-			}
-			kept = append(kept, line)
-		}
-		stmt := strings.TrimSpace(strings.Join(kept, "\n"))
+		cleaned, comments := stripTopLevelSQLComments(part)
+		unsupported = append(unsupported, comments...)
+		stmt := strings.TrimSpace(cleaned)
 		if stmt != "" {
 			stmts = append(stmts, stmt)
 		}
@@ -673,6 +671,11 @@ func splitSQLStatements(sqlText string) []string {
 		switch state {
 		case "single":
 			b.WriteByte(c)
+			if c == '\\' && i+1 < len(sqlText) {
+				i++
+				b.WriteByte(sqlText[i])
+				continue
+			}
 			if c == '\'' {
 				if i+1 < len(sqlText) && sqlText[i+1] == '\'' {
 					i++
@@ -683,6 +686,11 @@ func splitSQLStatements(sqlText string) []string {
 			}
 		case "double":
 			b.WriteByte(c)
+			if c == '\\' && i+1 < len(sqlText) {
+				i++
+				b.WriteByte(sqlText[i])
+				continue
+			}
 			if c == '"' {
 				if i+1 < len(sqlText) && sqlText[i+1] == '"' {
 					i++
@@ -766,6 +774,116 @@ func splitSQLStatements(sqlText string) []string {
 	}
 	parts = append(parts, b.String())
 	return parts
+}
+
+func stripTopLevelSQLComments(sqlText string) (string, []string) {
+	var b strings.Builder
+	var unsupported []string
+	state := "normal"
+	dollarTag := ""
+
+	for i := 0; i < len(sqlText); i++ {
+		c := sqlText[i]
+
+		switch state {
+		case "single":
+			b.WriteByte(c)
+			if c == '\\' && i+1 < len(sqlText) {
+				i++
+				b.WriteByte(sqlText[i])
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(sqlText) && sqlText[i+1] == '\'' {
+					i++
+					b.WriteByte(sqlText[i])
+					continue
+				}
+				state = "normal"
+			}
+		case "double":
+			b.WriteByte(c)
+			if c == '\\' && i+1 < len(sqlText) {
+				i++
+				b.WriteByte(sqlText[i])
+				continue
+			}
+			if c == '"' {
+				if i+1 < len(sqlText) && sqlText[i+1] == '"' {
+					i++
+					b.WriteByte(sqlText[i])
+					continue
+				}
+				state = "normal"
+			}
+		case "backtick":
+			b.WriteByte(c)
+			if c == '`' {
+				state = "normal"
+			}
+		case "bracket":
+			b.WriteByte(c)
+			if c == ']' {
+				state = "normal"
+			}
+		case "blockComment":
+			if c == '*' && i+1 < len(sqlText) && sqlText[i+1] == '/' {
+				i++
+				state = "normal"
+			}
+		case "dollar":
+			if dollarTag != "" && strings.HasPrefix(sqlText[i:], dollarTag) {
+				b.WriteString(dollarTag)
+				i += len(dollarTag) - 1
+				state = "normal"
+				dollarTag = ""
+				continue
+			}
+			b.WriteByte(c)
+		default:
+			switch {
+			case c == '\'':
+				b.WriteByte(c)
+				state = "single"
+			case c == '"':
+				b.WriteByte(c)
+				state = "double"
+			case c == '`':
+				b.WriteByte(c)
+				state = "backtick"
+			case c == '[':
+				b.WriteByte(c)
+				state = "bracket"
+			case c == '-' && i+1 < len(sqlText) && sqlText[i+1] == '-':
+				start := i
+				i += 2
+				for i < len(sqlText) && sqlText[i] != '\n' {
+					i++
+				}
+				unsupported = append(unsupported, strings.TrimSpace(sqlText[start:i]))
+				if i < len(sqlText) && sqlText[i] == '\n' {
+					b.WriteByte('\n')
+				}
+			case c == '/' && i+1 < len(sqlText) && sqlText[i+1] == '*':
+				i++
+				state = "blockComment"
+			case c == '$':
+				tag := readDollarQuoteTag(sqlText[i:])
+				if tag != "" {
+					b.WriteString(tag)
+					i += len(tag) - 1
+					dollarTag = tag
+					state = "dollar"
+					continue
+				}
+				b.WriteByte(c)
+			default:
+				b.WriteByte(c)
+			}
+		}
+	}
+
+	return b.String(), unsupported
 }
 
 func readDollarQuoteTag(s string) string {
