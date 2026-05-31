@@ -37,12 +37,13 @@ type sqlRunner interface {
 
 // Options configures an importable db push operation.
 type Options struct {
-	SchemaFS         fs.FS
-	SchemaRoot       string
-	DatabaseURL      string
-	AllowDestructive bool
-	Lock             bool
-	DryRun           bool
+	SchemaFS          fs.FS
+	SchemaRoot        string
+	DatabaseURL       string
+	AllowDestructive  bool
+	DisableLock       bool
+	DryRun            bool
+	SkipIntrospection bool
 }
 
 // Result summarizes a db push operation.
@@ -61,9 +62,6 @@ func Push(ctx context.Context, db *sql.DB, opts Options) (*Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if db == nil {
-		return nil, fmt.Errorf("db push: nil database")
-	}
 	if opts.SchemaFS == nil {
 		return nil, fmt.Errorf("db push: SchemaFS is required")
 	}
@@ -71,6 +69,15 @@ func Push(ctx context.Context, db *sql.DB, opts Options) (*Result, error) {
 	loaded, err := schemautil.LoadFS(opts.SchemaFS, opts.SchemaRoot)
 	if err != nil {
 		return nil, err
+	}
+	if opts.SkipIntrospection {
+		if !opts.DryRun {
+			return nil, fmt.Errorf("db push: SkipIntrospection requires DryRun")
+		}
+		return planWithoutIntrospection(loaded.Schema, loaded.Hash)
+	}
+	if db == nil {
+		return nil, fmt.Errorf("db push: nil database")
 	}
 	dsn, _, err := resolveURL(opts.DatabaseURL, loaded.Schema)
 	if err != nil {
@@ -141,7 +148,6 @@ func Run(args []string) error {
 	result, err := pushCompiled(ctx, db, targetSchema, loaded.Hash, dsn, Options{
 		DatabaseURL:      explicitURL,
 		AllowDestructive: force,
-		Lock:             true,
 	})
 	if err != nil {
 		return err
@@ -187,7 +193,10 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 	}
 	if len(cs.Changes) == 0 {
 		result.Noop = true
-		return result, nil
+		if opts.DryRun {
+			return result, nil
+		}
+		return recordNoopPush(ctx, db, provider, schemaHash, len(targetSchema.Models), opts)
 	}
 
 	risky := riskyChanges(cs)
@@ -215,7 +224,7 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 	}
 	defer tx.Rollback()
 
-	if opts.Lock {
+	if !opts.DisableLock {
 		if err := lockPushTransaction(ctx, tx, provider); err != nil {
 			return nil, err
 		}
@@ -247,7 +256,7 @@ func pushCompiledMySQL(ctx context.Context, db *sql.DB, targetSchema *ir.Schema,
 	defer conn.Close()
 
 	locked := false
-	if opts.Lock {
+	if !opts.DisableLock {
 		if err := acquireMySQLPushLock(ctx, conn); err != nil {
 			return nil, err
 		}
@@ -276,6 +285,15 @@ func pushCompiledMySQL(ctx context.Context, db *sql.DB, targetSchema *ir.Schema,
 	}
 	if len(cs.Changes) == 0 {
 		result.Noop = true
+		if opts.DryRun {
+			return result, nil
+		}
+		if err := ensureSchemaPushesTable(ctx, conn, "mysql"); err != nil {
+			return nil, err
+		}
+		if err := insertSchemaPushRecord(ctx, conn, "mysql", schemaHash, len(targetSchema.Models), 0); err != nil {
+			return nil, err
+		}
 		return result, nil
 	}
 
@@ -307,6 +325,69 @@ func pushCompiledMySQL(ctx context.Context, db *sql.DB, targetSchema *ir.Schema,
 		return nil, err
 	}
 	return result, nil
+}
+
+func planWithoutIntrospection(targetSchema *ir.Schema, schemaHash string) (*Result, error) {
+	provider := "postgresql"
+	if targetSchema.Datasource != nil && targetSchema.Datasource.Provider != "" {
+		provider = targetSchema.Datasource.Provider
+	}
+	if !isSupportedProvider(provider) {
+		return nil, fmt.Errorf("db push supports postgresql, mysql, and sqlite; got %q", provider)
+	}
+	if err := validateNoInternalTableConflict(targetSchema); err != nil {
+		return nil, err
+	}
+
+	cs := migrate.Diff(nil, targetSchema)
+	result := &Result{
+		Provider:    provider,
+		SchemaHash:  schemaHash,
+		ModelCount:  len(targetSchema.Models),
+		ChangeCount: len(cs.Changes),
+		Noop:        len(cs.Changes) == 0,
+	}
+	if len(cs.Changes) == 0 {
+		return result, nil
+	}
+
+	gen := migrate.DDLGenerator{Dialect: provider, Schema: targetSchema}
+	stmts, unsupported := splitStatements(gen.GenerateUp(cs))
+	if len(unsupported) > 0 {
+		return nil, fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
+	}
+	result.Statements = append(result.Statements, stmts...)
+	return result, nil
+}
+
+func recordNoopPush(ctx context.Context, db *sql.DB, provider, schemaHash string, modelCount int, opts Options) (*Result, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if !opts.DisableLock {
+		if err := lockPushTransaction(ctx, tx, provider); err != nil {
+			return nil, err
+		}
+	}
+	if err := ensureSchemaPushesTable(ctx, tx, provider); err != nil {
+		return nil, err
+	}
+	if err := insertSchemaPushRecord(ctx, tx, provider, schemaHash, modelCount, 0); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit transaction: %w", err)
+	}
+	return &Result{
+		Provider:    provider,
+		SchemaHash:  schemaHash,
+		ModelCount:  modelCount,
+		ChangeCount: 0,
+		Noop:        true,
+	}, nil
 }
 
 func resolveURL(explicitURL string, schema *ir.Schema) (string, string, error) {

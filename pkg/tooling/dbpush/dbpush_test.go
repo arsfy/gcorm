@@ -680,7 +680,6 @@ model User {
 		SchemaFS:    initialFS,
 		SchemaRoot:  "schema",
 		DatabaseURL: dsn,
-		Lock:        true,
 	})
 	if err != nil {
 		t.Fatalf("Push() error = %v", err)
@@ -707,7 +706,6 @@ model User {
 		SchemaFS:    initialFS,
 		SchemaRoot:  "schema",
 		DatabaseURL: dsn,
-		Lock:        true,
 	})
 	if err != nil {
 		t.Fatalf("second Push() error = %v", err)
@@ -718,8 +716,8 @@ model User {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM __gco_schema_pushes`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("metadata row count after noop = %d, want 1", count)
+	if count != 2 {
+		t.Fatalf("metadata row count after noop = %d, want 2", count)
 	}
 
 	updatedFS := fstest.MapFS{
@@ -739,7 +737,6 @@ model User {
 		SchemaFS:    updatedFS,
 		SchemaRoot:  "schema",
 		DatabaseURL: dsn,
-		Lock:        true,
 	})
 	if err != nil {
 		t.Fatalf("updated Push() error = %v", err)
@@ -756,8 +753,8 @@ model User {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM __gco_schema_pushes`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 {
-		t.Fatalf("metadata row count after update = %d, want 2", count)
+	if count != 3 {
+		t.Fatalf("metadata row count after update = %d, want 3", count)
 	}
 
 	hashRows, err := db.Query(`SELECT schema_hash FROM __gco_schema_pushes ORDER BY id`)
@@ -776,10 +773,13 @@ model User {
 	if err := hashRows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if len(hashes) != 2 {
-		t.Fatalf("schema hash count = %d, want 2", len(hashes))
+	if len(hashes) != 3 {
+		t.Fatalf("schema hash count = %d, want 3", len(hashes))
 	}
-	if hashes[0] == hashes[1] {
+	if hashes[0] != hashes[1] {
+		t.Fatalf("noop push should record the same schema hash: %v", hashes)
+	}
+	if hashes[0] == hashes[2] {
 		t.Fatalf("schema hashes should differ after schema change: %v", hashes)
 	}
 }
@@ -833,6 +833,57 @@ model User {
 	}
 	if count != 0 {
 		t.Fatalf("metadata table count = %d, want 0", count)
+	}
+}
+
+func TestPushEmbeddedDryRunSkipIntrospectionPlansWithoutDatabase(t *testing.T) {
+	schemaFS := fstest.MapFS{
+		"schema/main.gcorm": {Data: []byte(`datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id    String @id
+  email String @unique
+}
+`)},
+	}
+
+	result, err := Push(context.Background(), nil, Options{
+		SchemaFS:          schemaFS,
+		SchemaRoot:        "schema",
+		DryRun:            true,
+		SkipIntrospection: true,
+	})
+	if err != nil {
+		t.Fatalf("Push() error = %v", err)
+	}
+	if result.Noop || result.ChangeCount == 0 || len(result.Statements) == 0 {
+		t.Fatalf("dry-run local result = %#v, want planned init statements", result)
+	}
+}
+
+func TestPushEmbeddedSkipIntrospectionRequiresDryRun(t *testing.T) {
+	schemaFS := fstest.MapFS{
+		"schema/main.gcorm": {Data: []byte(`datasource db {
+  provider = "sqlite"
+  url      = "file:test.db"
+}
+
+model User {
+  id String @id
+}
+`)},
+	}
+
+	_, err := Push(context.Background(), nil, Options{
+		SchemaFS:          schemaFS,
+		SchemaRoot:        "schema",
+		SkipIntrospection: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "SkipIntrospection requires DryRun") {
+		t.Fatalf("Push() error = %v, want SkipIntrospection/DryRun validation", err)
 	}
 }
 

@@ -69,7 +69,6 @@ func main() {
 		SchemaFS:         schemaFS,
 		SchemaRoot:       "schema",
 		DatabaseURL:      dsn,
-		Lock:             true,
 		AllowDestructive: false,
 	})
 	if err != nil {
@@ -106,15 +105,15 @@ On every run, `dbpush.Push`:
 5. Refuses destructive or review-required changes unless
    `AllowDestructive` is true.
 6. Executes supported SQL in a transaction.
-7. Records a row in `__gco_schema_pushes` after a successful non-noop push.
+7. Records a row in `__gco_schema_pushes`.
 
 If the live database already matches the embedded schema, the result has
-`Noop=true` and no SQL is executed.
+`Noop=true`, no user schema SQL is executed, and a noop metadata row is still
+recorded.
 
 ## Metadata Table
 
-Successful non-noop pushes create and write to `__gco_schema_pushes`. The table
-stores:
+Successful pushes create and write to `__gco_schema_pushes`. The table stores:
 
 - Schema hash.
 - Provider.
@@ -143,12 +142,31 @@ result, err := dbpush.Push(ctx, db, dbpush.Options{
 ```
 
 `DryRun` does not create user tables and does not write `__gco_schema_pushes`.
+By default it still introspects the live database so the plan reflects current
+database state. On large databases, this can run catalog queries over tables,
+columns, indexes, and foreign keys.
+
+For a pure local initialization plan that does not touch the database, combine
+`DryRun` with `SkipIntrospection`:
+
+```go
+result, err := dbpush.Push(ctx, nil, dbpush.Options{
+	SchemaFS:          schemaFS,
+	SchemaRoot:        "schema",
+	DryRun:            true,
+	SkipIntrospection: true,
+})
+```
+
+`SkipIntrospection` is only valid with `DryRun`; it plans SQL from an empty
+database to the embedded schema.
 
 ## Production Guidance
 
 - Run embedded DB Push from one explicit migrator job or admin command, not
   from every web worker automatically.
-- Keep `Lock=true` for production use.
+- Locks are enabled by default. Use `DisableLock=true` only for single-process
+  test workflows where external serialization is already guaranteed.
 - Keep `AllowDestructive=false` by default.
 - Use a separate database credential with DDL permissions for the migrator.
 - Keep application runtime credentials more restrictive when possible.
