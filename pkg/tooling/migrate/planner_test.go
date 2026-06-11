@@ -323,6 +323,59 @@ func TestDiff_IndexSignatureNormalizesPostgreSQLDefaults(t *testing.T) {
 	}
 }
 
+func TestDiff_IndexSignatureNormalizesPostgreSQLTextLiteralCasts(t *testing.T) {
+	oldOrder := testModel(
+		"Order",
+		testField("id", "String"),
+		testField("user", "BigInt"),
+		testField("name", "String"),
+		testField("status", "SmallInt"),
+		testField("orderPrice", "BigInt"),
+		testField("createTime", "DateTime"),
+	)
+	oldOrder.DBName = "orders"
+	oldOrder.Fields[4].DBName = "order_price"
+	oldOrder.Fields[5].DBName = "create_time"
+	oldOrder.Indexes = []*ir.Index{{
+		Name:   "idx_orders_add_funds_reuse",
+		Fields: []string{"user", "order_price", "create_time"},
+		Where:  "((status = 0) AND (name = 'Add Funds'::text))",
+		Columns: []ir.IndexColumn{
+			{Field: "user"},
+			{Field: "order_price"},
+			{Field: "create_time", Sort: "DESC", Nulls: "LAST"},
+		},
+	}}
+
+	newOrder := testModel(
+		"Order",
+		testField("id", "String"),
+		testField("user", "BigInt"),
+		testField("name", "String"),
+		testField("status", "SmallInt"),
+		testField("orderPrice", "BigInt"),
+		testField("createTime", "DateTime"),
+	)
+	newOrder.DBName = "orders"
+	newOrder.Fields[4].DBName = "order_price"
+	newOrder.Fields[5].DBName = "create_time"
+	newOrder.Indexes = []*ir.Index{{
+		Name:   "idx_orders_add_funds_reuse",
+		Fields: []string{"user", "orderPrice", "createTime"},
+		Where:  "status = 0 AND name = 'Add Funds'",
+		Columns: []ir.IndexColumn{
+			{Field: "user", Sort: "ASC", Nulls: "LAST", OpClass: "int8_ops"},
+			{Field: "orderPrice", Sort: "ASC", Nulls: "LAST", OpClass: "int8_ops"},
+			{Field: "createTime", Sort: "DESC", Nulls: "LAST", OpClass: "timestamptz_ops"},
+		},
+	}}
+
+	cs := Diff(testSchema(oldOrder), testSchema(newOrder))
+	if len(cs.Changes) != 0 {
+		t.Fatalf("expected PostgreSQL text literal casts in partial index predicate to be stable, got: %+v", cs.Changes)
+	}
+}
+
 func TestDiff_DefaultIndexNameMatchesIntrospectedIndex(t *testing.T) {
 	oldPost := testModel("Post", testField("id", "Int"), testField("change", "String"))
 	oldPost.DBName = "posts"

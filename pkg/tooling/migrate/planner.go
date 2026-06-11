@@ -294,7 +294,134 @@ func normalizeIndexPredicate(where string) string {
 		}
 		where = next
 	}
+	where = stripPostgresTextLiteralCasts(where)
 	return strings.Join(strings.Fields(where), " ")
+}
+
+func stripPostgresTextLiteralCasts(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] != '\'' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+
+		for {
+			b.WriteByte(s[i])
+			i++
+			if i >= len(s) {
+				return b.String()
+			}
+			if s[i-1] != '\'' {
+				continue
+			}
+			if i < len(s) && s[i] == '\'' {
+				b.WriteByte(s[i])
+				i++
+				continue
+			}
+			break
+		}
+
+		if !strings.HasPrefix(s[i:], "::") {
+			continue
+		}
+		castStart := i + 2
+		castEnd := postgresCastTypeEnd(s, castStart)
+		if castEnd == castStart {
+			continue
+		}
+		if isPostgresTextLikeCast(s[castStart:castEnd]) {
+			i = castEnd
+		}
+	}
+	return b.String()
+}
+
+func postgresCastTypeEnd(s string, start int) int {
+	if hasCaseInsensitivePrefix(s[start:], "character varying") && isCastBoundary(s, start+len("character varying")) {
+		return start + len("character varying")
+	}
+
+	i := start
+	for {
+		next := postgresIdentifierEnd(s, i)
+		if next == i {
+			break
+		}
+		i = next
+		if i >= len(s) || s[i] != '.' {
+			break
+		}
+		i++
+	}
+	if i < len(s) && s[i] == '(' {
+		if end := matchingParenIndex(s, i); end != -1 {
+			i = end + 1
+		}
+	}
+	if strings.HasPrefix(s[i:], "[]") {
+		i += 2
+	}
+	return i
+}
+
+func postgresIdentifierEnd(s string, start int) int {
+	if start >= len(s) {
+		return start
+	}
+	if s[start] == '"' {
+		for i := start + 1; i < len(s); i++ {
+			if s[i] != '"' {
+				continue
+			}
+			if i+1 < len(s) && s[i+1] == '"' {
+				i++
+				continue
+			}
+			return i + 1
+		}
+		return start
+	}
+	i := start
+	for i < len(s) {
+		r := rune(s[i])
+		if !(r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			break
+		}
+		i++
+	}
+	return i
+}
+
+func isPostgresTextLikeCast(castType string) bool {
+	castType = strings.TrimSpace(castType)
+	castType = strings.ReplaceAll(castType, `"`, "")
+	castType = strings.Join(strings.Fields(castType), " ")
+	castType = strings.ToLower(castType)
+	castType = strings.TrimPrefix(castType, "pg_catalog.")
+	switch castType {
+	case "text", "varchar", "character varying", "bpchar", "char", "character", "name":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasCaseInsensitivePrefix(s, prefix string) bool {
+	if len(s) < len(prefix) {
+		return false
+	}
+	return strings.EqualFold(s[:len(prefix)], prefix)
+}
+
+func isCastBoundary(s string, idx int) bool {
+	if idx >= len(s) {
+		return true
+	}
+	r := rune(s[idx])
+	return !(r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r))
 }
 
 func stripSimplePredicateParens(s string) string {
