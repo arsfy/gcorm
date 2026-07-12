@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -101,6 +102,56 @@ func (m *mockExecutor) QueryRowContext(ctx context.Context, query string, args .
 // Compile-time check: mockExecutor satisfies Executor.
 var _ Executor = (*mockExecutor)(nil)
 
+func assertExecutorDelegates(t *testing.T, exec Executor, mock *mockExecutor) {
+	t.Helper()
+
+	ctx := context.Background()
+	wantRow := new(sql.Row)
+	execCalled := false
+	queryCalled := false
+	queryRowCalled := false
+
+	mock.execFn = func(gotCtx context.Context, query string, args ...any) (sql.Result, error) {
+		execCalled = true
+		if gotCtx != ctx || query != "EXEC" || !reflect.DeepEqual(args, []any{1, "two"}) {
+			t.Errorf("ExecContext delegation = (%v, %q, %#v)", gotCtx, query, args)
+		}
+		return fakeResult{}, nil
+	}
+	mock.queryFn = func(gotCtx context.Context, query string, args ...any) (*sql.Rows, error) {
+		queryCalled = true
+		if gotCtx != ctx || query != "QUERY" || !reflect.DeepEqual(args, []any{3}) {
+			t.Errorf("QueryContext delegation = (%v, %q, %#v)", gotCtx, query, args)
+		}
+		return nil, nil
+	}
+	mock.queryRowFn = func(gotCtx context.Context, query string, args ...any) *sql.Row {
+		queryRowCalled = true
+		if gotCtx != ctx || query != "ROW" || !reflect.DeepEqual(args, []any{4}) {
+			t.Errorf("QueryRowContext delegation = (%v, %q, %#v)", gotCtx, query, args)
+		}
+		return wantRow
+	}
+
+	result, err := exec.ExecContext(ctx, "EXEC", 1, "two")
+	if err != nil {
+		t.Fatalf("ExecContext() error = %v", err)
+	}
+	if _, ok := result.(fakeResult); !ok {
+		t.Fatalf("ExecContext() result = %T, want fakeResult", result)
+	}
+	rows, err := exec.QueryContext(ctx, "QUERY", 3)
+	if err != nil || rows != nil {
+		t.Fatalf("QueryContext() = (%v, %v), want (nil, nil)", rows, err)
+	}
+	if row := exec.QueryRowContext(ctx, "ROW", 4); row != wantRow {
+		t.Fatalf("QueryRowContext() = %p, want %p", row, wantRow)
+	}
+	if !execCalled || !queryCalled || !queryRowCalled {
+		t.Fatalf("delegate calls: exec=%v query=%v queryRow=%v", execCalled, queryCalled, queryRowCalled)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Mock dialect
 // ---------------------------------------------------------------------------
@@ -180,6 +231,17 @@ func TestDBExposesDialectAndExecutor(t *testing.T) {
 	}
 }
 
+func TestDBImplementsAndDelegatesExecutor(t *testing.T) {
+	rawDB := openFakeDB(t)
+	defer rawDB.Close()
+
+	mock := &mockExecutor{}
+	db := NewDB(rawDB, &mockDialect{name: "test"})
+	db.executor = mock
+
+	assertExecutorDelegates(t, db, mock)
+}
+
 func TestWithLoggerOption(t *testing.T) {
 	rawDB := openFakeDB(t)
 	defer rawDB.Close()
@@ -227,6 +289,22 @@ func TestTxCommitOnSuccess(t *testing.T) {
 	}
 	if !executed {
 		t.Error("transaction function was not executed")
+	}
+}
+
+func TestTxImplementsAndDelegatesExecutor(t *testing.T) {
+	rawDB := openFakeDB(t)
+	defer rawDB.Close()
+
+	db := NewDB(rawDB, &mockDialect{name: "test"})
+	err := db.Tx(context.Background(), func(tx *Tx) error {
+		mock := &mockExecutor{}
+		tx.executor = mock
+		assertExecutorDelegates(t, tx, mock)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Tx() error = %v", err)
 	}
 }
 

@@ -72,7 +72,7 @@ func FormatExpression(expr ast.Expression) string {
 	}
 	switch e := expr.(type) {
 	case ast.StringLiteral:
-		return "\"" + e.Value + "\""
+		return formatStringLiteral(e.Value)
 	case ast.NumberLiteral:
 		return e.Value
 	case ast.BooleanLiteral:
@@ -97,6 +97,28 @@ func FormatExpression(expr ast.Expression) string {
 	default:
 		return ""
 	}
+}
+
+func formatStringLiteral(value string) string {
+	var b strings.Builder
+	b.Grow(len(value) + 2)
+	b.WriteByte('"')
+	for _, r := range value {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 func formatDatasource(d ast.DatasourceDecl) string {

@@ -684,3 +684,31 @@ func TestParseNativeTypeAttribute(t *testing.T) {
 		t.Errorf("number value = %q, want %q", nl.Value, "255")
 	}
 }
+
+func TestParseNegativeNumberDefaults(t *testing.T) {
+	src := `model Metric {
+  delta Int   @default(-1)
+  ratio Float @default(-0.5)
+}`
+	doc, err := Parse("test.gcorm", []byte(src))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []struct {
+		value   string
+		isFloat bool
+	}{
+		{value: "-1", isFloat: false},
+		{value: "-0.5", isFloat: true},
+	}
+	for i, field := range doc.Models[0].Fields {
+		number, ok := field.Attributes[0].Args[0].Value.(ast.NumberLiteral)
+		if !ok {
+			t.Fatalf("field %q default = %T, want ast.NumberLiteral", field.Name, field.Attributes[0].Args[0].Value)
+		}
+		if number.Value != want[i].value || number.IsFloat != want[i].isFloat {
+			t.Errorf("field %q default = %#v, want value %q isFloat=%v", field.Name, number, want[i].value, want[i].isFloat)
+		}
+	}
+}

@@ -186,6 +186,17 @@ func TestGenerate(t *testing.T) {
 	}
 }
 
+func TestRenderTemplateReturnsFormatError(t *testing.T) {
+	g := NewGenerator(testSchema())
+	_, err := g.renderTemplate("invalid", "package invalid-", nil)
+	if err == nil {
+		t.Fatal("renderTemplate() should report invalid generated Go source")
+	}
+	if !strings.Contains(err.Error(), "format generated template invalid") {
+		t.Fatalf("renderTemplate() error = %q", err)
+	}
+}
+
 func TestGenerateModelsContent(t *testing.T) {
 	s := testSchema()
 	g := NewGenerator(s)

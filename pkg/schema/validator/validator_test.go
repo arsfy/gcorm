@@ -423,6 +423,86 @@ func TestFieldNameUppercase(t *testing.T) {
 	requireErrors(t, r, "must start with a lowercase letter")
 }
 
+func TestUnicodeNamingUsesFirstRune(t *testing.T) {
+	t.Run("uppercase model and enum with lowercase field", func(t *testing.T) {
+		doc := &ast.Document{
+			Models: []ast.ModelDecl{{
+				Name: "Πρόσωπο",
+				Fields: []ast.FieldDecl{{
+					Name: "α",
+					Type: ast.FieldType{Name: "Int"},
+				}},
+			}},
+			Enums: []ast.EnumDecl{{
+				Name:   "Ρόλος",
+				Values: []ast.EnumValue{{Name: "ADMIN"}},
+			}},
+		}
+		requireNoErrors(t, Validate(doc))
+	})
+
+	t.Run("lowercase model", func(t *testing.T) {
+		doc := &ast.Document{Models: []ast.ModelDecl{{
+			Name:   "πρόσωπο",
+			Fields: []ast.FieldDecl{{Name: "id", Type: ast.FieldType{Name: "Int"}}},
+		}}}
+		requireErrors(t, Validate(doc), "must start with an uppercase letter")
+	})
+
+	t.Run("lowercase enum", func(t *testing.T) {
+		doc := &ast.Document{Enums: []ast.EnumDecl{{
+			Name:   "ρόλος",
+			Values: []ast.EnumValue{{Name: "ADMIN"}},
+		}}}
+		requireErrors(t, Validate(doc), "must start with an uppercase letter")
+	})
+}
+
+func TestModelEnumTypeNameConflict(t *testing.T) {
+	model := ast.ModelDecl{
+		Name:   "Role",
+		Fields: []ast.FieldDecl{{Name: "id", Type: ast.FieldType{Name: "Int"}}},
+	}
+	enum := ast.EnumDecl{
+		Name:   "Role",
+		Values: []ast.EnumValue{{Name: "ADMIN"}},
+	}
+
+	t.Run("single document", func(t *testing.T) {
+		r := Validate(&ast.Document{
+			Models: []ast.ModelDecl{model},
+			Enums:  []ast.EnumDecl{enum},
+		})
+		requireErrors(t, r, "both a model and an enum")
+	})
+
+	t.Run("document set", func(t *testing.T) {
+		r := ValidateDocumentSet(&ast.DocumentSet{Documents: []*ast.Document{
+			{Models: []ast.ModelDecl{model}},
+			{Enums: []ast.EnumDecl{enum}},
+		}})
+		requireErrors(t, r, "both a model and an enum")
+	})
+}
+
+func TestBuiltInScalarTypeNameConflict(t *testing.T) {
+	t.Run("model", func(t *testing.T) {
+		doc := &ast.Document{Models: []ast.ModelDecl{{
+			Name:   "String",
+			Fields: []ast.FieldDecl{{Name: "id", Type: ast.FieldType{Name: "Int"}}},
+		}}}
+		requireErrors(t, Validate(doc), `model name "String" conflicts with built-in scalar type`)
+	})
+
+	t.Run("enum", func(t *testing.T) {
+		doc := &ast.Document{Enums: []ast.EnumDecl{{
+			Name:   "Int",
+			Values: []ast.EnumValue{{Name: "ONE"}},
+		}}}
+		requireErrors(t, Validate(doc), `enum name "Int" conflicts with built-in scalar type`)
+	})
+}
+
 func TestIndexWithFieldReferences(t *testing.T) {
 	doc := &ast.Document{
 		Models: []ast.ModelDecl{{

@@ -94,8 +94,11 @@ func (l *Lexer) NextToken() Token {
 		return l.readString()
 	}
 
-	// Numbers
-	if r >= '0' && r <= '9' {
+	// Numbers, including a leading minus sign when it is immediately followed
+	// by a digit.
+	isDigit := r >= '0' && r <= '9'
+	hasLeadingMinus := r == '-' && l.offset+1 < len(l.src) && l.src[l.offset+1] >= '0' && l.src[l.offset+1] <= '9'
+	if isDigit || hasLeadingMinus {
 		return l.readNumber()
 	}
 
@@ -201,6 +204,9 @@ func (l *Lexer) readString() Token {
 func (l *Lexer) readNumber() Token {
 	pos := l.pos()
 	start := l.offset
+	if l.src[l.offset] == '-' {
+		l.advance()
+	}
 	for l.offset < len(l.src) {
 		r, _ := l.peek()
 		if r < '0' || r > '9' {

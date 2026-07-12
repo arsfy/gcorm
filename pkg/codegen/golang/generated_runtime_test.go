@@ -144,13 +144,13 @@ func init() {
 	sql.Register("capture_runtime", captureDriver{})
 }
 
-func openCaptureClient(t *testing.T) *client.Client {
+func openCaptureClient(t *testing.T, opts ...client.Option) *client.Client {
 	t.Helper()
 	db, err := sql.Open("capture_runtime", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return client.New(db)
+	return client.New(db, opts...)
 }
 
 func TestBulkCreateDoReturningValues(t *testing.T) {
@@ -213,6 +213,35 @@ func TestLikeWildcardsAreEscaped(t *testing.T) {
 	}
 }
 
+func TestSkipOnlyUsesDialectCompatibleLimit(t *testing.T) {
+	tests := []struct {
+		dialect string
+		want    string
+	}{
+		{"postgresql", "SELECT id, title, published, author_id FROM Post OFFSET 5"},
+		{"mysql", "SELECT id, title, published, author_id FROM Post LIMIT 18446744073709551615 OFFSET 5"},
+		{"sqlite", "SELECT id, title, published, author_id FROM Post LIMIT -1 OFFSET 5"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.dialect, func(t *testing.T) {
+			c := openCaptureClient(t, client.WithDialect(tt.dialect))
+			defer c.Close()
+
+			if _, err := c.Post.Query().Skip(5).Do(context.Background()); err != nil {
+				t.Fatalf("FindMany() error: %v", err)
+			}
+
+			captureState.Lock()
+			got := captureState.query
+			captureState.Unlock()
+			if got != tt.want {
+				t.Fatalf("query = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRawScansStructsByDBTag(t *testing.T) {
 	c := openCaptureClient(t)
 	defer c.Close()
@@ -226,6 +255,19 @@ func TestRawScansStructsByDBTag(t *testing.T) {
 	}
 	if posts[0].Id != "p1" || posts[0].Title != "First" || !posts[0].Published || posts[0].AuthorId != "u1" {
 		t.Fatalf("post = %#v", posts[0])
+	}
+}
+
+func TestRawRejectsNilInterfaceDestination(t *testing.T) {
+	c := openCaptureClient(t)
+	defer c.Close()
+
+	_, err := client.Raw[any](context.Background(), c, "SELECT id FROM posts")
+	if err == nil {
+		t.Fatal("Raw[any]() should reject a non-struct destination")
+	}
+	if !strings.Contains(err.Error(), "destination type must be a struct") {
+		t.Fatalf("Raw[any]() error = %q", err)
 	}
 }
 

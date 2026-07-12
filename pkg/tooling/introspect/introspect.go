@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -114,9 +115,11 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 	b.WriteString("generator client {\n  provider = \"gco-go\"\n  output   = \"./gen\"\n}\n")
 
 	for _, t := range tables {
-		b.WriteString(fmt.Sprintf("\nmodel %s {\n", pascalCase(t.Name)))
+		modelName := pascalCase(t.Name)
+		b.WriteString(fmt.Sprintf("\nmodel %s {\n", modelName))
 		for _, col := range t.Columns {
-			line := fmt.Sprintf("  %-20s %s", col.Name, mapSQLType(provider, col.DataType))
+			fieldType := mapSQLType(provider, col.DataType)
+			line := fmt.Sprintf("  %-20s %s", col.Name, fieldType)
 			if col.IsNullable {
 				line += "?"
 			}
@@ -127,7 +130,7 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 				line += " @unique"
 			}
 			if col.Default != "" {
-				line += fmt.Sprintf(" @default(%s)", mapDefault(col.Default))
+				line += fmt.Sprintf(" @default(%s)", mapDefaultForType(col.Default, fieldType))
 			}
 			b.WriteString(line + "\n")
 		}
@@ -139,6 +142,10 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 				copy(cols, idx.Columns)
 				fmt.Fprintf(&b, "\n  @@index([%s])\n", strings.Join(cols, ", "))
 			}
+		}
+
+		if modelName != t.Name {
+			fmt.Fprintf(&b, "\n  @@map(%q)\n", t.Name)
 		}
 
 		if t.Schema != "" {
@@ -202,18 +209,255 @@ func mapSQLType(provider, sqlType string) string {
 
 // mapDefault maps a SQL default expression to a GCO schema default.
 func mapDefault(def string) string {
-	lower := strings.ToLower(strings.TrimSpace(def))
-	switch {
-	case strings.Contains(lower, "uuid"):
-		return "uuid()"
-	case strings.Contains(lower, "now") || strings.Contains(lower, "current_timestamp"):
-		return "now()"
-	case strings.Contains(lower, "nextval") || lower == "autoincrement" ||
-		strings.Contains(lower, "auto_increment"):
-		return "autoincrement()"
-	default:
-		return fmt.Sprintf("%q", def)
+	return mapDefaultForType(def, "")
+}
+
+func mapDefaultForType(def, fieldType string) string {
+	value := strings.TrimSpace(def)
+	for hasWrappingDefaultParens(value) {
+		value = strings.TrimSpace(value[1 : len(value)-1])
 	}
+
+	lower := strings.ToLower(value)
+	quoted := isSQLStringLiteral(value)
+	switch {
+	case !quoted && strings.Contains(lower, "uuid"):
+		return "uuid()"
+	case !quoted && (strings.Contains(lower, "now()") || strings.HasPrefix(lower, "current_timestamp")):
+		return "now()"
+	case !quoted && (strings.Contains(lower, "nextval") || lower == "autoincrement" ||
+		strings.Contains(lower, "auto_increment")):
+		return "autoincrement()"
+	}
+
+	value = stripPostgresDefaultCast(value)
+	for hasWrappingDefaultParens(value) {
+		value = strings.TrimSpace(value[1 : len(value)-1])
+	}
+	value = unquoteSQLDefault(value)
+	lower = strings.ToLower(value)
+
+	switch fieldType {
+	case "Boolean":
+		switch lower {
+		case "1", "true":
+			return "true"
+		case "0", "false":
+			return "false"
+		}
+	case "Int", "SmallInt", "BigInt", "Float", "Decimal":
+		if isNumericDefault(value) {
+			return value
+		}
+	}
+
+	if fieldType == "" {
+		if lower == "true" || lower == "false" {
+			return lower
+		}
+		if isNumericDefault(value) {
+			return value
+		}
+	}
+	return strconv.Quote(value)
+}
+
+func stripPostgresDefaultCast(value string) string {
+	value = strings.TrimSpace(value)
+	for {
+		castIndex := trailingPostgresCastIndex(value)
+		if castIndex < 0 {
+			return value
+		}
+		value = strings.TrimSpace(value[:castIndex])
+	}
+}
+
+func trailingPostgresCastIndex(value string) int {
+	depth := 0
+	quote := byte(0)
+	lastCast := -1
+	for i := 0; i+1 < len(value); i++ {
+		if quote != 0 {
+			if value[i] == quote {
+				if i+1 < len(value) && value[i+1] == quote {
+					i++
+					continue
+				}
+				quote = 0
+			}
+			continue
+		}
+		switch value[i] {
+		case '\'', '"':
+			quote = value[i]
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ':':
+			if depth == 0 && value[i+1] == ':' {
+				lastCast = i
+				i++
+			}
+		}
+	}
+	if lastCast < 0 || !isPostgresCastType(value[lastCast+2:]) {
+		return -1
+	}
+	return lastCast
+}
+
+func isPostgresCastType(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for strings.HasSuffix(value, "[]") {
+		value = strings.TrimSpace(strings.TrimSuffix(value, "[]"))
+	}
+	if value == "" {
+		return false
+	}
+	if open := strings.LastIndexByte(value, '('); open > 0 && strings.HasSuffix(value, ")") {
+		precision := value[open+1 : len(value)-1]
+		if precision == "" {
+			return false
+		}
+		for _, r := range precision {
+			if r < '0' || r > '9' {
+				if r != ',' && r != ' ' && r != '\t' {
+					return false
+				}
+			}
+		}
+		value = strings.TrimSpace(value[:open])
+	}
+
+	normalized := strings.ToLower(strings.Join(strings.Fields(value), " "))
+	switch normalized {
+	case "bit varying", "character varying", "double precision",
+		"time with time zone", "time without time zone",
+		"timestamp with time zone", "timestamp without time zone":
+		return true
+	}
+	if strings.ContainsAny(value, " \t\r\n") {
+		return false
+	}
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			r == '_' || r == '$' || r == '.' || r == '"' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isSQLStringLiteral(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 2 || value[0] != '\'' && value[0] != '"' {
+		return false
+	}
+	quote := value[0]
+	for i := 1; i < len(value); i++ {
+		if value[i] != quote {
+			continue
+		}
+		if i+1 < len(value) && value[i+1] == quote {
+			i++
+			continue
+		}
+		rest := strings.TrimSpace(value[i+1:])
+		return rest == "" || strings.HasPrefix(rest, "::")
+	}
+	return false
+}
+
+func unquoteSQLDefault(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) < 2 {
+		return value
+	}
+	switch value[0] {
+	case '\'':
+		if value[len(value)-1] == '\'' {
+			return strings.ReplaceAll(value[1:len(value)-1], "''", "'")
+		}
+	case '"':
+		if value[len(value)-1] == '"' {
+			return strings.ReplaceAll(value[1:len(value)-1], `""`, `"`)
+		}
+	}
+	return value
+}
+
+func hasWrappingDefaultParens(value string) bool {
+	if len(value) < 2 || value[0] != '(' || value[len(value)-1] != ')' {
+		return false
+	}
+	depth := 0
+	quote := byte(0)
+	for i := 0; i < len(value); i++ {
+		if quote != 0 {
+			if value[i] == quote {
+				if i+1 < len(value) && value[i+1] == quote {
+					i++
+					continue
+				}
+				quote = 0
+			}
+			continue
+		}
+		switch value[i] {
+		case '\'', '"':
+			quote = value[i]
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && i != len(value)-1 {
+				return false
+			}
+		}
+		if depth < 0 {
+			return false
+		}
+	}
+	return depth == 0
+}
+
+func isNumericDefault(value string) bool {
+	if value == "" {
+		return false
+	}
+	i := 0
+	if value[0] == '-' {
+		i++
+		if i == len(value) {
+			return false
+		}
+	}
+	digitStart := i
+	for i < len(value) && value[i] >= '0' && value[i] <= '9' {
+		i++
+	}
+	if i == digitStart {
+		return false
+	}
+	if i < len(value) && value[i] == '.' {
+		i++
+		fractionStart := i
+		for i < len(value) && value[i] >= '0' && value[i] <= '9' {
+			i++
+		}
+		if i == fractionStart {
+			return false
+		}
+	}
+	return i == len(value)
 }
 
 // pascalCase converts snake_case or plain names to PascalCase for model names.

@@ -137,6 +137,216 @@ func TestPostgresPlaceholders(t *testing.T) {
 	}
 }
 
+func TestPostgresPlaceholderRewriteSkipsSQLTokens(t *testing.T) {
+	tests := []struct {
+		name      string
+		condition string
+		args      []any
+		want      string
+	}{
+		{
+			name:      "single quoted string",
+			condition: "note = 'it''s ?' AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE note = 'it''s ?' AND id = $1",
+		},
+		{
+			name:      "standard string trailing backslash",
+			condition: `path = 'C:\' AND id = ?`,
+			args:      []any{7},
+			want:      `SELECT * FROM t WHERE path = 'C:\' AND id = $1`,
+		},
+		{
+			name:      "standard string doubled backslash",
+			condition: `path = 'C:\\' AND id = ?`,
+			args:      []any{7},
+			want:      `SELECT * FROM t WHERE path = 'C:\\' AND id = $1`,
+		},
+		{
+			name:      "escape string escaped quote",
+			condition: `note = E'it\'s ?' AND id = ?`,
+			args:      []any{7},
+			want:      `SELECT * FROM t WHERE note = E'it\'s ?' AND id = $1`,
+		},
+		{
+			name:      "double quoted identifier",
+			condition: `"question?column" = ?`,
+			args:      []any{"value"},
+			want:      `SELECT * FROM t WHERE "question?column" = $1`,
+		},
+		{
+			name:      "dollar quoted string",
+			condition: "body = $tag$?$tag$ AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE body = $tag$?$tag$ AND id = $1",
+		},
+		{
+			name:      "line and nested block comments",
+			condition: "id = ? /* outer ? /* inner ? */ outer ? */ -- line ?\nAND active = true",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE id = $1 /* outer ? /* inner ? */ outer ? */ -- line ?\nAND active = true",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, gotArgs := New("postgresql").
+				Select("*").
+				From("t").
+				Where(tt.condition, tt.args...).
+				Build()
+			if got != tt.want {
+				t.Fatalf("SQL = %q, want %q", got, tt.want)
+			}
+			if !reflect.DeepEqual(gotArgs, tt.args) {
+				t.Fatalf("args = %#v, want %#v", gotArgs, tt.args)
+			}
+		})
+	}
+}
+
+func TestPostgresPlaceholderRewriteAfterExpressionKeywords(t *testing.T) {
+	tests := []struct {
+		name      string
+		condition string
+		args      []any
+		want      string
+	}{
+		{
+			name:      "is distinct from",
+			condition: "a IS DISTINCT FROM ? AND b = ?",
+			args:      []any{1, 2},
+			want:      "SELECT * FROM t WHERE a IS DISTINCT FROM $1 AND b = $2",
+		},
+		{
+			name:      "fetch first",
+			condition: "EXISTS (SELECT 1 FROM child FETCH FIRST ? ROWS ONLY) AND id = ?",
+			args:      []any{5, 7},
+			want:      "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM child FETCH FIRST $1 ROWS ONLY) AND id = $2",
+		},
+		{
+			name:      "select expression",
+			condition: "EXISTS (SELECT ? AS value) AND id = ?",
+			args:      []any{true, 7},
+			want:      "SELECT * FROM t WHERE EXISTS (SELECT $1 AS value) AND id = $2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, gotArgs := New("postgresql").
+				Select("*").
+				From("t").
+				Where(tt.condition, tt.args...).
+				Build()
+			if got != tt.want {
+				t.Fatalf("SQL = %q, want %q", got, tt.want)
+			}
+			if !reflect.DeepEqual(gotArgs, tt.args) {
+				t.Fatalf("args = %#v, want %#v", gotArgs, tt.args)
+			}
+		})
+	}
+}
+
+func TestPostgresPlaceholderRewritePreservesJSONOperators(t *testing.T) {
+	tests := []struct {
+		name      string
+		condition string
+		args      []any
+		want      string
+	}{
+		{
+			name:      "existence with literal key",
+			condition: "attrs ? 'admin' AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE attrs ? 'admin' AND id = $1",
+		},
+		{
+			name:      "existence with parameter key",
+			condition: "attrs ? ? AND id = ?",
+			args:      []any{"admin", 7},
+			want:      "SELECT * FROM t WHERE attrs ? $1 AND id = $2",
+		},
+		{
+			name:      "any keys",
+			condition: "attrs ?| ARRAY[?] AND id = ?",
+			args:      []any{"admin", 7},
+			want:      "SELECT * FROM t WHERE attrs ?| ARRAY[$1] AND id = $2",
+		},
+		{
+			name:      "all keys",
+			condition: "attrs ?& ARRAY[?, ?] AND id = ?",
+			args:      []any{"admin", "owner", 7},
+			want:      "SELECT * FROM t WHERE attrs ?& ARRAY[$1, $2] AND id = $3",
+		},
+		{
+			name:      "json path",
+			condition: "attrs @? '$.admin' AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE attrs @? '$.admin' AND id = $1",
+		},
+		{
+			name:      "custom hash operator",
+			condition: "attrs ?# key AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE attrs ?# key AND id = $1",
+		},
+		{
+			name:      "custom prefixed question operator",
+			condition: "attrs #? key AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE attrs #? key AND id = $1",
+		},
+		{
+			name:      "custom minus operator",
+			condition: "attrs ?- key AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE attrs ?- key AND id = $1",
+		},
+		{
+			name:      "custom multi operator",
+			condition: "attrs ?-| key AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE attrs ?-| key AND id = $1",
+		},
+		{
+			name:      "operators with comment lookaround",
+			condition: "attrs /* before ? */ ?# /* after ? */ key AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE attrs /* before ? */ ?# /* after ? */ key AND id = $1",
+		},
+		{
+			name:      "bare operator and parameter with comment lookaround",
+			condition: "attrs /* before ? */ ? /* after ? */ ? AND id = ?",
+			args:      []any{"admin", 7},
+			want:      "SELECT * FROM t WHERE attrs /* before ? */ ? /* after ? */ $1 AND id = $2",
+		},
+		{
+			name:      "parameter followed by subtraction without whitespace",
+			condition: "id = ?-1 AND other_id = ?",
+			args:      []any{8, 9},
+			want:      "SELECT * FROM t WHERE id = $1-1 AND other_id = $2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, gotArgs := New("postgresql").
+				Select("*").
+				From("t").
+				Where(tt.condition, tt.args...).
+				Build()
+			if got != tt.want {
+				t.Fatalf("SQL = %q, want %q", got, tt.want)
+			}
+			if !reflect.DeepEqual(gotArgs, tt.args) {
+				t.Fatalf("args = %#v, want %#v", gotArgs, tt.args)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // MySQL placeholders (?)
 // ---------------------------------------------------------------------------
@@ -196,12 +406,43 @@ func TestQuoteIdent(t *testing.T) {
 		{"mysql", []string{"mydb", "users"}, "`mydb`.`users`"},
 		{"sqlite", []string{"users"}, `"users"`},
 		{"sqlite", []string{"main", "users"}, `"main"."users"`},
+		{"postgresql", []string{`weird"name`}, `"weird""name"`},
+		{"mysql", []string{"weird`name"}, "`weird``name`"},
+		{"sqlite", []string{`weird"name`}, `"weird""name"`},
 	}
 	for _, tc := range cases {
 		got := QuoteIdent(tc.dialect, tc.parts...)
 		if got != tc.want {
 			t.Errorf("QuoteIdent(%q, %v) = %q, want %q", tc.dialect, tc.parts, got, tc.want)
 		}
+	}
+}
+
+func TestOffsetOnlyByDialect(t *testing.T) {
+	tests := []struct {
+		dialect string
+		want    string
+	}{
+		{"postgresql", "SELECT * FROM t OFFSET 20"},
+		{"mysql", "SELECT * FROM t LIMIT 18446744073709551615 OFFSET 20"},
+		{"sqlite", "SELECT * FROM t LIMIT -1 OFFSET 20"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.dialect, func(t *testing.T) {
+			got, _ := New(tt.dialect).Select("*").From("t").Offset(20).Build()
+			if got != tt.want {
+				t.Fatalf("SQL = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLimitOffsetOrderIsCanonical(t *testing.T) {
+	got, _ := New("sqlite").Select("*").From("t").Offset(20).Limit(10).Build()
+	want := "SELECT * FROM t LIMIT 10 OFFSET 20"
+	if got != want {
+		t.Fatalf("SQL = %q, want %q", got, want)
 	}
 }
 

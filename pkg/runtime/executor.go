@@ -64,6 +64,21 @@ func (db *DB) Close() error {
 	return db.rawDB.Close()
 }
 
+// ExecContext executes a query without returning rows.
+func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return db.executor.ExecContext(ctx, query, args...)
+}
+
+// QueryContext executes a query that returns rows.
+func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return db.executor.QueryContext(ctx, query, args...)
+}
+
+// QueryRowContext executes a query expected to return at most one row.
+func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return db.executor.QueryRowContext(ctx, query, args...)
+}
+
 // Executor returns the underlying executor.
 func (db *DB) Executor() Executor {
 	return db.executor
@@ -114,3 +129,5 @@ func (db *DB) TxWithOptions(ctx context.Context, opts *sql.TxOptions, fn func(tx
 
 	return tx.Commit()
 }
+
+var _ Executor = (*DB)(nil)

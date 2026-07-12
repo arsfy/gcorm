@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/arsfy/gcorm/pkg/schema/ast"
 )
@@ -194,6 +195,7 @@ type validator struct {
 	result     *ValidationResult
 	modelNames map[string]ast.Position
 	enumNames  map[string]ast.Position
+	typeKinds  map[string]string
 }
 
 func newValidator() *validator {
@@ -201,6 +203,7 @@ func newValidator() *validator {
 		result:     &ValidationResult{},
 		modelNames: make(map[string]ast.Position),
 		enumNames:  make(map[string]ast.Position),
+		typeKinds:  make(map[string]string),
 	}
 }
 
@@ -218,11 +221,24 @@ func (v *validator) addWarning(pos ast.Position, msg string) {
 
 func (v *validator) collectTypes(doc *ast.Document) {
 	for _, m := range doc.Models {
+		v.registerTypeName(m.Name, "model", m.Span.Start)
 		v.modelNames[m.Name] = m.Span.Start
 	}
 	for _, e := range doc.Enums {
+		v.registerTypeName(e.Name, "enum", e.Span.Start)
 		v.enumNames[e.Name] = e.Span.Start
 	}
+}
+
+func (v *validator) registerTypeName(name, kind string, pos ast.Position) {
+	if scalarTypes[name] {
+		v.addError(pos, fmt.Sprintf("%s name %q conflicts with built-in scalar type", kind, name))
+	}
+	if previousKind, ok := v.typeKinds[name]; ok && previousKind != kind {
+		v.addError(pos, fmt.Sprintf("type name %q is used by both a model and an enum", name))
+		return
+	}
+	v.typeKinds[name] = kind
 }
 
 func (v *validator) isKnownType(name string) bool {
@@ -290,7 +306,11 @@ func (v *validator) validateModelNames(models []ast.ModelDecl) {
 }
 
 func (v *validator) validateModelNaming(m ast.ModelDecl) {
-	if len(m.Name) > 0 && !unicode.IsUpper(rune(m.Name[0])) {
+	if len(m.Name) > 0 {
+		first, _ := utf8.DecodeRuneInString(m.Name)
+		if unicode.IsUpper(first) {
+			return
+		}
 		v.addError(m.Span.Start, fmt.Sprintf("model name %q must start with an uppercase letter", m.Name))
 	}
 }
@@ -310,8 +330,11 @@ func (v *validator) validateModel(m ast.ModelDecl) {
 		}
 		fieldNames[f.Name] = true
 
-		if len(f.Name) > 0 && !unicode.IsLower(rune(f.Name[0])) {
-			v.addError(f.Span.Start, fmt.Sprintf("field name %q must start with a lowercase letter", f.Name))
+		if len(f.Name) > 0 {
+			first, _ := utf8.DecodeRuneInString(f.Name)
+			if !unicode.IsLower(first) {
+				v.addError(f.Span.Start, fmt.Sprintf("field name %q must start with a lowercase letter", f.Name))
+			}
 		}
 
 		if !v.isKnownType(f.Type.Name) {
@@ -586,7 +609,11 @@ func (v *validator) validateEnumNames(enums []ast.EnumDecl) {
 }
 
 func (v *validator) validateEnumNaming(e ast.EnumDecl) {
-	if len(e.Name) > 0 && !unicode.IsUpper(rune(e.Name[0])) {
+	if len(e.Name) > 0 {
+		first, _ := utf8.DecodeRuneInString(e.Name)
+		if unicode.IsUpper(first) {
+			return
+		}
 		v.addError(e.Span.Start, fmt.Sprintf("enum name %q must start with an uppercase letter", e.Name))
 	}
 }

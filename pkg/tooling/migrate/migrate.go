@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/arsfy/gcorm/internal/config"
+	"github.com/arsfy/gcorm/pkg/schema/ast"
 	"github.com/arsfy/gcorm/pkg/schema/ir"
 	"github.com/arsfy/gcorm/pkg/tooling/internal/schemautil"
 )
@@ -28,6 +29,7 @@ type MigrationManifest struct {
 	ReviewRequired bool           `json:"reviewRequired"`
 	Changes        []ChangeRecord `json:"changes,omitempty"`
 	Models         []string       `json:"models,omitempty"`
+	SchemaSnapshot *ir.Schema     `json:"schemaSnapshot,omitempty"`
 }
 
 // ChangeRecord stores a single schema change in the migration manifest.
@@ -100,6 +102,9 @@ func runDiff(args []string) error {
 			}
 		}
 	}
+	if err := validateMigrationName(name); err != nil {
+		return err
+	}
 
 	// Load config.
 	cfg, _, err := config.Load(configPath)
@@ -117,7 +122,10 @@ func runDiff(args []string) error {
 	newSchema := loaded.Schema
 
 	// Load previous schema (nil when no prior migrations exist).
-	prevSchema := loadPreviousSchema(migrationDir)
+	prevSchema, err := loadPreviousSchema(migrationDir)
+	if err != nil {
+		return err
+	}
 
 	// Diff.
 	cs := Diff(prevSchema, newSchema)
@@ -134,11 +142,9 @@ func runDiff(args []string) error {
 
 	// Write migration files.
 	timestamp := time.Now().UTC().Format("20060102_150405")
-	dirName := fmt.Sprintf("%s_%s", timestamp, name)
-	migPath := filepath.Join(migrationDir, dirName)
-
-	if err := os.MkdirAll(migPath, 0o755); err != nil {
-		return fmt.Errorf("create migration directory: %w", err)
+	dirName, migPath, err := createMigrationDirectory(migrationDir, timestamp, name)
+	if err != nil {
+		return err
 	}
 
 	if err := os.WriteFile(filepath.Join(migPath, "up.sql"), []byte(upSQL), 0o644); err != nil {
@@ -172,6 +178,11 @@ func runDiff(args []string) error {
 		}
 	}
 
+	snapshot, err := credentialFreeSchemaSnapshot(newSchema)
+	if err != nil {
+		return fmt.Errorf("build schema snapshot: %w", err)
+	}
+
 	manifest := MigrationManifest{
 		ID:             dirName,
 		Description:    name,
@@ -182,6 +193,7 @@ func runDiff(args []string) error {
 		ReviewRequired: reviewRequired,
 		Changes:        changeRecords,
 		Models:         collectModelNames(newSchema),
+		SchemaSnapshot: snapshot,
 	}
 
 	manifestJSON, err := json.MarshalIndent(manifest, "", "  ")
@@ -392,30 +404,141 @@ func runResolve(args []string) error {
 	return nil
 }
 
-// loadPreviousSchema attempts to load the schema state from the latest
-// migration manifest. Returns nil when no prior migrations exist.
-func loadPreviousSchema(migrationDir string) *ir.Schema {
+// loadPreviousSchema loads the schema state from the latest migration
+// manifest. It returns nil when no prior migrations exist. Manifests created by
+// older versions without a snapshot cannot safely serve as a diff baseline.
+func loadPreviousSchema(migrationDir string) (*ir.Schema, error) {
 	entries, err := os.ReadDir(migrationDir)
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read migration directory: %w", err)
 	}
-	// Find latest migration directory with a manifest.
-	var latest string
+	type manifestCandidate struct {
+		dir      string
+		manifest MigrationManifest
+	}
+	var latest *manifestCandidate
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
 		manifestPath := filepath.Join(migrationDir, e.Name(), "manifest.json")
-		if _, err := os.Stat(manifestPath); err == nil {
-			latest = e.Name()
+		data, err := os.ReadFile(manifestPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("read migration manifest %s: %w", manifestPath, err)
+		}
+		var manifest MigrationManifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			return nil, fmt.Errorf("parse migration manifest %s: %w", manifestPath, err)
+		}
+		candidate := &manifestCandidate{dir: e.Name(), manifest: manifest}
+		if latest == nil || candidate.manifest.CreatedAt.After(latest.manifest.CreatedAt) ||
+			candidate.manifest.CreatedAt.Equal(latest.manifest.CreatedAt) && candidate.dir > latest.dir {
+			latest = candidate
 		}
 	}
-	if latest == "" {
-		return nil
+	if latest == nil {
+		return nil, nil
 	}
-	// Full schema snapshot loading will be added in a future iteration.
-	_ = latest
+	if latest.manifest.SchemaSnapshot == nil {
+		return nil, fmt.Errorf("latest migration %q has no schema snapshot; create a new baseline migration before generating an incremental diff", latest.dir)
+	}
+	return latest.manifest.SchemaSnapshot, nil
+}
+
+func validateMigrationName(name string) error {
+	if name == "" {
+		return fmt.Errorf("migration name cannot be empty")
+	}
+	for _, r := range name {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+			continue
+		}
+		return fmt.Errorf("invalid migration name %q: use only letters, numbers, '-' and '_'", name)
+	}
 	return nil
+}
+
+func createMigrationDirectory(migrationDir, timestamp, name string) (string, string, error) {
+	if err := os.MkdirAll(migrationDir, 0o755); err != nil {
+		return "", "", fmt.Errorf("create migration directory: %w", err)
+	}
+
+	base := fmt.Sprintf("%s_%s", timestamp, name)
+	for suffix := 0; ; suffix++ {
+		dirName := base
+		if suffix > 0 {
+			dirName = fmt.Sprintf("%s_%03d", base, suffix)
+		}
+		migPath := filepath.Join(migrationDir, dirName)
+		if err := os.Mkdir(migPath, 0o755); err == nil {
+			return dirName, migPath, nil
+		} else if !os.IsExist(err) {
+			return "", "", fmt.Errorf("create migration directory: %w", err)
+		}
+	}
+}
+
+func credentialFreeSchemaSnapshot(schema *ir.Schema) (*ir.Schema, error) {
+	if schema == nil {
+		return nil, nil
+	}
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return nil, err
+	}
+	var snapshot ir.Schema
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return nil, err
+	}
+	if snapshot.Datasource != nil {
+		snapshot.Datasource.URL = ""
+		snapshot.Datasource.URLIsEnv = false
+		snapshot.Datasource.EnvVar = ""
+	}
+	snapshot.Generators = nil
+	clearSchemaSourceLocations(&snapshot)
+	return &snapshot, nil
+}
+
+func clearSchemaSourceLocations(schema *ir.Schema) {
+	if schema == nil {
+		return
+	}
+	if schema.Datasource != nil {
+		schema.Datasource.Span = ast.Span{}
+	}
+	for _, model := range schema.Models {
+		if model == nil {
+			continue
+		}
+		model.Span = ast.Span{}
+		for _, field := range model.Fields {
+			if field != nil {
+				field.Span = ast.Span{}
+			}
+		}
+		for _, relation := range model.Relations {
+			if relation != nil && relation.Field != nil {
+				relation.Field.Span = ast.Span{}
+			}
+		}
+		for _, index := range model.Indexes {
+			if index != nil {
+				index.Span = ast.Span{}
+			}
+		}
+	}
+	for _, enum := range schema.Enums {
+		if enum != nil {
+			enum.Span = ast.Span{}
+		}
+	}
 }
 
 // detectDialectFromSchema returns the SQL dialect from the datasource provider,

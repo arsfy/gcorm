@@ -547,6 +547,9 @@ func scanRowsToStructs[T any](rows *sql.Rows) ([]T, error) {
 
 	var sample T
 	typ := reflect.TypeOf(sample)
+	if typ == nil {
+		return nil, fmt.Errorf("Raw: destination type must be a struct, got <nil>")
+	}
 	if typ.Kind() != reflect.Struct {
 		return nil, fmt.Errorf("Raw: destination type must be a struct, got %s", typ.Kind())
 	}
@@ -1118,6 +1121,14 @@ func (a {{$model.Name}}Actions) FindMany(ctx context.Context, opts ...query.{{$m
 		q += fmt.Sprintf(" LIMIT %d", *cfg.Take)
 	}
 	if cfg.Skip != nil {
+		if cfg.Take == nil {
+			switch a.client.dialect {
+			case "mysql":
+				q += " LIMIT 18446744073709551615"
+			case "sqlite":
+				q += " LIMIT -1"
+			}
+		}
 		q += fmt.Sprintf(" OFFSET %d", *cfg.Skip)
 	}
 	rows, err := a.client.executor.QueryContext(ctx, q, args...)

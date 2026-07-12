@@ -150,6 +150,22 @@ func TestNumbers(t *testing.T) {
 			t.Errorf("expected %q, got %q", "0", tokens[0].Value)
 		}
 	})
+
+	t.Run("negative integer", func(t *testing.T) {
+		tokens := tokenize(t, "-123")
+		assertTokenTypes(t, tokens, []TokenType{TokenNumber, TokenEOF})
+		if tokens[0].Value != "-123" {
+			t.Errorf("expected %q, got %q", "-123", tokens[0].Value)
+		}
+	})
+
+	t.Run("negative decimal", func(t *testing.T) {
+		tokens := tokenize(t, "-3.14")
+		assertTokenTypes(t, tokens, []TokenType{TokenNumber, TokenEOF})
+		if tokens[0].Value != "-3.14" {
+			t.Errorf("expected %q, got %q", "-3.14", tokens[0].Value)
+		}
+	})
 }
 
 func TestBooleans(t *testing.T) {

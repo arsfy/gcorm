@@ -20,7 +20,7 @@ func (SQLite) Placeholder(_ int) string { return "?" }
 func (SQLite) QuoteIdent(parts ...string) string {
 	quoted := make([]string, len(parts))
 	for i, p := range parts {
-		quoted[i] = `"` + p + `"`
+		quoted[i] = `"` + strings.ReplaceAll(p, `"`, `""`) + `"`
 	}
 	return strings.Join(quoted, ".")
 }

@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/arsfy/gcorm/pkg/schema/ast"
 	"github.com/arsfy/gcorm/pkg/schema/ir"
 )
 
@@ -87,6 +89,221 @@ func TestRunDiff(t *testing.T) {
 	}
 	if manifest.ToolVersion != "0.1.0" {
 		t.Errorf("manifest toolVersion = %q, want %q", manifest.ToolVersion, "0.1.0")
+	}
+	if manifest.SchemaSnapshot == nil {
+		t.Fatal("manifest schema snapshot is missing")
+	}
+	if manifest.SchemaSnapshot.Datasource == nil {
+		t.Fatal("manifest schema snapshot datasource is missing")
+	}
+	if manifest.SchemaSnapshot.Datasource.URL != "" || manifest.SchemaSnapshot.Datasource.EnvVar != "" {
+		t.Fatalf("manifest schema snapshot retained datasource credentials: %+v", manifest.SchemaSnapshot.Datasource)
+	}
+	if len(manifest.SchemaSnapshot.Generators) != 0 {
+		t.Fatalf("manifest schema snapshot retained generators: %+v", manifest.SchemaSnapshot.Generators)
+	}
+}
+
+func TestRunDiffUsesLatestSchemaSnapshot(t *testing.T) {
+	initial := `datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id String @id
+}
+`
+	updated := `datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id  String @id
+  bio String?
+}
+`
+	schemaDir := writeTestSchema(t, initial)
+	migDir := filepath.Join(t.TempDir(), "migrations")
+
+	if err := runDiff([]string{"--name", "change", "--dir", migDir, "--schema", schemaDir}); err != nil {
+		t.Fatalf("first runDiff() error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(schemaDir, "schema.gcorm"), []byte(updated), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDiff([]string{"--name", "change", "--dir", migDir, "--schema", schemaDir}); err != nil {
+		t.Fatalf("second runDiff() error: %v", err)
+	}
+
+	entries, err := os.ReadDir(migDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected two migration directories, got %d", len(entries))
+	}
+	secondPath := filepath.Join(migDir, entries[1].Name())
+	upSQL, err := os.ReadFile(filepath.Join(secondPath, "up.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := string(upSQL)
+	if !strings.Contains(up, `ALTER TABLE "User" ADD COLUMN "bio" TEXT;`) {
+		t.Fatalf("second migration should add only bio column:\n%s", up)
+	}
+	if strings.Contains(up, "CREATE TABLE") {
+		t.Fatalf("second migration unexpectedly recreated the table:\n%s", up)
+	}
+
+	data, err := os.ReadFile(filepath.Join(secondPath, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest MigrationManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Changes) != 1 || manifest.Changes[0].Type != string(AddColumn) || manifest.Changes[0].Field != "bio" {
+		t.Fatalf("second migration changes = %+v, want one AddColumn User.bio", manifest.Changes)
+	}
+}
+
+func TestCreateMigrationDirectoryAvoidsCollision(t *testing.T) {
+	migDir := filepath.Join(t.TempDir(), "migrations")
+	firstName, firstPath, err := createMigrationDirectory(migDir, "20260101_120000", "change")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondName, secondPath, err := createMigrationDirectory(migDir, "20260101_120000", "change")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstName == secondName || firstPath == secondPath {
+		t.Fatalf("collision reused migration directory %q", firstPath)
+	}
+	if secondName != "20260101_120000_change_001" {
+		t.Fatalf("collision suffix = %q", secondName)
+	}
+}
+
+func TestLoadPreviousSchemaRejectsLegacyManifest(t *testing.T) {
+	migDir := filepath.Join(t.TempDir(), "migrations")
+	migPath := filepath.Join(migDir, "20260101_120000_init")
+	if err := os.MkdirAll(migPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(MigrationManifest{ID: "20260101_120000_init"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(migPath, "manifest.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPreviousSchema(migDir); err == nil || !strings.Contains(err.Error(), "no schema snapshot") {
+		t.Fatalf("loadPreviousSchema() error = %v, want missing snapshot error", err)
+	}
+}
+
+func TestLoadPreviousSchemaUsesCreatedAtBeforeDirectoryName(t *testing.T) {
+	migDir := filepath.Join(t.TempDir(), "migrations")
+	baseTime := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	writeManifest := func(dirName string, createdAt time.Time, modelName string) {
+		t.Helper()
+		migPath := filepath.Join(migDir, dirName)
+		if err := os.MkdirAll(migPath, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		manifest := MigrationManifest{
+			ID:        dirName,
+			CreatedAt: createdAt,
+			SchemaSnapshot: &ir.Schema{Models: []*ir.Model{{
+				Name: modelName,
+			}}},
+		}
+		data, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(migPath, "manifest.json"), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeManifest("20260101_120000_z", baseTime.Add(100*time.Millisecond), "Older")
+	writeManifest("20260101_120000_a", baseTime.Add(900*time.Millisecond), "Newer")
+
+	schema, err := loadPreviousSchema(migDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schema == nil || len(schema.Models) != 1 || schema.Models[0].Name != "Newer" {
+		t.Fatalf("loadPreviousSchema() = %#v, want snapshot from newer a migration", schema)
+	}
+}
+
+func TestCredentialFreeSchemaSnapshotClearsSourceLocations(t *testing.T) {
+	const sourcePath = "/Users/alice/private/project/schema/schema.gcorm"
+	span := ast.Span{
+		Start: ast.Position{File: sourcePath, Line: 1, Column: 1},
+		End:   ast.Position{File: sourcePath, Line: 2, Column: 1},
+	}
+	schema := &ir.Schema{
+		Datasource: &ir.Datasource{
+			Provider: "postgresql",
+			URL:      "postgresql://user:password@localhost/db",
+			Span:     span,
+		},
+		Generators: []*ir.Generator{{Output: sourcePath, Span: span}},
+		Models: []*ir.Model{{
+			Name: "User",
+			Span: span,
+			Fields: []*ir.Field{{
+				Name:       "id",
+				Type:       ir.FieldKindScalar,
+				ScalarType: "String",
+				Span:       span,
+			}},
+			Relations: []*ir.Relation{{
+				Field: &ir.Field{Name: "posts", Type: ir.FieldKindRelation, Span: span},
+			}},
+			Indexes: []*ir.Index{{Name: "idx_user_id", Fields: []string{"id"}, Span: span}},
+		}},
+		Enums: []*ir.Enum{{Name: "Role", Span: span}},
+	}
+
+	snapshot, err := credentialFreeSchemaSnapshot(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), sourcePath) || strings.Contains(string(data), "password") {
+		t.Fatalf("snapshot leaked source path or credentials: %s", data)
+	}
+	if snapshot.Datasource.Span != (ast.Span{}) ||
+		snapshot.Models[0].Span != (ast.Span{}) ||
+		snapshot.Models[0].Fields[0].Span != (ast.Span{}) ||
+		snapshot.Models[0].Relations[0].Field.Span != (ast.Span{}) ||
+		snapshot.Models[0].Indexes[0].Span != (ast.Span{}) ||
+		snapshot.Enums[0].Span != (ast.Span{}) {
+		t.Fatalf("snapshot retained source spans: %#v", snapshot)
+	}
+}
+
+func TestValidateMigrationNameRejectsPathTraversal(t *testing.T) {
+	for _, name := range []string{"../escape", `..\\escape`, ".", "..", "nested/name"} {
+		if err := validateMigrationName(name); err == nil {
+			t.Errorf("validateMigrationName(%q) unexpectedly succeeded", name)
+		}
+	}
+	for _, name := range []string{"init", "add_users", "add-users-2"} {
+		if err := validateMigrationName(name); err != nil {
+			t.Errorf("validateMigrationName(%q) error: %v", name, err)
+		}
 	}
 }
 

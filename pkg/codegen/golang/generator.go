@@ -243,8 +243,7 @@ func (g *Generator) renderTemplate(name, tmplSrc string, data any) ([]byte, erro
 	// Format with gofmt.
 	formatted, err := format.Source(buf.Bytes())
 	if err != nil {
-		// Return unformatted if gofmt fails, for debugging.
-		return buf.Bytes(), nil
+		return nil, fmt.Errorf("format generated template %s: %w", name, err)
 	}
 	return formatted, nil
 }

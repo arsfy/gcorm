@@ -11,6 +11,8 @@ type Builder struct {
 	args       []any
 	paramCount int
 	dialect    string // "postgresql", "mysql", "sqlite"
+	limit      *int
+	offset     *int
 }
 
 // New creates a Builder for the given dialect.
@@ -78,13 +80,13 @@ func (b *Builder) OrderBy(clause string) *Builder {
 
 // Limit adds a LIMIT clause.
 func (b *Builder) Limit(n int) *Builder {
-	b.parts = append(b.parts, fmt.Sprintf("LIMIT %d", n))
+	b.limit = &n
 	return b
 }
 
 // Offset adds an OFFSET clause.
 func (b *Builder) Offset(n int) *Builder {
-	b.parts = append(b.parts, fmt.Sprintf("OFFSET %d", n))
+	b.offset = &n
 	return b
 }
 
@@ -166,10 +168,30 @@ func (b *Builder) Having(condition string, args ...any) *Builder {
 
 // Build returns the assembled SQL string and collected arguments.
 func (b *Builder) Build() (string, []any) {
-	return strings.Join(b.parts, " "), b.args
+	parts := make([]string, len(b.parts), len(b.parts)+2)
+	copy(parts, b.parts)
+
+	if b.limit != nil {
+		parts = append(parts, fmt.Sprintf("LIMIT %d", *b.limit))
+	} else if b.offset != nil {
+		switch b.dialect {
+		case "mysql":
+			parts = append(parts, "LIMIT 18446744073709551615")
+		case "sqlite":
+			parts = append(parts, "LIMIT -1")
+		}
+	}
+	if b.offset != nil {
+		parts = append(parts, fmt.Sprintf("OFFSET %d", *b.offset))
+	}
+
+	return strings.Join(parts, " "), b.args
 }
 
-// rewrite replaces "?" tokens in s with dialect-specific placeholders.
+// rewrite replaces parameter "?" tokens with dialect-specific placeholders.
+// PostgreSQL overloads "?" as an operator character, so its path first skips
+// quoted/commented text and only preserves a question mark as an operator when
+// the surrounding significant tokens form an infix expression.
 func (b *Builder) rewrite(s string, nArgs int) string {
 	if b.dialect != "postgresql" || nArgs == 0 {
 		// For mysql/sqlite "?" is already correct; just bump the counter.
@@ -177,15 +199,294 @@ func (b *Builder) rewrite(s string, nArgs int) string {
 		return s
 	}
 	var out strings.Builder
-	for _, ch := range s {
-		if ch == '?' {
+	out.Grow(len(s))
+	replaced := 0
+	for i := 0; i < len(s); {
+		switch {
+		case s[i] == '\'':
+			n := quotedTokenLen(s[i:], '\'', isPostgresEscapeString(s, i))
+			out.WriteString(s[i : i+n])
+			i += n
+		case s[i] == '"':
+			n := quotedTokenLen(s[i:], '"', false)
+			out.WriteString(s[i : i+n])
+			i += n
+		case strings.HasPrefix(s[i:], "--"):
+			n := lineCommentLen(s[i:])
+			out.WriteString(s[i : i+n])
+			i += n
+		case strings.HasPrefix(s[i:], "/*"):
+			n := blockCommentLen(s[i:])
+			out.WriteString(s[i : i+n])
+			i += n
+		case s[i] == '$':
+			if tag := dollarQuoteTag(s[i:]); tag != "" {
+				n := dollarQuotedTokenLen(s[i:], tag)
+				out.WriteString(s[i : i+n])
+				i += n
+				continue
+			}
+			out.WriteByte(s[i])
+			i++
+		case s[i] == '?' && replaced < nArgs && !isPostgresQuestionOperator(s, i):
 			b.paramCount++
+			replaced++
 			out.WriteString(fmt.Sprintf("$%d", b.paramCount))
-		} else {
-			out.WriteRune(ch)
+			i++
+		default:
+			out.WriteByte(s[i])
+			i++
 		}
 	}
 	return out.String()
+}
+
+func quotedTokenLen(s string, quote byte, backslashEscapes bool) int {
+	for i := 1; i < len(s); i++ {
+		if backslashEscapes && s[i] == '\\' && i+1 < len(s) {
+			i++
+			continue
+		}
+		if s[i] != quote {
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == quote {
+			i++
+			continue
+		}
+		return i + 1
+	}
+	return len(s)
+}
+
+func isPostgresEscapeString(s string, quotePos int) bool {
+	if quotePos == 0 || s[quotePos-1] != 'E' && s[quotePos-1] != 'e' {
+		return false
+	}
+	return quotePos == 1 || !isIdentByte(s[quotePos-2])
+}
+
+func lineCommentLen(s string) int {
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		return idx + 1
+	}
+	return len(s)
+}
+
+func blockCommentLen(s string) int {
+	depth := 0
+	for i := 0; i < len(s)-1; i++ {
+		switch s[i : i+2] {
+		case "/*":
+			depth++
+			i++
+		case "*/":
+			depth--
+			i++
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return len(s)
+}
+
+func dollarQuoteTag(s string) string {
+	if len(s) < 2 || s[0] != '$' {
+		return ""
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i] == '$' {
+			return s[:i+1]
+		}
+		if !isIdentByte(s[i]) {
+			return ""
+		}
+	}
+	return ""
+}
+
+func dollarQuotedTokenLen(s, tag string) int {
+	if idx := strings.Index(s[len(tag):], tag); idx >= 0 {
+		return len(tag) + idx + len(tag)
+	}
+	return len(s)
+}
+
+func isPostgresQuestionOperator(s string, i int) bool {
+	// Include safe operator prefixes such as @? and #?, plus every valid
+	// PostgreSQL operator suffix such as ?#, ?-, and ?-|. Delimiters and
+	// comments are handled by the token lookaround below.
+	start := i
+	for start > 0 && isQuestionOperatorPrefixByte(s[start-1]) {
+		start--
+	}
+	end := i + 1
+	for end < len(s) && isPostgresOperatorByte(s[end]) {
+		if strings.HasPrefix(s[end:], "--") || strings.HasPrefix(s[end:], "/*") {
+			break
+		}
+		end++
+	}
+
+	prev, ok := previousSignificantToken(s, start)
+	if !ok || !tokenCanEndValue(s, prev) {
+		return false
+	}
+	next, ok := nextSignificantToken(s, end)
+	return ok && tokenCanStartValue(s, next)
+}
+
+type sqlTokenKind uint8
+
+const (
+	tokenOther sqlTokenKind = iota
+	tokenWord
+	tokenValue
+	tokenOperator
+	tokenLeftParen
+	tokenRightParen
+	tokenLeftBracket
+	tokenRightBracket
+)
+
+type sqlToken struct {
+	kind       sqlTokenKind
+	start, end int
+}
+
+func previousSignificantToken(s string, before int) (sqlToken, bool) {
+	var last sqlToken
+	found := false
+	for pos := 0; pos < before; {
+		tok, ok := nextSignificantToken(s[:before], pos)
+		if !ok {
+			break
+		}
+		last = tok
+		found = true
+		pos = tok.end
+	}
+	return last, found
+}
+
+func nextSignificantToken(s string, from int) (sqlToken, bool) {
+	for from < len(s) {
+		switch {
+		case isSpaceByte(s[from]):
+			from++
+		case strings.HasPrefix(s[from:], "--"):
+			from += lineCommentLen(s[from:])
+		case strings.HasPrefix(s[from:], "/*"):
+			from += blockCommentLen(s[from:])
+		default:
+			goto token
+		}
+	}
+	return sqlToken{}, false
+
+token:
+	start := from
+	switch s[from] {
+	case '\'':
+		from += quotedTokenLen(s[from:], '\'', isPostgresEscapeString(s, from))
+		return sqlToken{kind: tokenValue, start: start, end: from}, true
+	case '"':
+		from += quotedTokenLen(s[from:], '"', false)
+		return sqlToken{kind: tokenValue, start: start, end: from}, true
+	case '$':
+		if tag := dollarQuoteTag(s[from:]); tag != "" {
+			from += dollarQuotedTokenLen(s[from:], tag)
+			return sqlToken{kind: tokenValue, start: start, end: from}, true
+		}
+	case '(':
+		return sqlToken{kind: tokenLeftParen, start: start, end: from + 1}, true
+	case ')':
+		return sqlToken{kind: tokenRightParen, start: start, end: from + 1}, true
+	case '[':
+		return sqlToken{kind: tokenLeftBracket, start: start, end: from + 1}, true
+	case ']':
+		return sqlToken{kind: tokenRightBracket, start: start, end: from + 1}, true
+	}
+
+	if isIdentByte(s[from]) {
+		for from++; from < len(s) && isIdentByte(s[from]); from++ {
+		}
+		return sqlToken{kind: tokenWord, start: start, end: from}, true
+	}
+	if isPostgresOperatorByte(s[from]) {
+		for from++; from < len(s) && isPostgresOperatorByte(s[from]); from++ {
+			if strings.HasPrefix(s[from:], "--") || strings.HasPrefix(s[from:], "/*") {
+				break
+			}
+		}
+		return sqlToken{kind: tokenOperator, start: start, end: from}, true
+	}
+	return sqlToken{kind: tokenOther, start: start, end: from + 1}, true
+}
+
+func isOperandPrefixKeyword(word string) bool {
+	switch word {
+	case "ALL", "AND", "AS", "BETWEEN", "BY", "CASE", "DEFAULT", "DISTINCT", "ELSE", "EXISTS", "FETCH", "FIRST", "FROM", "GROUP", "HAVING", "ILIKE", "IN", "IS", "LIKE", "LIMIT", "NEXT", "NOT", "OFFSET", "ON", "OR", "ORDER", "PARTITION", "RANGE", "RETURNING", "ROWS", "SELECT", "SET", "SOME", "THEN", "USING", "VALUES", "WHEN", "WHERE", "ZONE":
+		return true
+	default:
+		return false
+	}
+}
+
+func tokenCanEndValue(s string, tok sqlToken) bool {
+	switch tok.kind {
+	case tokenValue, tokenRightParen, tokenRightBracket:
+		return true
+	case tokenWord:
+		return !isOperandPrefixKeyword(strings.ToUpper(s[tok.start:tok.end]))
+	default:
+		return false
+	}
+}
+
+func tokenCanStartValue(s string, tok sqlToken) bool {
+	switch tok.kind {
+	case tokenValue, tokenLeftParen, tokenLeftBracket:
+		return true
+	case tokenWord:
+		return !isOperandPrefixKeyword(strings.ToUpper(s[tok.start:tok.end]))
+	case tokenOperator:
+		return s[tok.start:tok.end] == "?"
+	default:
+		return false
+	}
+}
+
+func isQuestionOperatorPrefixByte(ch byte) bool {
+	switch ch {
+	case '~', '!', '@', '#', '%', '^', '&', '|':
+		return true
+	default:
+		return false
+	}
+}
+
+func isPostgresOperatorByte(ch byte) bool {
+	switch ch {
+	case '+', '-', '*', '/', '<', '>', '=', '~', '!', '@', '#', '%', '^', '&', '|', '`', '?':
+		return true
+	default:
+		return false
+	}
+}
+
+func isIdentByte(ch byte) bool {
+	return ch == '_' || ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= 0x80
+}
+
+func isSpaceByte(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\n', '\r', '\f':
+		return true
+	default:
+		return false
+	}
 }
 
 // QuoteIdent quotes identifier parts for the given dialect.
@@ -198,7 +499,8 @@ func QuoteIdent(dialect string, parts ...string) string {
 	}
 	quoted := make([]string, len(parts))
 	for i, p := range parts {
-		quoted[i] = string(q) + p + string(q)
+		escaped := strings.ReplaceAll(p, string(q), strings.Repeat(string(q), 2))
+		quoted[i] = string(q) + escaped + string(q)
 	}
 	return strings.Join(quoted, ".")
 }

@@ -1224,6 +1224,29 @@ func TestDDLDefaultFunctionParsingAndFallback(t *testing.T) {
 	}
 }
 
+func TestDDLQuotesMappedIdentifiersAndStringDefaults(t *testing.T) {
+	if got := (DDLGenerator{Dialect: "postgresql"}).quoteID(`odd"name`); got != `"odd""name"` {
+		t.Fatalf("PostgreSQL quoteID() = %q", got)
+	}
+	if got := (DDLGenerator{Dialect: "mysql"}).quoteID("odd`name"); got != "`odd``name`" {
+		t.Fatalf("MySQL quoteID() = %q", got)
+	}
+
+	g := DDLGenerator{Dialect: "postgresql"}
+	for _, tt := range []struct {
+		value string
+		want  string
+	}{
+		{value: "O'Reilly", want: "'O''Reilly'"},
+		{value: "123", want: "'123'"},
+	} {
+		field := &ir.Field{Default: &ir.DefaultValue{Value: tt.value, IsString: true}}
+		if got := g.defaultExprForField(field); got != tt.want {
+			t.Errorf("defaultExprForField(%q) = %q, want %q", tt.value, got, tt.want)
+		}
+	}
+}
+
 func TestDDLUnsupportedChangeComments(t *testing.T) {
 	change := Change{Type: ChangeType("RenameTable"), Model: "users"}
 	gen := DDLGenerator{Dialect: "postgresql"}

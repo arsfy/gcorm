@@ -20,7 +20,7 @@ func (MySQL) Placeholder(_ int) string { return "?" }
 func (MySQL) QuoteIdent(parts ...string) string {
 	quoted := make([]string, len(parts))
 	for i, p := range parts {
-		quoted[i] = "`" + p + "`"
+		quoted[i] = "`" + strings.ReplaceAll(p, "`", "``") + "`"
 	}
 	return strings.Join(quoted, ".")
 }
@@ -33,6 +33,10 @@ func (MySQL) RewriteLimitOffset(limit, offset *int) string {
 	var sb strings.Builder
 	if limit != nil {
 		sb.WriteString(fmt.Sprintf("LIMIT %d", *limit))
+	} else if offset != nil {
+		// MySQL does not allow OFFSET without LIMIT. The documented maximum
+		// unsigned BIGINT value represents an effectively unbounded limit.
+		sb.WriteString("LIMIT 18446744073709551615")
 	}
 	if offset != nil {
 		if sb.Len() > 0 {

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/arsfy/gcorm/pkg/schema/ast"
+	"github.com/arsfy/gcorm/pkg/schema/parser"
 )
 
 // ---------------------------------------------------------------------------
@@ -345,6 +346,39 @@ model User {
 	got := Format(doc)
 	if got != want {
 		t.Errorf("comments preservation mismatch.\nwant:\n%s\ngot:\n%s", want, got)
+	}
+}
+
+func TestStringLiteralParseFormatParseRoundTrip(t *testing.T) {
+	src := []byte(`model Message {
+  value String @default("backslash\\ quote\" newline\n tab\t")
+}`)
+
+	first, err := parser.Parse("input.gcorm", src)
+	if err != nil {
+		t.Fatalf("first Parse() error: %v", err)
+	}
+	firstLiteral, ok := first.Models[0].Fields[0].Attributes[0].Args[0].Value.(ast.StringLiteral)
+	if !ok {
+		t.Fatalf("first default = %T, want ast.StringLiteral", first.Models[0].Fields[0].Attributes[0].Args[0].Value)
+	}
+
+	wantExpression := `"backslash\\ quote\" newline\n tab\t"`
+	if got := FormatExpression(firstLiteral); got != wantExpression {
+		t.Fatalf("FormatExpression() = %q, want %q", got, wantExpression)
+	}
+
+	formatted := Format(first)
+	second, err := parser.Parse("formatted.gcorm", []byte(formatted))
+	if err != nil {
+		t.Fatalf("formatted schema should parse: %v\n%s", err, formatted)
+	}
+	secondLiteral, ok := second.Models[0].Fields[0].Attributes[0].Args[0].Value.(ast.StringLiteral)
+	if !ok {
+		t.Fatalf("second default = %T, want ast.StringLiteral", second.Models[0].Fields[0].Attributes[0].Args[0].Value)
+	}
+	if secondLiteral.Value != firstLiteral.Value {
+		t.Fatalf("round-trip value = %q, want %q", secondLiteral.Value, firstLiteral.Value)
 	}
 }
 

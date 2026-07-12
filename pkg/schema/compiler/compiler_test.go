@@ -119,16 +119,31 @@ func TestCompileResolutionErrors(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. CompileFile convenience: works for single file
+// 4. CompileFile convenience: parses and compiles a single file
 // ---------------------------------------------------------------------------
 
 func TestCompileFile(t *testing.T) {
-	// CompileFile creates a minimal DocumentSet; with an empty document
-	// it should still run without panicking. It will produce a validation
-	// error because there are no models.
-	result := CompileFile("schema.prisma", []byte(""))
-	// We just verify it does not panic and returns a result.
-	if result == nil {
-		t.Fatal("expected non-nil result")
+	result := CompileFile("schema.gcorm", []byte(`model User {
+  id Int @id
+}`))
+	if result.HasErrors() {
+		t.Fatalf("unexpected errors: %v", result.Errors)
+	}
+	if result.Schema == nil {
+		t.Fatal("expected non-nil schema")
+	}
+	if len(result.Schema.Models) != 1 || result.Schema.Models[0].Name != "User" {
+		t.Fatalf("models = %#v, want one User model", result.Schema.Models)
+	}
+}
+
+func TestCompileFileParseError(t *testing.T) {
+	result := CompileFile("broken.gcorm", []byte(`model User {
+  id Int @id`))
+	if !result.HasErrors() {
+		t.Fatal("expected parse error")
+	}
+	if result.Schema != nil {
+		t.Fatal("expected nil schema after parse error")
 	}
 }

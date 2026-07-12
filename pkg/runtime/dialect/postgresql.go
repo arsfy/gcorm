@@ -20,7 +20,7 @@ func (PostgreSQL) Placeholder(n int) string { return fmt.Sprintf("$%d", n) }
 func (PostgreSQL) QuoteIdent(parts ...string) string {
 	quoted := make([]string, len(parts))
 	for i, p := range parts {
-		quoted[i] = `"` + p + `"`
+		quoted[i] = `"` + strings.ReplaceAll(p, `"`, `""`) + `"`
 	}
 	return strings.Join(quoted, ".")
 }

@@ -676,9 +676,9 @@ func (g DDLGenerator) changeToDown(c Change, cs *Changeset) string {
 func (g DDLGenerator) quoteID(name string) string {
 	switch g.Dialect {
 	case "mysql":
-		return "`" + name + "`"
+		return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 	default: // postgresql, sqlite
-		return `"` + name + `"`
+		return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 	}
 }
 
@@ -859,7 +859,14 @@ func (g DDLGenerator) defaultExprForField(f *ir.Field) string {
 	if f.Default.IsArray {
 		return g.arrayDefaultExpr(f.Default)
 	}
+	if f.Default.IsString {
+		return quoteSQLString(f.Default.Value)
+	}
 	return g.defaultExpr(formatDefault(f.Default))
+}
+
+func quoteSQLString(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func (g DDLGenerator) defaultExprForChange(c Change) string {

@@ -323,6 +323,35 @@ model User {
 	}
 }
 
+func TestIntegrationRejectsBuiltInScalarTypeNames(t *testing.T) {
+	schema := `
+model String {
+  id Int @id
+}
+
+enum Int {
+  ONE
+}
+`
+	result := parseAndCompile(t, schema)
+	if !result.HasErrors() {
+		t.Fatal("expected validation errors for declarations using built-in scalar names")
+	}
+
+	for _, name := range []string{"String", "Int"} {
+		found := false
+		for _, err := range result.Errors {
+			if strings.Contains(err.Error(), name) && strings.Contains(err.Error(), "built-in scalar type") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected built-in scalar conflict for %q, got: %v", name, result.Errors)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 5. Empty schema
 // ---------------------------------------------------------------------------

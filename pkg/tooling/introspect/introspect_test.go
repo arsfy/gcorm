@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/arsfy/gcorm/pkg/schema/compiler"
+	"github.com/arsfy/gcorm/pkg/schema/parser"
 )
 
 func TestDetectProvider(t *testing.T) {
@@ -119,12 +122,60 @@ func TestGenerateSchema(t *testing.T) {
 		`@unique`,
 		`model Posts {`,
 		`@@index([age])`,
+		`@@map("users")`,
+		`@@map("posts")`,
 	}
 
 	for _, c := range checks {
 		if !strings.Contains(schema, c) {
 			t.Errorf("generated schema missing %q\nGot:\n%s", c, schema)
 		}
+	}
+}
+
+func TestGenerateSchemaPreservesTableMappingAndTypedDefaults(t *testing.T) {
+	tables := []TableInfo{{
+		Name: "account_settings",
+		Columns: []ColumnInfo{
+			{Name: "id", DataType: "INTEGER", IsPrimaryKey: true, Default: "42"},
+			{Name: "enabled", DataType: "BOOLEAN", Default: "false"},
+			{Name: "attempts", DataType: "INTEGER", Default: "(3)"},
+			{Name: "label", DataType: "TEXT", Default: "'O''Reilly'::text"},
+			{Name: "mode", DataType: "TEXT", Default: "'uuid'::text"},
+		},
+	}}
+
+	schema := GenerateSchema("postgresql", tables)
+	for _, want := range []string{
+		`model AccountSettings {`,
+		`@@map("account_settings")`,
+		`@default(42)`,
+		`@default(false)`,
+		`@default(3)`,
+		`@default("O'Reilly")`,
+		`@default("uuid")`,
+	} {
+		if !strings.Contains(schema, want) {
+			t.Fatalf("generated schema missing %q:\n%s", want, schema)
+		}
+	}
+	if strings.Contains(schema, `@default(uuid())`) {
+		t.Fatalf("quoted uuid literal was mistaken for uuid():\n%s", schema)
+	}
+
+	ds, err := parser.ParseMulti(map[string][]byte{"schema.gcorm": []byte(schema)})
+	if err != nil {
+		t.Fatalf("generated schema parse error: %v\n%s", err, schema)
+	}
+	result := compiler.Compile(ds)
+	if len(result.Errors) > 0 {
+		t.Fatalf("generated schema compile errors: %v\n%s", result.Errors, schema)
+	}
+	if result.Schema == nil || len(result.Schema.Models) != 1 {
+		t.Fatalf("compiled generated schema = %#v", result.Schema)
+	}
+	if got := result.Schema.Models[0].TableName(); got != "account_settings" {
+		t.Fatalf("compiled table name = %q, want account_settings", got)
 	}
 }
 
@@ -173,12 +224,46 @@ func TestMapDefault(t *testing.T) {
 		{"now()", "now()"},
 		{"CURRENT_TIMESTAMP", "now()"},
 		{"nextval('seq')", "autoincrement()"},
-		{"42", `"42"`},
+		{"42", `42`},
+		{"false", `false`},
+		{"'draft'::text", `"draft"`},
+		{"'uuid'::text", `"uuid"`},
 	}
 	for _, tt := range tests {
 		got := mapDefault(tt.input)
 		if got != tt.want {
 			t.Errorf("mapDefault(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestNumericDefaultMatchesSchemaNumberGrammar(t *testing.T) {
+	for _, value := range []string{"0", "42", "-7", "3.14", "-0.5"} {
+		if !isNumericDefault(value) {
+			t.Errorf("isNumericDefault(%q) = false, want true", value)
+		}
+	}
+	for _, value := range []string{"", "+1", "1e3", "NaN", ".5", "1.", "--1"} {
+		if isNumericDefault(value) {
+			t.Errorf("isNumericDefault(%q) = true, want false", value)
+		}
+	}
+}
+
+func TestStripPostgresDefaultCastOnlyRemovesTrailingCast(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{input: `'draft'::text`, want: `'draft'`},
+		{input: `'42'::text::integer`, want: `'42'`},
+		{input: `(1 + 2)::numeric`, want: `(1 + 2)`},
+		{input: `coalesce('a'::text, 'b')`, want: `coalesce('a'::text, 'b')`},
+		{input: `price::numeric + 1`, want: `price::numeric + 1`},
+	}
+	for _, tt := range tests {
+		if got := stripPostgresDefaultCast(tt.input); got != tt.want {
+			t.Errorf("stripPostgresDefaultCast(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }

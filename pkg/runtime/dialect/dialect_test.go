@@ -63,6 +63,9 @@ func TestQuoteIdent(t *testing.T) {
 		{MySQL{}, []string{"mydb", "users"}, "`mydb`.`users`"},
 		{SQLite{}, []string{"users"}, `"users"`},
 		{SQLite{}, []string{"main", "items"}, `"main"."items"`},
+		{PostgreSQL{}, []string{`weird"name`}, `"weird""name"`},
+		{MySQL{}, []string{"weird`name"}, "`weird``name`"},
+		{SQLite{}, []string{`weird"name`}, `"weird""name"`},
 	}
 	for _, tc := range cases {
 		got := tc.dialect.QuoteIdent(tc.parts...)
@@ -267,6 +270,7 @@ func TestRewriteLimitOffset(t *testing.T) {
 		{"pg both", PostgreSQL{}, intPtr(10), intPtr(20), "LIMIT 10 OFFSET 20"},
 		{"pg neither", PostgreSQL{}, nil, nil, ""},
 		{"mysql limit only", MySQL{}, intPtr(5), nil, "LIMIT 5"},
+		{"mysql offset only", MySQL{}, nil, intPtr(10), "LIMIT 18446744073709551615 OFFSET 10"},
 		{"mysql both", MySQL{}, intPtr(5), intPtr(10), "LIMIT 5 OFFSET 10"},
 		{"sqlite limit only", SQLite{}, intPtr(5), nil, "LIMIT 5"},
 		{"sqlite offset only", SQLite{}, nil, intPtr(10), "LIMIT -1 OFFSET 10"},

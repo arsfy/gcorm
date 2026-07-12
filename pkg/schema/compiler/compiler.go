@@ -5,6 +5,7 @@ package compiler
 import (
 	"github.com/arsfy/gcorm/pkg/schema/ast"
 	"github.com/arsfy/gcorm/pkg/schema/ir"
+	"github.com/arsfy/gcorm/pkg/schema/parser"
 	"github.com/arsfy/gcorm/pkg/schema/resolve"
 	"github.com/arsfy/gcorm/pkg/schema/validator"
 )
@@ -47,10 +48,13 @@ func Compile(ds *ast.DocumentSet) *CompileResult {
 // CompileFile compiles a single schema file represented as raw bytes.
 // The filename is used for error reporting only.
 func CompileFile(filename string, src []byte) *CompileResult {
-	_ = src // Parsing is handled by the parser package (not yet wired in).
-	// Build a minimal DocumentSet with the file recorded.
+	doc, err := parser.Parse(filename, src)
+	if err != nil {
+		return &CompileResult{Errors: []error{err}}
+	}
+
 	ds := &ast.DocumentSet{
-		Documents: []*ast.Document{{}},
+		Documents: []*ast.Document{doc},
 		Files:     []string{filename},
 	}
 	return Compile(ds)
