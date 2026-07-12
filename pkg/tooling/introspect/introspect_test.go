@@ -121,7 +121,7 @@ func TestGenerateSchema(t *testing.T) {
 		`@default(uuid())`,
 		`@unique`,
 		`model Posts {`,
-		`@@index([age])`,
+		`@@index([age], name: "idx_users_age")`,
 		`@@map("users")`,
 		`@@map("posts")`,
 	}
@@ -130,6 +130,19 @@ func TestGenerateSchema(t *testing.T) {
 		if !strings.Contains(schema, c) {
 			t.Errorf("generated schema missing %q\nGot:\n%s", c, schema)
 		}
+	}
+}
+
+func TestGenerateSchemaSanitizesNamesAndPreservesCompositeConstraints(t *testing.T) {
+	tables := []TableInfo{{Name: "user-data", Columns: []ColumnInfo{{Name: "1st", DataType: "INT", IsPrimaryKey: true}, {Name: "User ID", DataType: "INT", IsPrimaryKey: true}, {Name: "user-id", DataType: "TEXT"}}, Indexes: []IndexInfo{{Name: "uq_user", Columns: []string{"User ID", "user-id"}, IsUnique: true}}}}
+	schema := GenerateSchema("sqlite", tables)
+	for _, want := range []string{`model UserData {`, `field1st`, `userID`, `userId`, `@map("1st")`, `@@id([field1st, userID])`, `@@unique([userID, userId], name: "uq_user")`, `@@map("user-data")`} {
+		if !strings.Contains(schema, want) {
+			t.Fatalf("missing %q:\n%s", want, schema)
+		}
+	}
+	if result := compiler.CompileFile("schema.gcorm", []byte(schema)); result.HasErrors() {
+		t.Fatalf("generated schema invalid: %v\n%s", result.Errors, schema)
 	}
 }
 

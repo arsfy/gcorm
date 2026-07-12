@@ -20,15 +20,34 @@ type DDLGenerator struct {
 // GenerateUp produces the up migration SQL.
 func (g DDLGenerator) GenerateUp(cs *Changeset) string {
 	var b strings.Builder
+	if g.Dialect == "postgresql" && cs != nil {
+		b.WriteString(g.postgresEnumChanges(cs))
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+	}
 	createdTables := make(map[string]bool)
+	rebuildTables := make(map[string]bool)
 	if cs != nil {
 		for _, c := range cs.Changes {
 			if c.Type == CreateTable {
 				createdTables[c.Model] = true
 			}
+			if g.Dialect == "sqlite" && sqliteRequiresRebuild(c.Type) {
+				rebuildTables[c.Model] = true
+			}
 		}
 	}
+	rebuilt := make(map[string]bool)
 	for _, c := range g.orderedChanges(cs) {
+		if rebuildTables[c.Model] && !createdTables[c.Model] {
+			if !rebuilt[c.Model] {
+				b.WriteString(g.sqliteRebuildTableSQL(c.Model, cs))
+				b.WriteString("\n\n")
+				rebuilt[c.Model] = true
+			}
+			continue
+		}
 		if g.Dialect == "sqlite" && c.Type == AddFK && createdTables[c.Model] {
 			continue
 		}
@@ -39,6 +58,105 @@ func (g DDLGenerator) GenerateUp(cs *Changeset) string {
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func (g DDLGenerator) postgresEnumChanges(cs *Changeset) string {
+	oldEnums := map[string]*ir.Enum{}
+	if cs.Old != nil {
+		for _, e := range cs.Old.Enums {
+			oldEnums[e.Name] = e
+		}
+	}
+	var statements []string
+	if cs.New == nil {
+		return ""
+	}
+	for _, e := range cs.New.Enums {
+		name := e.Name
+		if e.DBName != "" {
+			name = e.DBName
+		}
+		old := oldEnums[e.Name]
+		if old == nil {
+			values := make([]string, len(e.Values))
+			for i, v := range e.Values {
+				value := v.Name
+				if v.DBName != "" {
+					value = v.DBName
+				}
+				values[i] = quoteSQLString(value)
+			}
+			statements = append(statements, "CREATE TYPE "+g.quoteID(name)+" AS ENUM ("+strings.Join(values, ", ")+");")
+			continue
+		}
+		seen := map[string]bool{}
+		for _, v := range old.Values {
+			seen[v.Name] = true
+		}
+		for _, v := range e.Values {
+			if !seen[v.Name] {
+				value := v.Name
+				if v.DBName != "" {
+					value = v.DBName
+				}
+				statements = append(statements, "ALTER TYPE "+g.quoteID(name)+" ADD VALUE IF NOT EXISTS "+quoteSQLString(value)+";")
+			}
+		}
+	}
+	return strings.Join(statements, "\n")
+}
+
+func sqliteRequiresRebuild(t ChangeType) bool {
+	switch t {
+	case DropColumn, AlterType, AlterNull, AlterDefault, AddUnique, DropUnique, ChangePK, AddFK, DropFK:
+		return true
+	}
+	return false
+}
+
+func (g DDLGenerator) sqliteRebuildTableSQL(table string, cs *Changeset) string {
+	newModel := findModel(g.Schema, table)
+	if newModel == nil {
+		return "-- SQLite table rebuild unavailable for " + table
+	}
+	temp := "__gco_new_" + table
+	create := g.createTableSQL(Change{Type: CreateTable, Model: table}, cs)
+	create = strings.Replace(create, "CREATE TABLE "+g.quoteID(table), "CREATE TABLE "+g.quoteID(temp), 1)
+	oldModel := findModel(cs.Old, table)
+	oldCols := map[string]bool{}
+	if oldModel != nil {
+		for _, f := range oldModel.ScalarFields() {
+			oldCols[columnName(f)] = true
+		}
+	}
+	var cols []string
+	for _, f := range newModel.ScalarFields() {
+		col := columnName(f)
+		if oldCols[col] {
+			cols = append(cols, col)
+		}
+	}
+	var b strings.Builder
+	b.WriteString("PRAGMA defer_foreign_keys = ON;\n")
+	b.WriteString(create)
+	b.WriteString("\n")
+	if len(cols) > 0 {
+		quoted := g.quoteIDs(cols)
+		fmt.Fprintf(&b, "INSERT INTO %s (%s) SELECT %s FROM %s;\n", g.quoteID(temp), strings.Join(quoted, ", "), strings.Join(quoted, ", "), g.quoteID(table))
+	}
+	fmt.Fprintf(&b, "DROP TABLE %s;\nALTER TABLE %s RENAME TO %s;", g.quoteID(table), g.quoteID(temp), g.quoteID(table))
+	for _, idx := range newModel.Indexes {
+		name := idx.Name
+		if name == "" {
+			name = defaultIndexName(newModel, normalizeFieldNames(newModel, idx.Fields))
+		}
+		unique := ""
+		if idx.IsUnique {
+			unique = "UNIQUE "
+		}
+		b.WriteString("\n" + g.createIndexSQL(name, table, unique, g.indexColumnsSQL(newModel, idx), idx.Where))
+	}
+	return b.String()
 }
 
 // GenerateDown produces the best-effort down migration SQL.
@@ -90,9 +208,36 @@ func (g DDLGenerator) changeToUp(c Change, cs *Changeset) string {
 		return g.addFKSQL(c)
 	case DropFK:
 		return g.dropFKSQL(c)
+	case CreateEnum:
+		return "" // PostgreSQL enum creation is emitted before table changes.
+	case AlterEnum:
+		if g.Dialect == "mysql" {
+			return g.mysqlRefreshEnumColumns(c.Model)
+		}
+		return "" // PostgreSQL additions are emitted in postgresEnumChanges; SQLite stores enum values as text.
+	case DropEnum:
+		if g.Dialect == "postgresql" {
+			return "DROP TYPE " + g.quoteID(c.Model) + ";"
+		}
+		return ""
 	default:
 		return fmt.Sprintf("-- unsupported change type: %s", c.Type)
 	}
+}
+
+func (g DDLGenerator) mysqlRefreshEnumColumns(enumName string) string {
+	if g.Schema == nil {
+		return ""
+	}
+	var statements []string
+	for _, m := range g.Schema.Models {
+		for _, f := range m.ScalarFields() {
+			if f.Type == ir.FieldKindEnum && f.EnumType == enumName {
+				statements = append(statements, fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s;", g.quoteID(m.TableName()), g.columnDef(f)))
+			}
+		}
+	}
+	return strings.Join(statements, "\n")
 }
 
 func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
@@ -180,11 +325,17 @@ func (g DDLGenerator) alterTypeSQL(c Change) string {
 	tbl := g.quoteID(c.Model)
 	col := g.quoteID(c.Field)
 	newType := g.sqlTypeSignature(c.NewValue)
+	if c.NewField != nil {
+		newType = g.columnSQLType(c.NewField)
+	}
 
 	switch g.Dialect {
 	case "postgresql":
 		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s;", tbl, col, newType)
 	case "mysql":
+		if c.NewField != nil {
+			return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s;", tbl, g.columnDef(c.NewField))
+		}
 		return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s;", tbl, col, newType)
 	default: // sqlite
 		return fmt.Sprintf("-- SQLite: ALTER COLUMN not supported; table rebuild required for %s.%s to %s", c.Model, c.Field, newType)
@@ -204,16 +355,10 @@ func (g DDLGenerator) alterNullSQL(c Change) string {
 		}
 		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;", tbl, col)
 	case "mysql":
-		sqlType := g.sqlType(c.NewValue)
-		// MySQL MODIFY requires restating the full type; use placeholder if we
-		// don't know the actual type from the change context.
-		if sqlType == "TEXT" {
-			sqlType = "/* current_type */"
+		if c.NewField != nil {
+			return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s;", tbl, g.columnDef(c.NewField))
 		}
-		if nullable {
-			return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s NULL;", tbl, col, sqlType)
-		}
-		return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s NOT NULL;", tbl, col, sqlType)
+		return fmt.Sprintf("-- MySQL: nullability change requires the full column definition for %s.%s", c.Model, c.Field)
 	default: // sqlite
 		return fmt.Sprintf("-- SQLite: nullability change not supported inline for %s.%s", c.Model, c.Field)
 	}
@@ -849,7 +994,69 @@ func (g DDLGenerator) columnSQLType(f *ir.Field) string {
 	if f == nil {
 		return g.sqlType("")
 	}
-	return g.sqlTypeSignature(fieldTypeSignature(f))
+	if f.NativeType != nil {
+		return g.nativeTypeSQL(f.NativeType)
+	}
+	if f.Type == ir.FieldKindEnum {
+		if g.Dialect == "postgresql" {
+			return g.quoteID(f.EnumType)
+		}
+		if g.Dialect == "mysql" {
+			if enum := findEnum(g.Schema, f.EnumType); enum != nil {
+				values := make([]string, len(enum.Values))
+				for i, value := range enum.Values {
+					values[i] = quoteSQLString(value.Name)
+				}
+				return "ENUM(" + strings.Join(values, ", ") + ")"
+			}
+		}
+		return "TEXT"
+	}
+	base := f.ScalarType
+	if f.IsList {
+		base += "[]"
+	}
+	return g.sqlTypeSignature(base)
+}
+
+func (g DDLGenerator) nativeTypeSQL(nt *ir.NativeType) string {
+	if nt == nil {
+		return "TEXT"
+	}
+	name := nt.Name
+	// Native type names originate in the validated @db namespace. Keep only
+	// identifier characters here so they can never become an SQL fragment.
+	for _, r := range name {
+		if !(r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
+			return "TEXT"
+		}
+	}
+	if len(nt.Args) == 0 {
+		return strings.ToUpper(name)
+	}
+	args := make([]string, len(nt.Args))
+	for i, arg := range nt.Args {
+		arg = strings.TrimSpace(arg)
+		for _, r := range arg {
+			if !(r >= '0' && r <= '9' || r == ',') {
+				return "TEXT"
+			}
+		}
+		args[i] = arg
+	}
+	return strings.ToUpper(name) + "(" + strings.Join(args, ",") + ")"
+}
+
+func findEnum(schema *ir.Schema, name string) *ir.Enum {
+	if schema == nil {
+		return nil
+	}
+	for _, enum := range schema.Enums {
+		if enum.Name == name {
+			return enum
+		}
+	}
+	return nil
 }
 
 func (g DDLGenerator) defaultExprForField(f *ir.Field) string {

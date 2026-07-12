@@ -32,6 +32,17 @@ type sqlRunner interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
+// IntrospectDatabase exposes the live-database reflection used by db push so
+// the introspect CLI and schema push always observe the same database shape.
+func IntrospectDatabase(ctx context.Context, db *sql.DB, provider string, target *ir.Schema, dsn string) (*ir.Schema, error) {
+	return introspectDatabase(ctx, db, provider, target, dsn)
+}
+
+// NormalizeConnectionURL converts user-facing URLs to database/sql driver DSNs.
+func NormalizeConnectionURL(rawURL, provider string) (string, error) {
+	return normalizeConnectionURL(rawURL, provider)
+}
+
 // Options configures an importable db push operation.
 type Options struct {
 	SchemaFS          fs.FS
@@ -170,11 +181,44 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 	if err := validateNoInternalTableConflict(targetSchema); err != nil {
 		return nil, err
 	}
+	if provider == "postgresql" && targetSchema.Datasource != nil && len(targetSchema.Datasource.Schemas) > 1 {
+		return nil, fmt.Errorf("db push does not yet support multiple postgresql datasource schemas; use schema or a single schemas entry")
+	}
 	if provider == "mysql" {
 		return pushCompiledMySQL(ctx, db, targetSchema, schemaHash, dsn, opts)
 	}
 
-	currentSchema, err := introspectDatabase(ctx, db, provider, targetSchema, dsn)
+	var tx *sql.Tx
+	var runner sqlRunner = db
+	if !opts.DryRun {
+		tx, err = db.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, fmt.Errorf("begin transaction: %w", err)
+		}
+		defer tx.Rollback()
+		if provider == "postgresql" {
+			schemaName := resolveSchemaName(targetSchema, dsn)
+			quotedSchema := `"` + strings.ReplaceAll(schemaName, `"`, `""`) + `"`
+			if _, err := tx.ExecContext(ctx, "SET LOCAL search_path TO "+quotedSchema); err != nil {
+				return nil, fmt.Errorf("set postgresql search_path: %w", err)
+			}
+		}
+		if !opts.DisableLock {
+			if err := lockPushTransaction(ctx, tx, provider); err != nil {
+				return nil, err
+			}
+		}
+		if provider == "sqlite" {
+			// Force acquisition of SQLite's writer lock before introspection so
+			// concurrent pushes cannot both plan from the same stale schema.
+			if err := ensureSchemaPushesTable(ctx, tx, provider); err != nil {
+				return nil, err
+			}
+		}
+		runner = tx
+	}
+
+	currentSchema, err := introspectDatabase(ctx, runner, provider, targetSchema, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("introspect database: %w", err)
 	}
@@ -191,7 +235,16 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 		if opts.DryRun {
 			return result, nil
 		}
-		return recordNoopPush(ctx, db, provider, schemaHash, len(targetSchema.Models), opts)
+		if err := ensureSchemaPushesTable(ctx, tx, provider); err != nil {
+			return nil, err
+		}
+		if err := insertSchemaPushRecord(ctx, tx, provider, schemaHash, len(targetSchema.Models), 0); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit transaction: %w", err)
+		}
+		return result, nil
 	}
 
 	risky := riskyChanges(cs)
@@ -211,18 +264,6 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 	}
 	if opts.DryRun {
 		return result, nil
-	}
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	if !opts.DisableLock {
-		if err := lockPushTransaction(ctx, tx, provider); err != nil {
-			return nil, err
-		}
 	}
 
 	if err := ensureSchemaPushesTable(ctx, tx, provider); err != nil {
@@ -395,7 +436,7 @@ func resolveURL(explicitURL string, schema *ir.Schema) (string, string, error) {
 		if err != nil {
 			return "", "", err
 		}
-		return normalizedURL, "--url", nil
+		return applyDatasourceSchema(normalizedURL, schema)
 	}
 	if schema != nil && schema.Datasource != nil {
 		ds := schema.Datasource
@@ -411,14 +452,16 @@ func resolveURL(explicitURL string, schema *ir.Schema) (string, string, error) {
 			if err != nil {
 				return "", "", err
 			}
-			return normalizedURL, fmt.Sprintf("datasource env(%q)", ds.EnvVar), nil
+			normalizedURL, err = withPostgresSearchPath(normalizedURL, ds)
+			return normalizedURL, fmt.Sprintf("datasource env(%q)", ds.EnvVar), err
 		}
 		if ds.URL != "" {
 			normalizedURL, err := normalizeConnectionURL(ds.URL, ds.Provider)
 			if err != nil {
 				return "", "", err
 			}
-			return normalizedURL, "schema datasource", nil
+			normalizedURL, err = withPostgresSearchPath(normalizedURL, ds)
+			return normalizedURL, "schema datasource", err
 		}
 	}
 	modelCount := 0
@@ -426,6 +469,41 @@ func resolveURL(explicitURL string, schema *ir.Schema) (string, string, error) {
 		modelCount = len(schema.Models)
 	}
 	return "", "", fmt.Errorf("db push: schema compiled with %d model(s). Push to database requires a connection URL.\nSet datasource url in your .gcorm schema or provide --url flag.", modelCount)
+}
+
+func applyDatasourceSchema(normalizedURL string, schema *ir.Schema) (string, string, error) {
+	if schema == nil || schema.Datasource == nil {
+		return normalizedURL, "--url", nil
+	}
+	value, err := withPostgresSearchPath(normalizedURL, schema.Datasource)
+	return value, "--url", err
+}
+
+func withPostgresSearchPath(rawURL string, ds *ir.Datasource) (string, error) {
+	if ds == nil || ds.Provider != "postgresql" {
+		return rawURL, nil
+	}
+	schemaName := strings.TrimSpace(ds.Schema)
+	if schemaName == "" && len(ds.Schemas) == 1 {
+		schemaName = strings.TrimSpace(ds.Schemas[0])
+	}
+	if schemaName == "" {
+		return rawURL, nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" {
+		return rawURL, nil
+	}
+	q := u.Query()
+	if existing := strings.TrimSpace(q.Get("search_path")); existing != "" && existing != schemaName {
+		return "", fmt.Errorf("postgresql datasource schema %q conflicts with URL search_path %q", schemaName, existing)
+	}
+	q.Set("search_path", schemaName)
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 func detectProvider(schema *ir.Schema) (string, error) {
@@ -500,6 +578,9 @@ func normalizePostgresURL(rawURL string) (string, error) {
 func resolveSchemaName(schema *ir.Schema, dsn string) string {
 	if schema != nil && schema.Datasource != nil && schema.Datasource.Schema != "" {
 		return schema.Datasource.Schema
+	}
+	if schema != nil && schema.Datasource != nil && len(schema.Datasource.Schemas) == 1 {
+		return schema.Datasource.Schemas[0]
 	}
 	if schemaName := postgresSchemaFromURL(dsn); schemaName != "" {
 		return schemaName
@@ -1153,19 +1234,23 @@ ORDER BY table_name`, schemaName)
 
 func loadPostgresColumns(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
-SELECT table_name, column_name, is_nullable, data_type, udt_name, column_default, is_identity
-FROM information_schema.columns
-WHERE table_schema = $1
-ORDER BY table_name, ordinal_position`, schemaName)
+SELECT c.table_name, c.column_name, c.is_nullable, c.data_type, c.udt_name, c.column_default, c.is_identity,
+       format_type(a.atttypid, a.atttypmod)
+FROM information_schema.columns c
+JOIN pg_namespace n ON n.nspname = c.table_schema
+JOIN pg_class cls ON cls.relnamespace = n.oid AND cls.relname = c.table_name
+JOIN pg_attribute a ON a.attrelid = cls.oid AND a.attname = c.column_name
+WHERE c.table_schema = $1
+ORDER BY c.table_name, c.ordinal_position`, schemaName)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var tableName, columnName, isNullable, dataType, udtName, isIdentity string
+		var tableName, columnName, isNullable, dataType, udtName, isIdentity, formattedType string
 		var columnDefault sql.NullString
-		if err := rows.Scan(&tableName, &columnName, &isNullable, &dataType, &udtName, &columnDefault, &isIdentity); err != nil {
+		if err := rows.Scan(&tableName, &columnName, &isNullable, &dataType, &udtName, &columnDefault, &isIdentity, &formattedType); err != nil {
 			return err
 		}
 		model := models[tableName]
@@ -1180,6 +1265,7 @@ ORDER BY table_name, ordinal_position`, schemaName)
 			Default:    postgresDefaultValue(columnDefault.String, isIdentity == "YES"),
 		}
 		field.ScalarType, field.IsList = postgresColumnType(dataType, udtName)
+		field.NativeType = postgresNativeType(formattedType, field.ScalarType)
 		model.Fields = append(model.Fields, field)
 	}
 	return rows.Err()
@@ -1342,28 +1428,22 @@ ORDER BY t.relname, i.relname`, schemaName)
 
 func loadPostgresForeignKeys(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
-SELECT
-  tc.table_name,
-  tc.constraint_name,
-  kcu.column_name,
-  ccu.table_name AS foreign_table_name,
-  ccu.column_name AS foreign_column_name,
-  rc.delete_rule,
-  rc.update_rule
-FROM information_schema.table_constraints tc
-JOIN information_schema.key_column_usage kcu
-  ON tc.constraint_name = kcu.constraint_name
- AND tc.table_schema = kcu.table_schema
- AND tc.table_name = kcu.table_name
-JOIN information_schema.constraint_column_usage ccu
-  ON tc.constraint_name = ccu.constraint_name
- AND tc.table_schema = ccu.constraint_schema
-JOIN information_schema.referential_constraints rc
-  ON tc.constraint_name = rc.constraint_name
- AND tc.table_schema = rc.constraint_schema
-WHERE tc.table_schema = $1
-  AND tc.constraint_type = 'FOREIGN KEY'
-ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`, schemaName)
+SELECT src.relname,
+       con.conname,
+       src_col.attname,
+       dst.relname,
+       dst_col.attname,
+       CASE con.confdeltype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END,
+       CASE con.confupdtype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END
+FROM pg_constraint con
+JOIN pg_class src ON src.oid = con.conrelid
+JOIN pg_namespace ns ON ns.oid = src.relnamespace
+JOIN pg_class dst ON dst.oid = con.confrelid
+JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS keys(src_attnum, dst_attnum, ord) ON true
+JOIN pg_attribute src_col ON src_col.attrelid = src.oid AND src_col.attnum = keys.src_attnum
+JOIN pg_attribute dst_col ON dst_col.attrelid = dst.oid AND dst_col.attnum = keys.dst_attnum
+WHERE con.contype = 'f' AND ns.nspname = $1
+ORDER BY src.relname, con.conname, keys.ord`, schemaName)
 	if err != nil {
 		return err
 	}
@@ -1463,6 +1543,7 @@ ORDER BY table_name, ordinal_position`)
 			IsOptional: isNullable == "YES",
 			Default:    mysqlDefaultValue(columnDefault.String, extra),
 		}
+		field.NativeType = mysqlNativeType(columnType, field.ScalarType)
 		model.Fields = append(model.Fields, field)
 	}
 	return rows.Err()
@@ -2024,6 +2105,31 @@ func postgresColumnType(dataType, udtName string) (string, bool) {
 	return postgresScalarType(dataType, udtName), false
 }
 
+func postgresNativeType(formatted, scalar string) *ir.NativeType {
+	lower := strings.ToLower(strings.TrimSpace(formatted))
+	name := ""
+	args := []string{}
+	switch {
+	case strings.HasPrefix(lower, "character varying("):
+		name = "VarChar"
+	case strings.HasPrefix(lower, "numeric("):
+		name = "Decimal"
+	case lower == "text" && scalar == "String":
+		return nil
+	default:
+		return nil
+	}
+	if start := strings.Index(lower, "("); start >= 0 {
+		if end := strings.LastIndex(lower, ")"); end > start {
+			args = strings.Split(lower[start+1:end], ",")
+			for i := range args {
+				args[i] = strings.TrimSpace(args[i])
+			}
+		}
+	}
+	return &ir.NativeType{Name: name, Args: args}
+}
+
 func postgresScalarType(dataType, udtName string) string {
 	upperType := strings.ToUpper(strings.TrimSpace(dataType))
 	upperUDT := strings.ToUpper(strings.TrimSpace(udtName))
@@ -2182,6 +2288,34 @@ func mysqlScalarType(dataType, columnType string) string {
 	default:
 		return "String"
 	}
+}
+
+func mysqlNativeType(columnType, scalar string) *ir.NativeType {
+	lower := strings.ToLower(strings.TrimSpace(columnType))
+	name := ""
+	if (scalar == "String" && lower == "varchar(255)") || (scalar == "Decimal" && lower == "decimal(65,30)") {
+		return nil
+	}
+	switch {
+	case strings.HasPrefix(lower, "varchar("):
+		name = "VarChar"
+	case strings.HasPrefix(lower, "char(") && scalar != "UUID":
+		name = "Char"
+	case strings.HasPrefix(lower, "decimal("):
+		name = "Decimal"
+	default:
+		return nil
+	}
+	start := strings.Index(lower, "(")
+	end := strings.LastIndex(lower, ")")
+	var args []string
+	if start >= 0 && end > start {
+		args = strings.Split(lower[start+1:end], ",")
+		for i := range args {
+			args[i] = strings.TrimSpace(args[i])
+		}
+	}
+	return &ir.NativeType{Name: name, Args: args}
 }
 
 func mysqlDefaultValue(def, extra string) *ir.DefaultValue {

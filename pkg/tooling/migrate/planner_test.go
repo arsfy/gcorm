@@ -1151,16 +1151,16 @@ func TestDDLAlterNullSQLByDialect(t *testing.T) {
 			want:    `ALTER TABLE "users" ALTER COLUMN "email" DROP NOT NULL;`,
 		},
 		{
-			name:    "mysql set null with known type",
+			name:    "mysql rejects null change without complete definition",
 			dialect: "mysql",
 			change:  Change{Type: AlterNull, Model: "users", Field: "age", NewValue: "Int"},
-			want:    "ALTER TABLE `users` MODIFY COLUMN `age` INT NOT NULL;",
+			want:    "-- MySQL: nullability change requires the full column definition for users.age",
 		},
 		{
-			name:    "mysql drop not null with placeholder type",
+			name:    "mysql rejects null change without full column definition",
 			dialect: "mysql",
 			change:  Change{Type: AlterNull, Model: "users", Field: "bio", NewValue: "optional"},
-			want:    "ALTER TABLE `users` MODIFY COLUMN `bio` /* current_type */ NULL;",
+			want:    "-- MySQL: nullability change requires the full column definition for users.bio",
 		},
 		{
 			name:    "sqlite unsupported",
@@ -1177,6 +1177,30 @@ func TestDDLAlterNullSQLByDialect(t *testing.T) {
 				t.Fatalf("alterNullSQL() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMySQLAlterUsesCompleteTargetColumnDefinition(t *testing.T) {
+	field := &ir.Field{Name: "id", DBName: "order", Type: ir.FieldKindScalar, ScalarType: "BigInt", Default: &ir.DefaultValue{IsFunction: true, FuncName: "autoincrement"}}
+	change := Change{Type: AlterNull, Model: "select", Field: "order", NewValue: "required", NewField: field}
+	got := DDLGenerator{Dialect: "mysql"}.alterNullSQL(change)
+	want := "ALTER TABLE `select` MODIFY COLUMN `order` BIGINT AUTO_INCREMENT NOT NULL;"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestNativeTypeAndEnumChangesParticipateInDiff(t *testing.T) {
+	oldField := &ir.Field{Name: "name", Type: ir.FieldKindScalar, ScalarType: "String", NativeType: &ir.NativeType{Name: "VarChar", Args: []string{"100"}}}
+	newField := &ir.Field{Name: "name", Type: ir.FieldKindScalar, ScalarType: "String", NativeType: &ir.NativeType{Name: "VarChar", Args: []string{"200"}}}
+	old := &ir.Schema{Models: []*ir.Model{{Name: "User", Fields: []*ir.Field{oldField}}}, Enums: []*ir.Enum{{Name: "Role", Values: []*ir.EnumValue{{Name: "USER"}}}}}
+	new := &ir.Schema{Models: []*ir.Model{{Name: "User", Fields: []*ir.Field{newField}}}, Enums: []*ir.Enum{{Name: "Role", Values: []*ir.EnumValue{{Name: "USER"}, {Name: "ADMIN"}}}}}
+	cs := Diff(old, new)
+	if !hasChange(cs, AlterType, "User", "name") {
+		t.Fatal("native type change not detected")
+	}
+	if !hasChange(cs, AlterEnum, "Role", "") {
+		t.Fatal("enum change not detected")
 	}
 }
 

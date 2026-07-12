@@ -50,6 +50,22 @@ func TestResolveURLUsesSchemaDatasourceURL(t *testing.T) {
 	}
 }
 
+func TestResolveURLAppliesDatasourceSchemaToSearchPath(t *testing.T) {
+	schema := &ir.Schema{Datasource: &ir.Datasource{Provider: "postgresql", URL: "postgresql://localhost/app", Schema: "tenant"}}
+	got, _, err := resolveURL("", schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(got)
+	if value := u.Query().Get("search_path"); value != "tenant" {
+		t.Fatalf("search_path=%q", value)
+	}
+	schema.Datasource.URL = "postgresql://localhost/app?search_path=other"
+	if _, _, err := resolveURL("", schema); err == nil {
+		t.Fatal("expected conflicting search_path error")
+	}
+}
+
 func TestResolveURLUsesDatasourceEnvURL(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgresql://postgres:secret@localhost:15432/postgres?schema=public")
 	schema := &ir.Schema{

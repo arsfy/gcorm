@@ -15,11 +15,12 @@ type Schema struct {
 // Datasource holds the resolved database connection configuration.
 type Datasource struct {
 	Name     string
-	Provider string // "postgresql", "mysql", "sqlite"
-	URL      string // raw URL or env() reference
-	URLIsEnv bool   // true if URL comes from env()
-	EnvVar   string // environment variable name if URLIsEnv
-	Schema   string // database schema/namespace
+	Provider string   // "postgresql", "mysql", "sqlite"
+	URL      string   // raw URL or env() reference
+	URLIsEnv bool     // true if URL comes from env()
+	EnvVar   string   // environment variable name if URLIsEnv
+	Schema   string   // database schema/namespace
+	Schemas  []string // configured database schemas/namespaces
 	Span     ast.Span
 }
 

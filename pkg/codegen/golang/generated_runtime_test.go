@@ -92,7 +92,7 @@ func (c captureConn) QueryContext(ctx context.Context, queryText string, args []
 	captureState.Unlock()
 
 	switch {
-	case strings.Contains(queryText, "RETURNING id"):
+	case strings.Contains(queryText, "RETURNING \"id\""):
 		return &captureRows{cols: []string{"id"}, rows: [][]driver.Value{{"p1"}, {"p2"}}}, nil
 	default:
 		return &captureRows{
@@ -177,7 +177,7 @@ func TestBulkCreateDoReturningValues(t *testing.T) {
 	gotArgs := append([]driver.Value(nil), captureState.args...)
 	captureState.Unlock()
 
-	wantQuery := "INSERT INTO Post (id, title, published, author_id) VALUES ($1, $2, $3, $4), ($5, $6, $7, $8) ON CONFLICT (id) DO NOTHING RETURNING id"
+	wantQuery := "INSERT INTO \"Post\" (\"id\", \"title\", \"published\", \"author_id\") VALUES ($1, $2, $3, $4), ($5, $6, $7, $8) ON CONFLICT (\"id\") DO NOTHING RETURNING \"id\""
 	if gotQuery != wantQuery {
 		t.Fatalf("query = %q, want %q", gotQuery, wantQuery)
 	}
@@ -203,7 +203,7 @@ func TestLikeWildcardsAreEscaped(t *testing.T) {
 	gotArgs := append([]driver.Value(nil), captureState.args...)
 	captureState.Unlock()
 
-	wantQuery := "SELECT id, title, published, author_id FROM Post WHERE title LIKE $1 ESCAPE '\\'"
+	wantQuery := "SELECT \"id\", \"title\", \"published\", \"author_id\" FROM \"Post\" WHERE \"title\" LIKE $1 ESCAPE '\\'"
 	if gotQuery != wantQuery {
 		t.Fatalf("query = %q, want %q", gotQuery, wantQuery)
 	}
@@ -218,9 +218,9 @@ func TestSkipOnlyUsesDialectCompatibleLimit(t *testing.T) {
 		dialect string
 		want    string
 	}{
-		{"postgresql", "SELECT id, title, published, author_id FROM Post OFFSET 5"},
-		{"mysql", "SELECT id, title, published, author_id FROM Post LIMIT 18446744073709551615 OFFSET 5"},
-		{"sqlite", "SELECT id, title, published, author_id FROM Post LIMIT -1 OFFSET 5"},
+		{"postgresql", "SELECT \"id\", \"title\", \"published\", \"author_id\" FROM \"Post\" OFFSET 5"},
+		{"mysql", "SELECT \x60id\x60, \x60title\x60, \x60published\x60, \x60author_id\x60 FROM \x60Post\x60 LIMIT 18446744073709551615 OFFSET 5"},
+		{"sqlite", "SELECT \"id\", \"title\", \"published\", \"author_id\" FROM \"Post\" LIMIT -1 OFFSET 5"},
 	}
 
 	for _, tt := range tests {

@@ -87,6 +87,7 @@ func Validate(doc *ast.Document) *ValidationResult {
 	for _, e := range doc.Enums {
 		v.validateEnum(e)
 	}
+	v.validateCrossReferences(&ast.DocumentSet{Documents: []*ast.Document{doc}})
 	return v.result
 }
 
@@ -181,6 +182,7 @@ var knownDatasourceKeys = map[string]bool{
 	"shadowDatabaseUrl": true,
 	"directUrl":         true,
 	"relationMode":      true,
+	"schema":            true,
 	"schemas":           true,
 	"extensions":        true,
 }
@@ -268,25 +270,95 @@ func (v *validator) validateDatasourceCount(datasources []ast.DatasourceDecl) {
 
 func (v *validator) validateDatasource(d ast.DatasourceDecl) {
 	hasURL := false
+	hasProvider := false
+	provider := ""
+	seen := make(map[string]bool)
+	hasSchema := false
+	hasSchemas := false
 	for _, e := range d.Entries {
+		if seen[e.Key] {
+			v.addError(e.Span.Start, fmt.Sprintf("duplicate datasource config key %q", e.Key))
+		}
+		seen[e.Key] = true
 		switch e.Key {
 		case "provider":
+			hasProvider = true
 			if sl, ok := e.Value.(ast.StringLiteral); ok {
+				provider = sl.Value
 				if !validProviders[sl.Value] {
 					v.addError(e.Span.Start, fmt.Sprintf(
 						"invalid provider %q; must be one of: postgresql, mysql, sqlite", sl.Value))
 				}
+			} else {
+				v.addError(e.Span.Start, "datasource provider must be a string")
 			}
 		case "url":
 			hasURL = true
+			v.validateDatasourceURL(e)
+		case "schema":
+			hasSchema = true
+			if sl, ok := e.Value.(ast.StringLiteral); !ok || strings.TrimSpace(sl.Value) == "" {
+				v.addError(e.Span.Start, "datasource schema must be a non-empty string")
+			}
+		case "schemas":
+			hasSchemas = true
+			v.validateDatasourceSchemas(e)
 		default:
 			if !knownDatasourceKeys[e.Key] {
-				v.addWarning(e.Span.Start, fmt.Sprintf("unknown datasource config key %q", e.Key))
+				v.addError(e.Span.Start, fmt.Sprintf("unknown datasource config key %q", e.Key))
 			}
 		}
 	}
 	if !hasURL {
 		v.addError(d.Span.Start, "datasource block requires a \"url\" entry")
+	}
+	if !hasProvider {
+		v.addError(d.Span.Start, "datasource block requires a \"provider\" entry")
+	}
+	if hasSchema && hasSchemas {
+		v.addError(d.Span.Start, "datasource schema and schemas are mutually exclusive")
+	}
+	if (hasSchema || hasSchemas) && provider != "" && provider != "postgresql" {
+		v.addError(d.Span.Start, "datasource schema/schemas are only supported by postgresql")
+	}
+}
+
+func (v *validator) validateDatasourceURL(e ast.ConfigEntry) {
+	switch value := e.Value.(type) {
+	case ast.StringLiteral:
+		if strings.TrimSpace(value.Value) == "" {
+			v.addError(e.Span.Start, "datasource url must not be empty")
+		}
+	case ast.FunctionCall:
+		if value.Name != "env" || len(value.Args) != 1 {
+			v.addError(e.Span.Start, "datasource url must be a string or env(\"NAME\")")
+			return
+		}
+		if name, ok := value.Args[0].(ast.StringLiteral); !ok || strings.TrimSpace(name.Value) == "" {
+			v.addError(e.Span.Start, "env() requires exactly one non-empty string argument")
+		}
+	default:
+		v.addError(e.Span.Start, "datasource url must be a string or env(\"NAME\")")
+	}
+}
+
+func (v *validator) validateDatasourceSchemas(e ast.ConfigEntry) {
+	arr, ok := e.Value.(ast.ArrayLiteral)
+	if !ok || len(arr.Elements) == 0 {
+		v.addError(e.Span.Start, "datasource schemas must be a non-empty string array")
+		return
+	}
+	seen := make(map[string]bool)
+	for _, elem := range arr.Elements {
+		sl, ok := elem.(ast.StringLiteral)
+		if !ok || strings.TrimSpace(sl.Value) == "" {
+			v.addError(elem.ExprSpan().Start, "datasource schemas values must be non-empty strings")
+			continue
+		}
+		if seen[sl.Value] {
+			v.addError(elem.ExprSpan().Start, fmt.Sprintf("duplicate datasource schema %q", sl.Value))
+		}
+		seen[sl.Value] = true
 	}
 }
 
@@ -366,7 +438,15 @@ func (v *validator) validateModel(m ast.ModelDecl) {
 }
 
 func (v *validator) validateFieldAttribute(a ast.Attribute, f ast.FieldDecl, m ast.ModelDecl) {
+	if strings.HasPrefix(a.Name, "db.") {
+		v.validateNativeType(a)
+		return
+	}
 	switch a.Name {
+	case "id", "unique":
+		if len(a.Args) != 0 {
+			v.addError(a.Span.Start, "@"+a.Name+" does not accept arguments")
+		}
 	case "default":
 		if len(a.Args) != 1 {
 			v.addError(a.Span.Start, "@default requires exactly one argument")
@@ -382,14 +462,35 @@ func (v *validator) validateFieldAttribute(a ast.Attribute, f ast.FieldDecl, m a
 	case "relation":
 		v.validateRelation(a, f, m)
 	case "updatedAt":
+		if len(a.Args) != 0 {
+			v.addError(a.Span.Start, "@updatedAt does not accept arguments")
+		}
 		if f.Type.Name != "DateTime" {
 			v.addError(a.Span.Start, "@updatedAt is only valid on DateTime fields")
+		}
+	default:
+		v.addError(a.Span.Start, fmt.Sprintf("unknown field attribute @%s", a.Name))
+	}
+}
+
+func (v *validator) validateNativeType(a ast.Attribute) {
+	name := strings.TrimPrefix(a.Name, "db.")
+	known := map[string]bool{"VarChar": true, "Char": true, "Text": true, "Decimal": true, "Json": true, "JsonB": true, "Uuid": true, "Timestamp": true, "Timestamptz": true, "Date": true, "Time": true, "Bytes": true, "Blob": true, "TinyInt": true, "SmallInt": true, "Int": true, "BigInt": true, "UnsignedInt": true, "UnsignedBigInt": true}
+	if !known[name] {
+		v.addError(a.Span.Start, fmt.Sprintf("unknown native type @db.%s", name))
+		return
+	}
+	for _, arg := range a.Args {
+		n, ok := arg.Value.(ast.NumberLiteral)
+		if !ok || n.IsFloat {
+			v.addError(arg.Span.Start, "native type arguments must be integers")
 		}
 	}
 }
 
 func (v *validator) validateDefaultArg(arg ast.AttributeArg, f ast.FieldDecl) {
-	if _, ok := arg.Value.(ast.FunctionCall); ok {
+	if fc, ok := arg.Value.(ast.FunctionCall); ok {
+		v.validateDefaultFunction(fc, f)
 		return
 	}
 	if f.Type.IsList {
@@ -412,6 +513,45 @@ func (v *validator) validateDefaultArg(arg ast.AttributeArg, f ast.FieldDecl) {
 			v.addError(arg.Span.Start,
 				"@default value for Boolean field must be a boolean or function call")
 		}
+	}
+}
+
+func (v *validator) validateDefaultFunction(fc ast.FunctionCall, f ast.FieldDecl) {
+	requireArgs := func(n int) {
+		if len(fc.Args) != n {
+			v.addError(fc.Span.Start, fmt.Sprintf("%s() requires %d argument(s)", fc.Name, n))
+		}
+	}
+	switch fc.Name {
+	case "now":
+		requireArgs(0)
+		if f.Type.Name != "DateTime" {
+			v.addError(fc.Span.Start, "now() is only valid for DateTime fields")
+		}
+	case "autoincrement":
+		requireArgs(0)
+		if f.Type.Name != "Int" && f.Type.Name != "SmallInt" && f.Type.Name != "BigInt" {
+			v.addError(fc.Span.Start, "autoincrement() is only valid for integer fields")
+		}
+	case "uuid":
+		requireArgs(0)
+		if f.Type.Name != "UUID" && f.Type.Name != "String" {
+			v.addError(fc.Span.Start, "uuid() is only valid for UUID or String fields")
+		}
+	case "cuid":
+		requireArgs(0)
+		if f.Type.Name != "String" {
+			v.addError(fc.Span.Start, "cuid() is only valid for String fields")
+		}
+	case "dbgenerated":
+		requireArgs(1)
+		if len(fc.Args) == 1 {
+			if _, ok := fc.Args[0].(ast.StringLiteral); !ok {
+				v.addError(fc.Args[0].ExprSpan().Start, "dbgenerated() argument must be a string")
+			}
+		}
+	default:
+		v.addError(fc.Span.Start, fmt.Sprintf("unknown default function %q", fc.Name))
 	}
 }
 
@@ -449,14 +589,23 @@ func (v *validator) validateListDefaultArg(arg ast.AttributeArg, f ast.FieldDecl
 }
 
 func (v *validator) validateRelation(a ast.Attribute, f ast.FieldDecl, m ast.ModelDecl) {
-	if scalarTypes[f.Type.Name] {
+	if scalarTypes[f.Type.Name] || v.typeKinds[f.Type.Name] != "model" {
 		v.addError(a.Span.Start, "@relation is only valid on fields with a model type")
 	}
 
 	hasFields := false
 	hasReferences := false
 
+	seenArgs := make(map[string]bool)
 	for _, arg := range a.Args {
+		key := arg.Name
+		if key == "" {
+			key = "name"
+		}
+		if seenArgs[key] {
+			v.addError(arg.Span.Start, fmt.Sprintf("duplicate @relation argument %q", key))
+		}
+		seenArgs[key] = true
 		switch arg.Name {
 		case "fields":
 			hasFields = true
@@ -465,12 +614,22 @@ func (v *validator) validateRelation(a ast.Attribute, f ast.FieldDecl, m ast.Mod
 				for _, ff := range m.Fields {
 					fmap[ff.Name] = true
 				}
+				if len(arr.Elements) == 0 {
+					v.addError(arg.Span.Start, "@relation fields must not be empty")
+				}
+				seen := make(map[string]bool)
 				for _, elem := range arr.Elements {
 					if id, ok := elem.(ast.Identifier); ok {
+						if seen[id.Name] {
+							v.addError(id.Span.Start, fmt.Sprintf("duplicate @relation field %q", id.Name))
+						}
+						seen[id.Name] = true
 						if !fmap[id.Name] {
 							v.addError(id.Span.Start, fmt.Sprintf(
 								"@relation field %q does not exist in model %q", id.Name, m.Name))
 						}
+					} else {
+						v.addError(elem.ExprSpan().Start, "@relation fields must be identifiers")
 					}
 				}
 			} else {
@@ -478,9 +637,37 @@ func (v *validator) validateRelation(a ast.Attribute, f ast.FieldDecl, m ast.Mod
 			}
 		case "references":
 			hasReferences = true
-			if _, ok := arg.Value.(ast.ArrayLiteral); !ok {
+			if arr, ok := arg.Value.(ast.ArrayLiteral); !ok {
 				v.addError(arg.Span.Start, "@relation \"references\" argument must be an array")
+			} else {
+				if len(arr.Elements) == 0 {
+					v.addError(arg.Span.Start, "@relation references must not be empty")
+				}
+				seen := make(map[string]bool)
+				for _, elem := range arr.Elements {
+					id, ok := elem.(ast.Identifier)
+					if !ok {
+						v.addError(elem.ExprSpan().Start, "@relation references must be identifiers")
+						continue
+					}
+					if seen[id.Name] {
+						v.addError(id.Span.Start, fmt.Sprintf("duplicate @relation reference %q", id.Name))
+					}
+					seen[id.Name] = true
+				}
 			}
+		case "onDelete", "onUpdate":
+			value := indexOptionValue(arg.Value)
+			valid := map[string]bool{"CASCADE": true, "RESTRICT": true, "NOACTION": true, "SETNULL": true, "SETDEFAULT": true}
+			if !valid[strings.ToUpper(strings.ReplaceAll(value, "_", ""))] {
+				v.addError(arg.Span.Start, fmt.Sprintf("invalid referential action %q", value))
+			}
+		case "", "name":
+			if _, ok := arg.Value.(ast.StringLiteral); !ok {
+				v.addError(arg.Span.Start, "@relation name must be a string")
+			}
+		default:
+			v.addError(arg.Span.Start, fmt.Sprintf("unknown @relation argument %q", arg.Name))
 		}
 	}
 
@@ -495,11 +682,9 @@ func (v *validator) validateRelation(a ast.Attribute, f ast.FieldDecl, m ast.Mod
 func (v *validator) validateModelAttribute(a ast.Attribute, m ast.ModelDecl, fieldNames map[string]bool) {
 	switch a.Name {
 	case "id":
-		if len(a.Args) != 1 {
-			v.addError(a.Span.Start, "@@id requires exactly one argument")
-		} else if _, ok := a.Args[0].Value.(ast.ArrayLiteral); !ok {
-			v.addError(a.Span.Start, "@@id argument must be an array")
-		}
+		v.validateConstraintFields(a, m, fieldNames, "@@id")
+	case "unique":
+		v.validateConstraintFields(a, m, fieldNames, "@@unique")
 	case "index":
 		fieldArg, ok := indexFieldsArg(a)
 		if !ok {
@@ -525,6 +710,64 @@ func (v *validator) validateModelAttribute(a ast.Attribute, m ast.ModelDecl, fie
 		} else if _, ok := a.Args[0].Value.(ast.StringLiteral); !ok {
 			v.addError(a.Span.Start, "@@map argument must be a string")
 		}
+	case "schema":
+		if len(a.Args) != 1 {
+			v.addError(a.Span.Start, "@@schema requires exactly one argument")
+		} else if sl, ok := a.Args[0].Value.(ast.StringLiteral); !ok || strings.TrimSpace(sl.Value) == "" {
+			v.addError(a.Span.Start, "@@schema argument must be a non-empty string")
+		}
+	default:
+		v.addError(a.Span.Start, fmt.Sprintf("unknown model attribute @@%s", a.Name))
+	}
+}
+
+func (v *validator) validateConstraintFields(a ast.Attribute, m ast.ModelDecl, fieldNames map[string]bool, label string) {
+	fieldArg, ok := indexFieldsArg(a)
+	if !ok {
+		v.addError(a.Span.Start, label+" requires a fields array")
+		return
+	}
+	arr, ok := fieldArg.Value.(ast.ArrayLiteral)
+	if !ok {
+		v.addError(fieldArg.Span.Start, label+" fields argument must be an array")
+		return
+	}
+	if len(arr.Elements) == 0 {
+		v.addError(fieldArg.Span.Start, label+" fields must not be empty")
+	}
+	seenFields := make(map[string]bool)
+	seenArgs := make(map[string]bool)
+	for _, arg := range a.Args {
+		key := arg.Name
+		if key == "" {
+			key = "fields"
+		}
+		if seenArgs[key] {
+			v.addError(arg.Span.Start, fmt.Sprintf("duplicate %s argument %q", label, key))
+		}
+		seenArgs[key] = true
+		if key != "fields" && key != "name" {
+			v.addError(arg.Span.Start, fmt.Sprintf("unknown %s argument %q", label, key))
+		}
+		if key == "name" {
+			if _, ok := arg.Value.(ast.StringLiteral); !ok {
+				v.addError(arg.Span.Start, label+" name must be a string")
+			}
+		}
+	}
+	for _, elem := range arr.Elements {
+		id, ok := elem.(ast.Identifier)
+		if !ok {
+			v.addError(elem.ExprSpan().Start, label+" fields must be identifiers")
+			continue
+		}
+		if !fieldNames[id.Name] {
+			v.addError(id.Span.Start, fmt.Sprintf("%s references unknown field %q in model %q", label, id.Name, m.Name))
+		}
+		if seenFields[id.Name] {
+			v.addError(id.Span.Start, fmt.Sprintf("%s contains duplicate field %q", label, id.Name))
+		}
+		seenFields[id.Name] = true
 	}
 }
 
@@ -620,12 +863,32 @@ func (v *validator) validateEnumNaming(e ast.EnumDecl) {
 
 func (v *validator) validateEnum(e ast.EnumDecl) {
 	seen := make(map[string]bool)
+	for _, a := range e.Attributes {
+		if a.Name != "map" {
+			v.addError(a.Span.Start, fmt.Sprintf("unknown enum attribute @@%s", a.Name))
+			continue
+		}
+		if len(a.Args) != 1 {
+			v.addError(a.Span.Start, "@@map requires exactly one argument")
+		} else if _, ok := a.Args[0].Value.(ast.StringLiteral); !ok {
+			v.addError(a.Span.Start, "@@map argument must be a string")
+		}
+	}
 	for _, val := range e.Values {
 		if seen[val.Name] {
 			v.addError(val.Span.Start, fmt.Sprintf(
 				"duplicate enum value %q in enum %q", val.Name, e.Name))
 		}
 		seen[val.Name] = true
+		for _, a := range val.Attributes {
+			if a.Name != "map" {
+				v.addError(a.Span.Start, fmt.Sprintf("unknown enum value attribute @%s", a.Name))
+			} else if len(a.Args) != 1 {
+				v.addError(a.Span.Start, "@map requires exactly one argument")
+			} else if _, ok := a.Args[0].Value.(ast.StringLiteral); !ok {
+				v.addError(a.Span.Start, "@map argument must be a string")
+			}
+		}
 
 		if val.Name != strings.ToUpper(val.Name) {
 			v.addWarning(val.Span.Start, fmt.Sprintf(
@@ -639,14 +902,40 @@ func (v *validator) validateEnum(e ast.EnumDecl) {
 // ---------------------------------------------------------------------------
 
 func (v *validator) validateCrossReferences(ds *ast.DocumentSet) {
-	modelFields := make(map[string]map[string]bool)
+	modelFields := make(map[string]map[string]ast.FieldDecl)
+	modelUnique := make(map[string]map[string]bool)
 	for _, doc := range ds.Documents {
 		for _, m := range doc.Models {
-			fields := make(map[string]bool)
+			fields := make(map[string]ast.FieldDecl)
 			for _, f := range m.Fields {
-				fields[f.Name] = true
+				fields[f.Name] = f
 			}
 			modelFields[m.Name] = fields
+			unique := make(map[string]bool)
+			for _, f := range m.Fields {
+				for _, a := range f.Attributes {
+					if a.Name == "id" || a.Name == "unique" {
+						unique[f.Name] = true
+					}
+				}
+			}
+			for _, a := range m.Attributes {
+				if a.Name != "id" && a.Name != "unique" {
+					continue
+				}
+				if arg, ok := indexFieldsArg(a); ok {
+					if arr, ok := arg.Value.(ast.ArrayLiteral); ok {
+						var names []string
+						for _, e := range arr.Elements {
+							if id, ok := e.(ast.Identifier); ok {
+								names = append(names, id.Name)
+							}
+						}
+						unique[strings.Join(names, ",")] = true
+					}
+				}
+			}
+			modelUnique[m.Name] = unique
 		}
 	}
 
@@ -662,8 +951,13 @@ func (v *validator) validateCrossReferences(ds *ast.DocumentSet) {
 					if !ok {
 						continue
 					}
+					var localNames, refNames []string
+					var onDelete string
 					for _, arg := range a.Args {
-						if arg.Name != "references" {
+						if arg.Name == "onDelete" {
+							onDelete = indexOptionValue(arg.Value)
+						}
+						if arg.Name != "references" && arg.Name != "fields" {
 							continue
 						}
 						arr, ok := arg.Value.(ast.ArrayLiteral)
@@ -675,12 +969,33 @@ func (v *validator) validateCrossReferences(ds *ast.DocumentSet) {
 							if !ok {
 								continue
 							}
-							if !refFields[id.Name] {
+							if arg.Name == "fields" {
+								localNames = append(localNames, id.Name)
+								continue
+							}
+							refNames = append(refNames, id.Name)
+							if _, exists := refFields[id.Name]; !exists {
 								v.addError(id.Span.Start, fmt.Sprintf(
 									"@relation references unknown field %q on model %q",
 									id.Name, refModel))
 							}
 						}
+					}
+					if len(localNames) != len(refNames) {
+						v.addError(a.Span.Start, fmt.Sprintf("@relation fields and references must have the same length (got %d and %d)", len(localNames), len(refNames)))
+					}
+					for i := 0; i < len(localNames) && i < len(refNames); i++ {
+						lf, lok := modelFields[m.Name][localNames[i]]
+						rf, rok := refFields[refNames[i]]
+						if lok && rok && (lf.Type.Name != rf.Type.Name || lf.Type.IsList || rf.Type.IsList) {
+							v.addError(a.Span.Start, fmt.Sprintf("@relation field %q type %s does not match referenced field %q type %s", localNames[i], lf.Type.String(), refNames[i], rf.Type.String()))
+						}
+						if strings.EqualFold(strings.ReplaceAll(onDelete, "_", ""), "SetNull") && lok && !lf.Type.IsOptional {
+							v.addError(a.Span.Start, "onDelete: SetNull requires optional relation fields")
+						}
+					}
+					if len(refNames) > 0 && !modelUnique[refModel][strings.Join(refNames, ",")] {
+						v.addError(a.Span.Start, fmt.Sprintf("@relation references on model %q must match an id or unique constraint", refModel))
 					}
 				}
 			}

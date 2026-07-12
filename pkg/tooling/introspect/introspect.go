@@ -3,11 +3,22 @@
 package introspect
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode"
+
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "modernc.org/sqlite"
+
+	"github.com/arsfy/gcorm/pkg/schema/compiler"
+	"github.com/arsfy/gcorm/pkg/schema/ir"
+	"github.com/arsfy/gcorm/pkg/tooling/dbpush"
 )
 
 // TableInfo represents a database table discovered during introspection.
@@ -81,14 +92,86 @@ func Run(args []string) error {
 		provider = DetectProvider(dsn)
 	}
 
-	fmt.Printf("Introspecting %s database...\n", provider)
-	fmt.Printf("Output directory: %s\n", output)
-
-	// Introspection requires a live database connection.
-	// This implementation generates the schema file structure without connecting.
-	fmt.Println("Note: Full introspection requires database driver support.")
-	fmt.Println("Connect with a live database to generate schema from existing tables.")
+	normalized, err := dbpush.NormalizeConnectionURL(dsn, provider)
+	if err != nil {
+		return err
+	}
+	db, err := sql.Open(introspectDriver(provider), normalized)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("connect database: %w", err)
+	}
+	schema, err := dbpush.IntrospectDatabase(ctx, db, provider, nil, normalized)
+	if err != nil {
+		return fmt.Errorf("introspect database: %w", err)
+	}
+	content := GenerateSchema(provider, tablesFromIR(schema))
+	if compiled := compiler.CompileFile("schema.gcorm", []byte(content)); compiled.HasErrors() {
+		return fmt.Errorf("generated schema is invalid: %v", compiled.Errors[0])
+	}
+	if err := WriteSchemaFile(output, "schema.gcorm", content); err != nil {
+		return err
+	}
+	fmt.Printf("Introspected %d table(s) into %s\n", len(schema.Models), filepath.Join(output, "schema.gcorm"))
 	return nil
+}
+
+func introspectDriver(provider string) string {
+	if provider == "postgresql" {
+		return "pgx"
+	}
+	if provider == "sqlite" {
+		return "sqlite"
+	}
+	return provider
+}
+
+func tablesFromIR(schema *ir.Schema) []TableInfo {
+	if schema == nil {
+		return nil
+	}
+	out := make([]TableInfo, 0, len(schema.Models))
+	for _, model := range schema.Models {
+		t := TableInfo{Name: model.TableName(), Schema: model.Schema}
+		pk := map[string]bool{}
+		if model.PrimaryKey != nil {
+			for _, f := range model.PrimaryKey.Fields {
+				pk[f] = true
+			}
+		}
+		for _, f := range model.ScalarFields() {
+			name := f.DBName
+			if name == "" {
+				name = f.Name
+			}
+			c := ColumnInfo{Name: name, DataType: f.ScalarType, IsNullable: f.IsOptional, IsPrimaryKey: pk[f.Name] || pk[name] || f.IsID, IsUnique: f.IsUnique}
+			if f.Default != nil {
+				if f.Default.IsFunction {
+					c.Default = f.Default.FuncName + "()"
+				} else {
+					c.Default = f.Default.Value
+				}
+			}
+			t.Columns = append(t.Columns, c)
+		}
+		for _, idx := range model.Indexes {
+			t.Indexes = append(t.Indexes, IndexInfo{Name: idx.Name, Columns: append([]string(nil), idx.Fields...), IsUnique: idx.IsUnique})
+		}
+		for _, uc := range model.UniqueConstraints {
+			t.Indexes = append(t.Indexes, IndexInfo{Name: uc.Name, Columns: append([]string(nil), uc.Fields...), IsUnique: true})
+		}
+		for _, rel := range model.Relations {
+			if len(rel.Fields) > 0 {
+				t.FKs = append(t.FKs, ForeignKeyInfo{Name: rel.ConstraintName, Columns: append([]string(nil), rel.Fields...), RefTable: rel.ToModel, RefColumns: append([]string(nil), rel.References...), OnDelete: rel.OnDelete, OnUpdate: rel.OnUpdate})
+			}
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 // DetectProvider infers the database provider from a connection string.
@@ -114,16 +197,35 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 	b.WriteString(fmt.Sprintf("datasource db {\n  provider = %q\n  url      = env(\"DATABASE_URL\")\n}\n\n", provider))
 	b.WriteString("generator client {\n  provider = \"gco-go\"\n  output   = \"./gen\"\n}\n")
 
+	modelNames := make(map[string]string)
+	usedModels := make(map[string]bool)
+	fieldNames := make(map[string]map[string]string)
 	for _, t := range tables {
-		modelName := pascalCase(t.Name)
+		modelNames[t.Name] = uniqueName(sanitizeModelName(t.Name), usedModels)
+		used := make(map[string]bool)
+		fieldNames[t.Name] = make(map[string]string)
+		for _, col := range t.Columns {
+			fieldNames[t.Name][col.Name] = uniqueName(sanitizeFieldName(col.Name), used)
+		}
+	}
+
+	for _, t := range tables {
+		modelName := modelNames[t.Name]
 		b.WriteString(fmt.Sprintf("\nmodel %s {\n", modelName))
+		pkCount := 0
+		for _, col := range t.Columns {
+			if col.IsPrimaryKey {
+				pkCount++
+			}
+		}
 		for _, col := range t.Columns {
 			fieldType := mapSQLType(provider, col.DataType)
-			line := fmt.Sprintf("  %-20s %s", col.Name, fieldType)
+			fieldName := fieldNames[t.Name][col.Name]
+			line := fmt.Sprintf("  %-20s %s", fieldName, fieldType)
 			if col.IsNullable {
 				line += "?"
 			}
-			if col.IsPrimaryKey {
+			if col.IsPrimaryKey && pkCount == 1 {
 				line += " @id"
 			}
 			if col.IsUnique && !col.IsPrimaryKey {
@@ -132,15 +234,63 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 			if col.Default != "" {
 				line += fmt.Sprintf(" @default(%s)", mapDefaultForType(col.Default, fieldType))
 			}
-			b.WriteString(line + "\n")
+			if fieldName != col.Name {
+				line += fmt.Sprintf(" @map(%q)", col.Name)
+			}
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+		for i, fk := range t.FKs {
+			refModel := modelNames[fk.RefTable]
+			if refModel == "" {
+				refModel = sanitizeModelName(fk.RefTable)
+			}
+			name := uniqueName(sanitizeFieldName(fk.RefTable), mapUsedValues(fieldNames[t.Name]))
+			local := mappedNames(fieldNames[t.Name], fk.Columns)
+			refs := mappedNames(fieldNames[fk.RefTable], fk.RefColumns)
+			if len(local) == 0 || len(local) != len(refs) {
+				continue
+			}
+			line := fmt.Sprintf("  %-20s %s @relation(fields: [%s], references: [%s]", name, refModel, strings.Join(local, ", "), strings.Join(refs, ", "))
+			if fk.Name != "" {
+				line += fmt.Sprintf(", name: %q", fk.Name)
+			}
+			if fk.OnDelete != "" {
+				line += ", onDelete: " + referentialAction(fk.OnDelete)
+			}
+			if fk.OnUpdate != "" {
+				line += ", onUpdate: " + referentialAction(fk.OnUpdate)
+			}
+			line += ")"
+			if i >= 0 {
+				b.WriteString(line)
+				b.WriteString("\n")
+			}
+		}
+		if pkCount > 1 {
+			var cols []string
+			for _, col := range t.Columns {
+				if col.IsPrimaryKey {
+					cols = append(cols, fieldNames[t.Name][col.Name])
+				}
+			}
+			fmt.Fprintf(&b, "\n  @@id([%s])\n", strings.Join(cols, ", "))
 		}
 
 		// Model-level indexes.
 		for _, idx := range t.Indexes {
-			if !idx.IsUnique {
-				cols := make([]string, len(idx.Columns))
-				copy(cols, idx.Columns)
-				fmt.Fprintf(&b, "\n  @@index([%s])\n", strings.Join(cols, ", "))
+			cols := mappedNames(fieldNames[t.Name], idx.Columns)
+			if len(cols) == 0 {
+				continue
+			}
+			kind := "index"
+			if idx.IsUnique {
+				kind = "unique"
+			}
+			if idx.Name != "" {
+				fmt.Fprintf(&b, "\n  @@%s([%s], name: %q)\n", kind, strings.Join(cols, ", "), idx.Name)
+			} else {
+				fmt.Fprintf(&b, "\n  @@%s([%s])\n", kind, strings.Join(cols, ", "))
 			}
 		}
 
@@ -156,6 +306,88 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 	}
 
 	return b.String()
+}
+
+func sanitizeModelName(name string) string {
+	value := sanitizeIdentifier(pascalCase(name), true)
+	if value == "" {
+		return "Model"
+	}
+	return value
+}
+func sanitizeFieldName(name string) string {
+	value := sanitizeIdentifier(name, false)
+	if value == "" {
+		return "field"
+	}
+	return value
+}
+func sanitizeIdentifier(name string, upper bool) string {
+	var b strings.Builder
+	capitalize := upper
+	for _, r := range name {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			if b.Len() == 0 && unicode.IsDigit(r) {
+				if upper {
+					b.WriteString("Model")
+				} else {
+					b.WriteString("field")
+				}
+			}
+			if capitalize {
+				r = unicode.ToUpper(r)
+				capitalize = false
+			}
+			b.WriteRune(r)
+		} else {
+			capitalize = true
+		}
+	}
+	value := b.String()
+	if !upper && value != "" {
+		rs := []rune(value)
+		rs[0] = unicode.ToLower(rs[0])
+		value = string(rs)
+	}
+	return value
+}
+func uniqueName(base string, used map[string]bool) string {
+	name := base
+	for i := 2; used[name]; i++ {
+		name = base + strconv.Itoa(i)
+	}
+	used[name] = true
+	return name
+}
+func mappedNames(mapping map[string]string, names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if v := mapping[n]; v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+func mapUsedValues(mapping map[string]string) map[string]bool {
+	out := map[string]bool{}
+	for _, v := range mapping {
+		out[v] = true
+	}
+	return out
+}
+func referentialAction(value string) string {
+	switch strings.ToUpper(strings.ReplaceAll(value, " ", "")) {
+	case "CASCADE":
+		return "Cascade"
+	case "RESTRICT":
+		return "Restrict"
+	case "SETNULL":
+		return "SetNull"
+	case "SETDEFAULT":
+		return "SetDefault"
+	default:
+		return "NoAction"
+	}
 }
 
 // WriteSchemaFile writes generated schema to a file.

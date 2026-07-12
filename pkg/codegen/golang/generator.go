@@ -220,7 +220,9 @@ func (g *Generator) renderTemplate(name, tmplSrc string, data any) ([]byte, erro
 		"hasEnumFields":     hasEnumFields,
 		"quote":             func(s string) string { return fmt.Sprintf("%q", s) },
 		"tableName":         func(m *ir.Model) string { return m.TableName() },
+		"quotedTableName":   func(m *ir.Model) string { return quoteGeneratedIdentifier(g.schema.Datasource, m.TableName()) },
 		"columnCSV":         columnCSV,
+		"quotedColumnCSV":   func(m *ir.Model) string { return quotedColumnCSV(g.schema.Datasource, m) },
 		"scanFields":        scanFieldsStr,
 		"columnName":        columnName,
 		"isNumeric":         isNumericField,
@@ -246,6 +248,26 @@ func (g *Generator) renderTemplate(name, tmplSrc string, data any) ([]byte, erro
 		return nil, fmt.Errorf("format generated template %s: %w", name, err)
 	}
 	return formatted, nil
+}
+
+func quoteGeneratedIdentifier(ds *ir.Datasource, name string) string {
+	dialect := "postgresql"
+	if ds != nil && ds.Provider != "" {
+		dialect = ds.Provider
+	}
+	if dialect == "mysql" {
+		return "`" + strings.ReplaceAll(name, "`", "``") + "`"
+	}
+	return `\"` + strings.ReplaceAll(name, `"`, `\"\"`) + `\"`
+}
+
+func quotedColumnCSV(ds *ir.Datasource, m *ir.Model) string {
+	fields := m.ScalarFields()
+	cols := make([]string, len(fields))
+	for i, f := range fields {
+		cols[i] = quoteGeneratedIdentifier(ds, columnName(f))
+	}
+	return strings.Join(cols, ", ")
 }
 
 // goTypeForField returns the Go type for an IR field.

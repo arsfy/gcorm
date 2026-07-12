@@ -511,6 +511,14 @@ func (c *Client) placeholder(n int) string {
 	return "?"
 }
 
+func (c *Client) quoteIdentifier(name string) string {
+	if c.dialect == "mysql" {
+		quote := string(rune(96))
+		return quote + strings.ReplaceAll(name, quote, quote+quote) + quote
+	}
+	return "\"" + strings.ReplaceAll(name, "\"", "\"\"") + "\""
+}
+
 func scanRowsToMaps(rows *sql.Rows) ([]map[string]any, error) {
 	cols, err := rows.Columns()
 	if err != nil {
@@ -662,6 +670,24 @@ func (c *Client) Tx(ctx context.Context, fn func(tx *Client) error) error {
 }
 
 {{range $model := .Models}}
+func quoted{{$model.Name}}Table(c *Client) string { return c.quoteIdentifier("{{tableName $model}}") }
+func quoted{{$model.Name}}Columns(c *Client) string {
+	cols := []string{ {{scalarColNamesCSV $model}} }
+	for i := range cols { cols[i] = c.quoteIdentifier(cols[i]) }
+	return strings.Join(cols, ", ")
+}
+
+func quote{{$model.Name}}Field(c *Client, field string) (string, error) {
+	switch field {
+{{- range $field := $model.Fields}}{{if ne $field.Type 2}}
+	case "{{columnName $field}}":
+		return c.quoteIdentifier(field), nil
+{{- end}}{{end}}
+	default:
+		return "", fmt.Errorf("unknown {{$model.Name}} field %q", field)
+	}
+}
+
 // build{{$model.Name}}Where recursively builds a WHERE clause string and arguments.
 func build{{$model.Name}}Where(c *Client, wheres []query.{{$model.Name}}WhereClause, argIdx *int) (string, []any) {
 	var parts []string
@@ -699,9 +725,11 @@ func build{{$model.Name}}Where(c *Client, wheres []query.{{$model.Name}}WhereCla
 				args = append(args, subArgs...)
 			}
 		default:
+			field, err := quote{{$model.Name}}Field(c, w.Field)
+			if err != nil { parts = append(parts, "1 = 0"); continue }
 			switch w.Operator {
 			case "IS NULL":
-				parts = append(parts, w.Field+" IS NULL")
+				parts = append(parts, field+" IS NULL")
 			case "IN", "NOT IN":
 				if vals, ok := w.Value.([]any); ok {
 					if len(vals) == 0 {
@@ -717,24 +745,24 @@ func build{{$model.Name}}Where(c *Client, wheres []query.{{$model.Name}}WhereCla
 							phs[i] = c.placeholder(*argIdx)
 							args = append(args, v)
 						}
-						parts = append(parts, w.Field+" "+w.Operator+" ("+strings.Join(phs, ", ")+")")
+						parts = append(parts, field+" "+w.Operator+" ("+strings.Join(phs, ", ")+")")
 					}
 				}
 			case "CONTAINS":
 				*argIdx++
-				parts = append(parts, w.Field+" LIKE "+c.placeholder(*argIdx)+" ESCAPE '\\'")
+				parts = append(parts, field+" LIKE "+c.placeholder(*argIdx)+" ESCAPE '\\'")
 				args = append(args, "%"+escapeLikePattern(fmt.Sprint(w.Value))+"%")
 			case "STARTS_WITH":
 				*argIdx++
-				parts = append(parts, w.Field+" LIKE "+c.placeholder(*argIdx)+" ESCAPE '\\'")
+				parts = append(parts, field+" LIKE "+c.placeholder(*argIdx)+" ESCAPE '\\'")
 				args = append(args, escapeLikePattern(fmt.Sprint(w.Value))+"%")
 			case "ENDS_WITH":
 				*argIdx++
-				parts = append(parts, w.Field+" LIKE "+c.placeholder(*argIdx)+" ESCAPE '\\'")
+				parts = append(parts, field+" LIKE "+c.placeholder(*argIdx)+" ESCAPE '\\'")
 				args = append(args, "%"+escapeLikePattern(fmt.Sprint(w.Value)))
 			default:
 				*argIdx++
-				parts = append(parts, w.Field+" "+w.Operator+" "+c.placeholder(*argIdx))
+				parts = append(parts, field+" "+w.Operator+" "+c.placeholder(*argIdx))
 				args = append(args, w.Value)
 			}
 		}
@@ -1104,7 +1132,7 @@ func (b {{$model.Name}}DeleteBuilder) DoMany(ctx context.Context) (int64, error)
 // FindMany retrieves multiple {{$model.Name}} records.
 func (a {{$model.Name}}Actions) FindMany(ctx context.Context, opts ...query.{{$model.Name}}QueryOption) ([]model.{{$model.Name}}, error) {
 	cfg := query.Apply{{$model.Name}}Options(opts)
-	q := "SELECT {{columnCSV $model}} FROM {{tableName $model}}"
+	q := "SELECT "+quoted{{$model.Name}}Columns(a.client)+" FROM "+quoted{{$model.Name}}Table(a.client)
 	argIdx := 0
 	where, args := build{{$model.Name}}Where(a.client, cfg.Wheres, &argIdx)
 	if where != "" {
@@ -1113,7 +1141,11 @@ func (a {{$model.Name}}Actions) FindMany(ctx context.Context, opts ...query.{{$m
 	if len(cfg.OrderBys) > 0 {
 		obs := make([]string, len(cfg.OrderBys))
 		for i, ob := range cfg.OrderBys {
-			obs[i] = ob.Field + " " + ob.Direction
+			field, err := quote{{$model.Name}}Field(a.client, ob.Field)
+			if err != nil { return nil, err }
+			direction := strings.ToUpper(ob.Direction)
+			if direction != "ASC" && direction != "DESC" { return nil, fmt.Errorf("invalid order direction %q", ob.Direction) }
+			obs[i] = field + " " + direction
 		}
 		q += " ORDER BY " + strings.Join(obs, ", ")
 	}
@@ -1164,7 +1196,7 @@ func (a {{$model.Name}}Actions) FindFirst(ctx context.Context, opts ...query.{{$
 func (a {{$model.Name}}Actions) FindUnique(ctx context.Context, where query.{{$model.Name}}WhereClause) (*model.{{$model.Name}}, error) {
 	argIdx := 0
 	whereSQL, args := build{{$model.Name}}Where(a.client, []query.{{$model.Name}}WhereClause{where}, &argIdx)
-	q := "SELECT {{columnCSV $model}} FROM {{tableName $model}}"
+	q := "SELECT "+quoted{{$model.Name}}Columns(a.client)+" FROM "+quoted{{$model.Name}}Table(a.client)
 	if whereSQL != "" {
 		q += " WHERE " + whereSQL
 	}
@@ -1189,14 +1221,15 @@ func (a {{$model.Name}}Actions) CreateOne(ctx context.Context, sets ...query.{{$
 	vals := make([]any, len(sets))
 	phs := make([]string, len(sets))
 	for i, s := range sets {
-		cols[i] = s.Field
+		field, err := quote{{$model.Name}}Field(a.client, s.Field)
+		if err != nil { return nil, err }
+		cols[i] = field
 		vals[i] = s.Value
 		phs[i] = a.client.placeholder(i + 1)
 	}
-	q := fmt.Sprintf("INSERT INTO {{tableName $model}} (%s) VALUES (%s)",
-		strings.Join(cols, ", "), strings.Join(phs, ", "))
+	q := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", quoted{{$model.Name}}Table(a.client), strings.Join(cols, ", "), strings.Join(phs, ", "))
 	if a.client.dialect == "postgresql" {
-		q += " RETURNING {{columnCSV $model}}"
+		q += " RETURNING " + quoted{{$model.Name}}Columns(a.client)
 		row := a.client.executor.QueryRowContext(ctx, q, vals...)
 		var item model.{{$model.Name}}
 		if err := row.Scan({{scanFields $model}}); err != nil {
@@ -1219,6 +1252,7 @@ func (a {{$model.Name}}Actions) CreateMany(ctx context.Context, data []query.{{$
 
 func (a {{$model.Name}}Actions) build{{$model.Name}}CreateManySQL(data []query.{{$model.Name}}CreateInput, conflictDoNothing bool, conflictColumns []string, returningColumns []string) (string, []any) {
 	cols := []string{ {{scalarColNamesCSV $model}} }
+	for i := range cols { cols[i] = a.client.quoteIdentifier(cols[i]) }
 	argIdx := 0
 	var valueSets []string
 	var args []any
@@ -1232,8 +1266,7 @@ func (a {{$model.Name}}Actions) build{{$model.Name}}CreateManySQL(data []query.{
 		}
 		valueSets = append(valueSets, "("+strings.Join(phs, ", ")+")")
 	}
-	q := fmt.Sprintf("INSERT INTO {{tableName $model}} (%s) VALUES %s",
-		strings.Join(cols, ", "), strings.Join(valueSets, ", "))
+	q := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", quoted{{$model.Name}}Table(a.client), strings.Join(cols, ", "), strings.Join(valueSets, ", "))
 	if conflictDoNothing {
 		switch a.client.dialect {
 		case "mysql":
@@ -1243,13 +1276,17 @@ func (a {{$model.Name}}Actions) build{{$model.Name}}CreateManySQL(data []query.{
 		default:
 			q += " ON CONFLICT"
 			if len(conflictColumns) > 0 {
-				q += " (" + strings.Join(conflictColumns, ", ") + ")"
+				quoted := make([]string, len(conflictColumns))
+				for i, field := range conflictColumns { quoted[i] = a.client.quoteIdentifier(field) }
+				q += " (" + strings.Join(quoted, ", ") + ")"
 			}
 			q += " DO NOTHING"
 		}
 	}
 	if len(returningColumns) > 0 {
-		q += " RETURNING " + strings.Join(returningColumns, ", ")
+		quoted := make([]string, len(returningColumns))
+		for i, field := range returningColumns { quoted[i] = a.client.quoteIdentifier(field) }
+		q += " RETURNING " + strings.Join(quoted, ", ")
 	}
 	return q, args
 }
@@ -1264,17 +1301,19 @@ func (a {{$model.Name}}Actions) UpdateOne(ctx context.Context, where query.{{$mo
 	args := make([]any, 0, len(sets)+1)
 	for i, s := range sets {
 		argIdx++
-		setParts[i] = s.Field + " = " + a.client.placeholder(argIdx)
+		field, err := quote{{$model.Name}}Field(a.client, s.Field)
+		if err != nil { return nil, err }
+		setParts[i] = field + " = " + a.client.placeholder(argIdx)
 		args = append(args, s.Value)
 	}
 	whereSQL, whereArgs := build{{$model.Name}}Where(a.client, []query.{{$model.Name}}WhereClause{where}, &argIdx)
 	args = append(args, whereArgs...)
-	q := fmt.Sprintf("UPDATE {{tableName $model}} SET %s", strings.Join(setParts, ", "))
+	q := fmt.Sprintf("UPDATE %s SET %s", quoted{{$model.Name}}Table(a.client), strings.Join(setParts, ", "))
 	if whereSQL != "" {
 		q += " WHERE " + whereSQL
 	}
 	if a.client.dialect == "postgresql" {
-		q += " RETURNING {{columnCSV $model}}"
+		q += " RETURNING " + quoted{{$model.Name}}Columns(a.client)
 		row := a.client.executor.QueryRowContext(ctx, q, args...)
 		var item model.{{$model.Name}}
 		if err := row.Scan({{scanFields $model}}); err != nil {
@@ -1302,12 +1341,14 @@ func (a {{$model.Name}}Actions) UpdateMany(ctx context.Context, wheres []query.{
 	args := make([]any, 0, len(sets)+len(wheres))
 	for i, s := range sets {
 		argIdx++
-		setParts[i] = s.Field + " = " + a.client.placeholder(argIdx)
+		field, err := quote{{$model.Name}}Field(a.client, s.Field)
+		if err != nil { return 0, err }
+		setParts[i] = field + " = " + a.client.placeholder(argIdx)
 		args = append(args, s.Value)
 	}
 	whereSQL, whereArgs := build{{$model.Name}}Where(a.client, wheres, &argIdx)
 	args = append(args, whereArgs...)
-	q := fmt.Sprintf("UPDATE {{tableName $model}} SET %s", strings.Join(setParts, ", "))
+	q := fmt.Sprintf("UPDATE %s SET %s", quoted{{$model.Name}}Table(a.client), strings.Join(setParts, ", "))
 	if whereSQL != "" {
 		q += " WHERE " + whereSQL
 	}
@@ -1328,30 +1369,37 @@ func (a {{$model.Name}}Actions) UpsertOne(ctx context.Context, where query.{{$mo
 	phs := make([]string, len(create))
 	args := make([]any, 0, len(create)+len(update))
 	for i, s := range create {
-		cols[i] = s.Field
+		field, err := quote{{$model.Name}}Field(a.client, s.Field)
+		if err != nil { return nil, err }
+		cols[i] = field
 		argIdx++
 		phs[i] = a.client.placeholder(argIdx)
 		args = append(args, s.Value)
 	}
-	q := fmt.Sprintf("INSERT INTO {{tableName $model}} (%s) VALUES (%s)",
-		strings.Join(cols, ", "), strings.Join(phs, ", "))
+	q := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", quoted{{$model.Name}}Table(a.client), strings.Join(cols, ", "), strings.Join(phs, ", "))
 	if a.client.dialect == "mysql" {
 		if len(update) > 0 {
 			uParts := make([]string, len(update))
 			for i, s := range update {
 				argIdx++
-				uParts[i] = s.Field + " = " + a.client.placeholder(argIdx)
+				field, err := quote{{$model.Name}}Field(a.client, s.Field)
+				if err != nil { return nil, err }
+				uParts[i] = field + " = " + a.client.placeholder(argIdx)
 				args = append(args, s.Value)
 			}
 			q += " ON DUPLICATE KEY UPDATE " + strings.Join(uParts, ", ")
 		}
 	} else {
-		q += fmt.Sprintf(" ON CONFLICT (%s) DO", where.Field)
+		conflictField, err := quote{{$model.Name}}Field(a.client, where.Field)
+		if err != nil { return nil, err }
+		q += fmt.Sprintf(" ON CONFLICT (%s) DO", conflictField)
 		if len(update) > 0 {
 			uParts := make([]string, len(update))
 			for i, s := range update {
 				argIdx++
-				uParts[i] = s.Field + " = " + a.client.placeholder(argIdx)
+				field, err := quote{{$model.Name}}Field(a.client, s.Field)
+				if err != nil { return nil, err }
+				uParts[i] = field + " = " + a.client.placeholder(argIdx)
 				args = append(args, s.Value)
 			}
 			q += " UPDATE SET " + strings.Join(uParts, ", ")
@@ -1360,7 +1408,7 @@ func (a {{$model.Name}}Actions) UpsertOne(ctx context.Context, where query.{{$mo
 		}
 	}
 	if a.client.dialect == "postgresql" {
-		q += " RETURNING {{columnCSV $model}}"
+		q += " RETURNING " + quoted{{$model.Name}}Columns(a.client)
 		row := a.client.executor.QueryRowContext(ctx, q, args...)
 		var item model.{{$model.Name}}
 		if err := row.Scan({{scanFields $model}}); err != nil {
@@ -1379,12 +1427,12 @@ func (a {{$model.Name}}Actions) UpsertOne(ctx context.Context, where query.{{$mo
 func (a {{$model.Name}}Actions) DeleteOne(ctx context.Context, where query.{{$model.Name}}WhereClause) (*model.{{$model.Name}}, error) {
 	argIdx := 0
 	whereSQL, args := build{{$model.Name}}Where(a.client, []query.{{$model.Name}}WhereClause{where}, &argIdx)
-	q := "DELETE FROM {{tableName $model}}"
+	q := "DELETE FROM "+quoted{{$model.Name}}Table(a.client)
 	if whereSQL != "" {
 		q += " WHERE " + whereSQL
 	}
 	if a.client.dialect == "postgresql" {
-		q += " RETURNING {{columnCSV $model}}"
+		q += " RETURNING " + quoted{{$model.Name}}Columns(a.client)
 		row := a.client.executor.QueryRowContext(ctx, q, args...)
 		var item model.{{$model.Name}}
 		if err := row.Scan({{scanFields $model}}); err != nil {
@@ -1406,7 +1454,7 @@ func (a {{$model.Name}}Actions) DeleteOne(ctx context.Context, where query.{{$mo
 func (a {{$model.Name}}Actions) DeleteMany(ctx context.Context, wheres ...query.{{$model.Name}}WhereClause) (int64, error) {
 	argIdx := 0
 	whereSQL, args := build{{$model.Name}}Where(a.client, wheres, &argIdx)
-	q := "DELETE FROM {{tableName $model}}"
+	q := "DELETE FROM "+quoted{{$model.Name}}Table(a.client)
 	if whereSQL != "" {
 		q += " WHERE " + whereSQL
 	}
@@ -1421,7 +1469,7 @@ func (a {{$model.Name}}Actions) DeleteMany(ctx context.Context, wheres ...query.
 func (a {{$model.Name}}Actions) Count(ctx context.Context, wheres ...query.{{$model.Name}}WhereClause) (int64, error) {
 	argIdx := 0
 	whereSQL, args := build{{$model.Name}}Where(a.client, wheres, &argIdx)
-	q := "SELECT COUNT(*) FROM {{tableName $model}}"
+	q := "SELECT COUNT(*) FROM "+quoted{{$model.Name}}Table(a.client)
 	if whereSQL != "" {
 		q += " WHERE " + whereSQL
 	}
@@ -1436,9 +1484,13 @@ func (a {{$model.Name}}Actions) Count(ctx context.Context, wheres ...query.{{$mo
 func (a {{$model.Name}}Actions) Aggregate(ctx context.Context, opts ...query.{{$model.Name}}AggregateOption) (*query.{{$model.Name}}AggregateResult, error) {
 	selParts := []string{"COUNT(*)"}
 	for _, opt := range opts {
-		selParts = append(selParts, fmt.Sprintf("%s(%s)", strings.ToUpper(opt.Fn), opt.Field))
+		fn := strings.ToUpper(opt.Fn)
+		if fn != "AVG" && fn != "SUM" && fn != "MIN" && fn != "MAX" { return nil, fmt.Errorf("invalid aggregate function %q", opt.Fn) }
+		field, err := quote{{$model.Name}}Field(a.client, opt.Field)
+		if err != nil { return nil, err }
+		selParts = append(selParts, fmt.Sprintf("%s(%s)", fn, field))
 	}
-	q := fmt.Sprintf("SELECT %s FROM {{tableName $model}}", strings.Join(selParts, ", "))
+	q := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selParts, ", "), quoted{{$model.Name}}Table(a.client))
 	row := a.client.executor.QueryRowContext(ctx, q)
 	result := &query.{{$model.Name}}AggregateResult{
 		Avg: make(map[string]*float64),
@@ -1476,13 +1528,17 @@ func (a {{$model.Name}}Actions) Aggregate(ctx context.Context, opts ...query.{{$
 // GroupBy performs a GROUP BY query on {{$model.Name}}.
 func (a {{$model.Name}}Actions) GroupBy(ctx context.Context, fields []string, opts ...query.{{$model.Name}}AggregateOption) ([]query.{{$model.Name}}GroupByResult, error) {
 	selParts := make([]string, 0, len(fields)+1+len(opts))
-	selParts = append(selParts, fields...)
+	groupFields := make([]string, len(fields))
+	for i, field := range fields { quoted, err := quote{{$model.Name}}Field(a.client, field); if err != nil { return nil, err }; groupFields[i] = quoted }
+	selParts = append(selParts, groupFields...)
 	selParts = append(selParts, "COUNT(*)")
 	for _, opt := range opts {
-		selParts = append(selParts, fmt.Sprintf("%s(%s)", strings.ToUpper(opt.Fn), opt.Field))
+		fn := strings.ToUpper(opt.Fn)
+		if fn != "AVG" && fn != "SUM" && fn != "MIN" && fn != "MAX" { return nil, fmt.Errorf("invalid aggregate function %q", opt.Fn) }
+		field, err := quote{{$model.Name}}Field(a.client, opt.Field); if err != nil { return nil, err }
+		selParts = append(selParts, fmt.Sprintf("%s(%s)", fn, field))
 	}
-	q := fmt.Sprintf("SELECT %s FROM {{tableName $model}} GROUP BY %s",
-		strings.Join(selParts, ", "), strings.Join(fields, ", "))
+	q := fmt.Sprintf("SELECT %s FROM %s GROUP BY %s", strings.Join(selParts, ", "), quoted{{$model.Name}}Table(a.client), strings.Join(groupFields, ", "))
 	rows, err := a.client.executor.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("{{$model.Name}}.GroupBy: %w", err)

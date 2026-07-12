@@ -30,6 +30,9 @@ const (
 	ChangePK     ChangeType = "ChangePrimaryKey"
 	AddFK        ChangeType = "AddForeignKey"
 	DropFK       ChangeType = "DropForeignKey"
+	CreateEnum   ChangeType = "CreateEnum"
+	AlterEnum    ChangeType = "AlterEnum"
+	DropEnum     ChangeType = "DropEnum"
 )
 
 // RollbackSafety indicates how safe it is to reverse a change.
@@ -50,6 +53,8 @@ type Change struct {
 	NewValue string            // New value.
 	Details  map[string]string // Additional context.
 	Rollback RollbackSafety
+	OldField *ir.Field // Complete source column definition for dialects such as MySQL.
+	NewField *ir.Field // Complete target column definition for dialects such as MySQL.
 }
 
 // Changeset is an ordered list of changes from old to new schema.
@@ -62,7 +67,7 @@ type Changeset struct {
 // classifyRollback returns the safety classification for a change type.
 func classifyRollback(ct ChangeType) RollbackSafety {
 	switch ct {
-	case CreateTable, AddColumn, AddIndex, AddUnique, AddFK:
+	case CreateTable, AddColumn, AddIndex, AddUnique, AddFK, CreateEnum:
 		return SafeRollback
 	case DropTable, DropColumn, DropIndex, DropUnique, DropFK:
 		return DestructiveRollback
@@ -103,8 +108,44 @@ func Diff(old, new *ir.Schema) *Changeset {
 	}
 
 	addForeignKeysForCreatedTables(cs, newModels, createdTables)
+	compareEnums(cs, old, new)
 
 	return cs
+}
+
+func compareEnums(cs *Changeset, old, new *ir.Schema) {
+	oldMap := map[string]*ir.Enum{}
+	newMap := map[string]*ir.Enum{}
+	for _, e := range old.Enums {
+		oldMap[e.Name] = e
+	}
+	for _, e := range new.Enums {
+		newMap[e.Name] = e
+	}
+	for _, name := range mergedSortedKeys(oldMap, newMap) {
+		oe, okOld := oldMap[name]
+		ne, okNew := newMap[name]
+		switch {
+		case okNew && !okOld:
+			cs.add(Change{Type: CreateEnum, Model: name})
+		case okOld && !okNew:
+			cs.add(Change{Type: DropEnum, Model: name})
+		default:
+			if enumSignature(oe) != enumSignature(ne) {
+				cs.add(Change{Type: AlterEnum, Model: name, OldValue: enumSignature(oe), NewValue: enumSignature(ne)})
+			}
+		}
+	}
+}
+func enumSignature(e *ir.Enum) string {
+	if e == nil {
+		return ""
+	}
+	values := make([]string, len(e.Values))
+	for i, v := range e.Values {
+		values[i] = v.Name + "=" + v.DBName
+	}
+	return strings.Join(values, ",")
 }
 
 func (cs *Changeset) add(c Change) {
@@ -142,9 +183,9 @@ func compareFields(cs *Changeset, model string, oldFields, newFields []*ir.Field
 
 		switch {
 		case inNew && !inOld:
-			cs.add(Change{Type: AddColumn, Model: model, Field: fn, NewValue: fieldTypeSignature(nf)})
+			cs.add(Change{Type: AddColumn, Model: model, Field: fn, NewValue: fieldTypeSignature(nf), NewField: nf})
 		case inOld && !inNew:
-			cs.add(Change{Type: DropColumn, Model: model, Field: fn, OldValue: fieldTypeSignature(of)})
+			cs.add(Change{Type: DropColumn, Model: model, Field: fn, OldValue: fieldTypeSignature(of), OldField: of})
 		default:
 			compareField(cs, model, of, nf)
 		}
@@ -157,14 +198,14 @@ func compareField(cs *Changeset, model string, of, nf *ir.Field) {
 	if oldType != newType {
 		cs.add(Change{
 			Type: AlterType, Model: model, Field: columnName(nf),
-			OldValue: oldType, NewValue: newType,
+			OldValue: oldType, NewValue: newType, OldField: of, NewField: nf,
 		})
 	}
 
 	if of.IsOptional != nf.IsOptional {
 		cs.add(Change{
 			Type: AlterNull, Model: model, Field: columnName(nf),
-			OldValue: nullLabel(of.IsOptional), NewValue: nullLabel(nf.IsOptional),
+			OldValue: nullLabel(of.IsOptional), NewValue: nullLabel(nf.IsOptional), OldField: of, NewField: nf,
 		})
 	}
 
@@ -173,7 +214,7 @@ func compareField(cs *Changeset, model string, of, nf *ir.Field) {
 	if od != nd {
 		cs.add(Change{
 			Type: AlterDefault, Model: model, Field: columnName(nf),
-			OldValue: od, NewValue: nd,
+			OldValue: od, NewValue: nd, OldField: of, NewField: nf,
 		})
 	}
 }
@@ -205,10 +246,20 @@ func fieldTypeSignature(f *ir.Field) string {
 	if f == nil {
 		return ""
 	}
-	if f.IsList {
-		return f.ScalarType + "[]"
+	base := f.ScalarType
+	if f.Type == ir.FieldKindEnum {
+		base = f.EnumType
 	}
-	return f.ScalarType
+	if f.NativeType != nil {
+		base += "@db." + f.NativeType.Name
+		if len(f.NativeType.Args) > 0 {
+			base += "(" + strings.Join(f.NativeType.Args, ",") + ")"
+		}
+	}
+	if f.IsList {
+		return base + "[]"
+	}
+	return base
 }
 
 // ---------------------------------------------------------------------------

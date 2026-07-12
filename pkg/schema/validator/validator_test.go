@@ -653,7 +653,7 @@ func TestValidateDocumentSetMissingType(t *testing.T) {
 	requireErrors(t, r, "unknown type")
 }
 
-func TestWarningsForUnknownConfigKeys(t *testing.T) {
+func TestErrorsForUnknownDatasourceConfigKeys(t *testing.T) {
 	doc := &ast.Document{
 		Datasources: []ast.DatasourceDecl{{
 			Name: "db",
@@ -665,6 +665,30 @@ func TestWarningsForUnknownConfigKeys(t *testing.T) {
 		}},
 	}
 	r := Validate(doc)
-	requireNoErrors(t, r)
-	requireWarnings(t, r, "unknown datasource config key")
+	requireErrors(t, r, "unknown datasource config key")
+}
+
+func TestRejectsInvalidConstraintRelationAndDefaultEdges(t *testing.T) {
+	doc := &ast.Document{Datasources: []ast.DatasourceDecl{validDatasource()}, Models: []ast.ModelDecl{
+		{Name: "User", Fields: []ast.FieldDecl{{Name: "id", Type: ast.FieldType{Name: "Int"}, Attributes: []ast.Attribute{{Name: "id"}}}}},
+		{Name: "Post", Fields: []ast.FieldDecl{
+			{Name: "id", Type: ast.FieldType{Name: "Int"}, Attributes: []ast.Attribute{{Name: "uniqe"}}},
+			{Name: "userId", Type: ast.FieldType{Name: "String"}, Attributes: []ast.Attribute{{Name: "default", Args: []ast.AttributeArg{posArg(funcCall("anything"))}}}},
+			{Name: "user", Type: ast.FieldType{Name: "User"}, Attributes: []ast.Attribute{{Name: "relation", Args: []ast.AttributeArg{namedArg("fields", arrayLit(ident("userId"))), namedArg("references", arrayLit(ident("id"), ident("id"))), namedArg("onDelete", ident("Explode"))}}}},
+		}, Attributes: []ast.Attribute{{Name: "id", Args: []ast.AttributeArg{posArg(arrayLit())}}, {Name: "unique", Args: []ast.AttributeArg{posArg(arrayLit(ident("missing"), ident("missing")))}}}},
+	}}
+	r := Validate(doc)
+	for _, want := range []string{"unknown field attribute", "unknown default function", "fields must not be empty", "unknown field", "duplicate field", "same length", "invalid referential action"} {
+		requireErrors(t, r, want)
+	}
+}
+
+func TestRejectsMalformedDatasource(t *testing.T) {
+	doc := &ast.Document{Datasources: []ast.DatasourceDecl{{Name: "db", Entries: []ast.ConfigEntry{
+		{Key: "provider", Value: ident("postgresql")}, {Key: "url", Value: funcCall("env", strLit("A"), strLit("B"))}, {Key: "url", Value: strLit("x")}, {Key: "schema", Value: strLit("public")}, {Key: "schemas", Value: arrayLit(strLit("public"), strLit("public"))},
+	}}}}
+	r := Validate(doc)
+	for _, want := range []string{"provider must be a string", "duplicate datasource config key", `env("NAME")`, "mutually exclusive", "duplicate datasource schema"} {
+		requireErrors(t, r, want)
+	}
 }

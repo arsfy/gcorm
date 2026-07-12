@@ -112,8 +112,10 @@ func (r *resolver) resolveDatasource(d *ast.DatasourceDecl) *ir.Datasource {
 			} else {
 				ds.URL = exprToString(entry.Value)
 			}
-		case "schema", "schemas":
+		case "schema":
 			ds.Schema = exprToString(entry.Value)
+		case "schemas":
+			ds.Schemas = exprToStringSlice(entry.Value)
 		}
 	}
 	return ds
