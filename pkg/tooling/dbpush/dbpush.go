@@ -1089,6 +1089,10 @@ func validateNoInternalTableConflict(schema *ir.Schema) error {
 }
 
 func introspectPostgres(ctx context.Context, db sqlRunner, schemaName string) (*ir.Schema, error) {
+	return introspectPostgresWithTarget(ctx, db, schemaName, nil)
+}
+
+func introspectPostgresWithTarget(ctx context.Context, db sqlRunner, schemaName string, targetSchema *ir.Schema) (*ir.Schema, error) {
 	schema := &ir.Schema{
 		Datasource: &ir.Datasource{
 			Provider: "postgresql",
@@ -1100,7 +1104,12 @@ func introspectPostgres(ctx context.Context, db sqlRunner, schemaName string) (*
 	if err != nil {
 		return nil, err
 	}
-	if err := loadPostgresColumns(ctx, db, schemaName, models); err != nil {
+	enums, enumNames, err := loadPostgresEnums(ctx, db, schemaName, targetSchema)
+	if err != nil {
+		return nil, err
+	}
+	schema.Enums = enums
+	if err := loadPostgresColumns(ctx, db, schemaName, models, targetSchema, enumNames); err != nil {
 		return nil, err
 	}
 	if err := loadPostgresPrimaryKeys(ctx, db, schemaName, models); err != nil {
@@ -1130,7 +1139,7 @@ func introspectPostgres(ctx context.Context, db sqlRunner, schemaName string) (*
 func introspectDatabase(ctx context.Context, db sqlRunner, provider string, targetSchema *ir.Schema, dsn string) (*ir.Schema, error) {
 	switch provider {
 	case "postgresql":
-		return introspectPostgres(ctx, db, resolveSchemaName(targetSchema, dsn))
+		return introspectPostgresWithTarget(ctx, db, resolveSchemaName(targetSchema, dsn), targetSchema)
 	case "mysql":
 		return introspectMySQL(ctx, db)
 	case "sqlite":
@@ -1232,7 +1241,88 @@ ORDER BY table_name`, schemaName)
 	return models, rows.Err()
 }
 
-func loadPostgresColumns(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
+func loadPostgresEnums(ctx context.Context, db sqlRunner, schemaName string, targetSchema *ir.Schema) ([]*ir.Enum, map[string]string, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT typ.typname, enum.enumlabel
+FROM pg_type typ
+JOIN pg_namespace ns ON ns.oid = typ.typnamespace
+JOIN pg_enum enum ON enum.enumtypid = typ.oid
+WHERE ns.nspname = $1
+ORDER BY typ.typname, enum.enumsortorder`, schemaName)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	targetEnums := make(map[string]*ir.Enum)
+	if targetSchema != nil {
+		for _, enum := range targetSchema.Enums {
+			targetEnums[postgresEnumDatabaseName(enum)] = enum
+		}
+	}
+
+	byDatabaseName := make(map[string]*ir.Enum)
+	var databaseNames []string
+	for rows.Next() {
+		var databaseName, label string
+		if err := rows.Scan(&databaseName, &label); err != nil {
+			return nil, nil, err
+		}
+		enum := byDatabaseName[databaseName]
+		if enum == nil {
+			enum = postgresIntrospectedEnum(databaseName, targetEnums[databaseName])
+			byDatabaseName[databaseName] = enum
+			databaseNames = append(databaseNames, databaseName)
+		}
+		enum.Values = append(enum.Values, postgresIntrospectedEnumValue(label, targetEnums[databaseName]))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	enums := make([]*ir.Enum, 0, len(databaseNames))
+	names := make(map[string]string, len(databaseNames))
+	for _, databaseName := range databaseNames {
+		enum := byDatabaseName[databaseName]
+		enums = append(enums, enum)
+		names[databaseName] = enum.Name
+	}
+	return enums, names, nil
+}
+
+func postgresEnumDatabaseName(enum *ir.Enum) string {
+	if enum == nil {
+		return ""
+	}
+	if enum.DBName != "" {
+		return enum.DBName
+	}
+	return enum.Name
+}
+
+func postgresIntrospectedEnum(databaseName string, target *ir.Enum) *ir.Enum {
+	if target == nil {
+		return &ir.Enum{Name: databaseName}
+	}
+	return &ir.Enum{Name: target.Name, DBName: target.DBName}
+}
+
+func postgresIntrospectedEnumValue(label string, target *ir.Enum) *ir.EnumValue {
+	if target != nil {
+		for _, value := range target.Values {
+			databaseName := value.DBName
+			if databaseName == "" {
+				databaseName = value.Name
+			}
+			if databaseName == label {
+				return &ir.EnumValue{Name: value.Name, DBName: value.DBName}
+			}
+		}
+	}
+	return &ir.EnumValue{Name: label}
+}
+
+func loadPostgresColumns(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model, targetSchema *ir.Schema, enumNames map[string]string) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT c.table_name, c.column_name, c.is_nullable, c.data_type, c.udt_name, c.column_default, c.is_identity,
        format_type(a.atttypid, a.atttypmod)
@@ -1264,11 +1354,71 @@ ORDER BY c.table_name, c.ordinal_position`, schemaName)
 			IsOptional: isNullable == "YES",
 			Default:    postgresDefaultValue(columnDefault.String, isIdentity == "YES"),
 		}
-		field.ScalarType, field.IsList = postgresColumnType(dataType, udtName)
-		field.NativeType = postgresNativeType(formattedType, field.ScalarType)
+		targetField := findPostgresTargetField(targetSchema, tableName, columnName)
+		applyPostgresColumnType(field, dataType, udtName, formattedType, targetField, enumNames)
 		model.Fields = append(model.Fields, field)
 	}
 	return rows.Err()
+}
+
+func findPostgresTargetField(schema *ir.Schema, tableName, columnName string) *ir.Field {
+	if schema == nil {
+		return nil
+	}
+	for _, model := range schema.Models {
+		if model.TableName() == tableName {
+			return findFieldByColumn(model, columnName)
+		}
+	}
+	return nil
+}
+
+func applyPostgresColumnType(field *ir.Field, dataType, udtName, formattedType string, targetField *ir.Field, enumNames map[string]string) {
+	databaseType := strings.TrimPrefix(udtName, "_")
+	if enumName := enumNames[databaseType]; enumName != "" {
+		field.Type = ir.FieldKindEnum
+		field.EnumType = enumName
+		field.IsList = strings.EqualFold(strings.TrimSpace(dataType), "ARRAY") || strings.HasPrefix(udtName, "_")
+		return
+	}
+
+	field.ScalarType, field.IsList = postgresColumnType(dataType, udtName)
+	field.NativeType = postgresNativeType(formattedType, field.ScalarType)
+	if targetField != nil && targetField.NativeType != nil &&
+		targetField.Type == ir.FieldKindScalar && targetField.ScalarType == field.ScalarType &&
+		targetField.IsList == field.IsList && postgresNativeTypeMatches(formattedType, targetField.NativeType, targetField.IsList) {
+		clone := *targetField.NativeType
+		clone.Args = append([]string(nil), targetField.NativeType.Args...)
+		field.NativeType = &clone
+	}
+}
+
+func postgresNativeTypeMatches(formatted string, native *ir.NativeType, isList bool) bool {
+	if native == nil {
+		return false
+	}
+	expected := strings.ToLower(native.Name)
+	switch expected {
+	case "varchar":
+		expected = "character varying"
+	case "decimal":
+		expected = "numeric"
+	case "timestamptz":
+		expected = "timestamp with time zone"
+	case "timestamp":
+		expected = "timestamp without time zone"
+	case "uuid":
+		expected = "uuid"
+	}
+	if len(native.Args) > 0 {
+		expected += "(" + strings.Join(native.Args, ",") + ")"
+	}
+	if isList {
+		expected += "[]"
+	}
+	actual := strings.ToLower(strings.TrimSpace(formatted))
+	actual = strings.ReplaceAll(actual, ", ", ",")
+	return actual == expected
 }
 
 func loadPostgresPrimaryKeys(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {

@@ -391,6 +391,60 @@ func TestPostgresColumnTypeArray(t *testing.T) {
 	}
 }
 
+func TestApplyPostgresColumnTypeRestoresEnumAndNativeText(t *testing.T) {
+	t.Run("enum", func(t *testing.T) {
+		field := &ir.Field{Type: ir.FieldKindScalar}
+		applyPostgresColumnType(field, "USER-DEFINED", "ClusterPermission", `"ClusterPermission"`, nil, map[string]string{
+			"ClusterPermission": "ClusterPermission",
+		})
+		if field.Type != ir.FieldKindEnum || field.EnumType != "ClusterPermission" || field.ScalarType != "" {
+			t.Fatalf("field = %#v, want ClusterPermission enum", field)
+		}
+	})
+
+	t.Run("mapped enum array", func(t *testing.T) {
+		field := &ir.Field{Type: ir.FieldKindScalar}
+		applyPostgresColumnType(field, "ARRAY", "_cluster_permission", `cluster_permission[]`, nil, map[string]string{
+			"cluster_permission": "ClusterPermission",
+		})
+		if field.Type != ir.FieldKindEnum || field.EnumType != "ClusterPermission" || !field.IsList {
+			t.Fatalf("field = %#v, want ClusterPermission enum array", field)
+		}
+	})
+
+	t.Run("native text", func(t *testing.T) {
+		field := &ir.Field{Type: ir.FieldKindScalar}
+		target := &ir.Field{
+			Type:       ir.FieldKindScalar,
+			ScalarType: "String",
+			NativeType: &ir.NativeType{Name: "Text"},
+		}
+		applyPostgresColumnType(field, "text", "text", "text", target, nil)
+		if field.ScalarType != "String" || field.NativeType == nil || field.NativeType.Name != "Text" {
+			t.Fatalf("field = %#v, want String @db.Text", field)
+		}
+	})
+}
+
+func TestPostgresIntrospectedEnumUsesTargetMappings(t *testing.T) {
+	target := &ir.Enum{
+		Name:   "ClusterPermission",
+		DBName: "cluster_permission",
+		Values: []*ir.EnumValue{{Name: "OWNER", DBName: "owner"}, {Name: "OPERATOR"}},
+	}
+	enum := postgresIntrospectedEnum("cluster_permission", target)
+	enum.Values = append(enum.Values,
+		postgresIntrospectedEnumValue("owner", target),
+		postgresIntrospectedEnumValue("OPERATOR", target),
+	)
+	if enum.Name != "ClusterPermission" || enum.DBName != "cluster_permission" {
+		t.Fatalf("enum = %#v", enum)
+	}
+	if enum.Values[0].Name != "OWNER" || enum.Values[0].DBName != "owner" || enum.Values[1].Name != "OPERATOR" {
+		t.Fatalf("values = %#v", enum.Values)
+	}
+}
+
 func TestPostgresDefaultValueNormalizesIdentityAndCasts(t *testing.T) {
 	identity := postgresDefaultValue("", true)
 	if identity == nil || !identity.IsFunction || identity.FuncName != "autoincrement" {

@@ -154,7 +154,8 @@ func (g DDLGenerator) sqliteRebuildTableSQL(table string, cs *Changeset) string 
 		if idx.IsUnique {
 			unique = "UNIQUE "
 		}
-		b.WriteString("\n" + g.createIndexSQL(name, table, unique, g.indexColumnsSQL(newModel, idx), idx.Where))
+		b.WriteString("\n")
+		b.WriteString(g.createIndexSQL(name, table, unique, g.indexColumnsSQL(newModel, idx), idx.Where))
 	}
 	return b.String()
 }

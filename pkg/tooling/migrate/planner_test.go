@@ -973,6 +973,26 @@ func TestDDLDropIndexUsesIfExists(t *testing.T) {
 	}
 }
 
+func TestDiffIgnoresPostgresDefaultEnumIndexOpClass(t *testing.T) {
+	old := &ir.Schema{Models: []*ir.Model{{
+		Name:   "jobs",
+		Fields: []*ir.Field{{Name: "status", Type: ir.FieldKindEnum, EnumType: "JobStatus"}},
+		Indexes: []*ir.Index{{
+			Name:    "idx_jobs_status",
+			Fields:  []string{"status"},
+			Columns: []ir.IndexColumn{{Field: "status", OpClass: "enum_ops"}},
+		}},
+	}}}
+	newSchema := &ir.Schema{Models: []*ir.Model{{
+		Name:    "jobs",
+		Fields:  []*ir.Field{{Name: "status", Type: ir.FieldKindEnum, EnumType: "JobStatus"}},
+		Indexes: []*ir.Index{{Name: "idx_jobs_status", Fields: []string{"status"}}},
+	}}}
+	if changes := Diff(old, newSchema).Changes; len(changes) != 0 {
+		t.Fatalf("changes = %#v, want none", changes)
+	}
+}
+
 func TestDDLCreateIndexWithPredicateAndColumnOptions(t *testing.T) {
 	announcement := testModel(
 		"Announcement",

@@ -573,7 +573,7 @@ func normalizeIndexNulls(sort, nulls string) string {
 func normalizeIndexOpClass(opclass string) string {
 	opclass = strings.TrimSpace(opclass)
 	switch strings.ToLower(opclass) {
-	case "bool_ops", "int2_ops", "int4_ops", "int8_ops", "text_ops", "timestamp_ops", "timestamptz_ops", "uuid_ops":
+	case "bool_ops", "enum_ops", "int2_ops", "int4_ops", "int8_ops", "text_ops", "timestamp_ops", "timestamptz_ops", "uuid_ops":
 		return ""
 	default:
 		return opclass
