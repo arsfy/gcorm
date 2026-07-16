@@ -146,6 +146,15 @@ func TestRunGenerateFromSchemaFiles(t *testing.T) {
 	if !strings.Contains(guideText, "# Guide for Generated GCO Client") {
 		t.Fatalf("guide doc missing title: %s", guideText)
 	}
+	if !strings.Contains(guideText, "## About GCORM") || !strings.Contains(guideText, "schema-first ORM") {
+		t.Fatalf("guide doc missing project intro: %s", guideText)
+	}
+	if !strings.Contains(guideText, "https://github.com/arsfy/gcorm/wiki") {
+		t.Fatalf("guide doc missing wiki link: %s", guideText)
+	}
+	if !strings.Contains(guideText, "## gco CLI Basics") || !strings.Contains(guideText, "gco generate") {
+		t.Fatalf("guide doc missing gco CLI basics: %s", guideText)
+	}
 	if !strings.Contains(guideText, "## CRUD Builder Pattern") {
 		t.Fatalf("guide doc missing CRUD section: %s", guideText)
 	}
