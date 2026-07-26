@@ -133,6 +133,25 @@ func TestGenerateSchema(t *testing.T) {
 	}
 }
 
+func TestGenerateSchemaWithExpressionUniqueIndex(t *testing.T) {
+	tables := []TableInfo{{
+		Name:    "users",
+		Columns: []ColumnInfo{{Name: "id", DataType: "INT", IsPrimaryKey: true}, {Name: "email", DataType: "TEXT"}},
+		Indexes: []IndexInfo{{
+			Name:        "uq_users_email_ci",
+			Columns:     []string{""},
+			Expressions: []string{"lower(email)"},
+			IsUnique:    true,
+		}},
+	}}
+
+	schema := GenerateSchema("postgresql", tables)
+	want := `@@unique([email], name: "uq_users_email_ci", expression: "lower(email)")`
+	if !strings.Contains(schema, want) {
+		t.Fatalf("missing expression unique index:\n%s", schema)
+	}
+}
+
 func TestGenerateSchemaSanitizesNamesAndPreservesCompositeConstraints(t *testing.T) {
 	tables := []TableInfo{{Name: "user-data", Columns: []ColumnInfo{{Name: "1st", DataType: "INT", IsPrimaryKey: true}, {Name: "User ID", DataType: "INT", IsPrimaryKey: true}, {Name: "user-id", DataType: "TEXT"}}, Indexes: []IndexInfo{{Name: "uq_user", Columns: []string{"User ID", "user-id"}, IsUnique: true}}}}
 	schema := GenerateSchema("sqlite", tables)

@@ -1523,7 +1523,7 @@ SELECT
   t.relname AS table_name,
   i.relname AS index_name,
   ix.indisunique,
-  array_agg(a.attname ORDER BY keys.ord) AS columns,
+  array_agg(COALESCE(a.attname, '') ORDER BY keys.ord) AS columns,
   array_agg(pg_get_indexdef(ix.indexrelid, keys.ord::int, false) ORDER BY keys.ord) AS column_defs,
   array_agg((ix.indoption::int2[])[keys.ord::int - 1] ORDER BY keys.ord) AS column_options,
   array_agg(opc.opcname ORDER BY keys.ord) AS opclasses,
@@ -1534,7 +1534,7 @@ JOIN pg_namespace ns ON ns.oid = t.relnamespace
 JOIN pg_index ix ON t.oid = ix.indrelid
 JOIN pg_class i ON i.oid = ix.indexrelid
 JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS keys(attnum, ord) ON true
-JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = keys.attnum
+LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = keys.attnum
 JOIN LATERAL unnest(ix.indclass) WITH ORDINALITY AS classes(opcoid, ord) ON classes.ord = keys.ord
 JOIN pg_opclass opc ON opc.oid = classes.opcoid
 JOIN LATERAL unnest(ix.indcollation) WITH ORDINALITY AS index_collations(colloid, ord) ON index_collations.ord = keys.ord
@@ -2667,15 +2667,32 @@ func sqliteQuoteIdent(name string) string {
 }
 
 func parsePostgresTextArray(input string) []string {
-	input = strings.TrimSpace(strings.Trim(input, "{}"))
-	if input == "" {
+	input = strings.TrimSpace(input)
+	if input == "{}" || input == "" {
 		return nil
 	}
-	parts := strings.Split(input, ",")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		out = append(out, strings.Trim(part, `"`))
+	input = strings.TrimPrefix(strings.TrimSuffix(input, "}"), "{")
+	var out []string
+	var item strings.Builder
+	quoted := false
+	escaped := false
+	for _, r := range input {
+		switch {
+		case escaped:
+			item.WriteRune(r)
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case r == '"':
+			quoted = !quoted
+		case r == ',' && !quoted:
+			out = append(out, item.String())
+			item.Reset()
+		default:
+			item.WriteRune(r)
+		}
 	}
+	out = append(out, item.String())
 	return out
 }
 
@@ -2687,6 +2704,9 @@ func parsePostgresIndexColumns(fields, defs, options, opclasses, collations []st
 			cols[i] = parsePostgresIndexColumnDef(field, defs[i])
 		}
 		applyPostgresIndexCatalogOptions(&cols[i], arrayValueAt(options, i), arrayValueAt(opclasses, i), arrayValueAt(collations, i))
+		if cols[i].Expression != "" {
+			cols[i].Expression = stripPostgresIndexExpressionOptions(cols[i].Expression, cols[i])
+		}
 	}
 	return cols
 }
@@ -2740,6 +2760,10 @@ func normalizePostgresArrayItem(value string) string {
 func parsePostgresIndexColumnDef(field, def string) ir.IndexColumn {
 	col := ir.IndexColumn{Field: field}
 	rest := strings.TrimSpace(def)
+	if field == "" {
+		col.Expression = rest
+		return col
+	}
 	quotedField := `"` + strings.ReplaceAll(field, `"`, `""`) + `"`
 	switch {
 	case strings.HasPrefix(rest, quotedField):
@@ -2774,6 +2798,31 @@ func parsePostgresIndexColumnDef(field, def string) ir.IndexColumn {
 		}
 	}
 	return col
+}
+
+func stripPostgresIndexExpressionOptions(expression string, col ir.IndexColumn) string {
+	expression = strings.TrimSpace(expression)
+	expression = trimPostgresIndexSuffix(expression, "NULLS "+col.Nulls)
+	expression = trimPostgresIndexSuffix(expression, col.Sort)
+	expression = trimPostgresIndexSuffix(expression, col.OpClass)
+	if col.Collation != "" {
+		collation := strings.ReplaceAll(col.Collation, ".", `"."`)
+		expression = trimPostgresIndexSuffix(expression, `COLLATE "`+collation+`"`)
+		expression = trimPostgresIndexSuffix(expression, "COLLATE "+col.Collation)
+	}
+	return strings.TrimSpace(expression)
+}
+
+func trimPostgresIndexSuffix(value, suffix string) string {
+	suffix = strings.TrimSpace(suffix)
+	if suffix == "" || len(value) < len(suffix) {
+		return value
+	}
+	start := len(value) - len(suffix)
+	if strings.EqualFold(value[start:], suffix) && (start == 0 || value[start-1] == ' ') {
+		return strings.TrimSpace(value[:start])
+	}
+	return value
 }
 
 func normalizePostgresIdentifierPath(s string) string {

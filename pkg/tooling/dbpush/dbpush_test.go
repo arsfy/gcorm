@@ -572,8 +572,28 @@ func TestPostgresTextArrayAndIdentifierQuoting(t *testing.T) {
 	if got := parsePostgresTextArray("{}"); got != nil {
 		t.Fatalf("parsePostgresTextArray(empty) = %#v, want nil", got)
 	}
+	if got := parsePostgresTextArray(`{"lower(COALESCE(email, ''))",email}`); len(got) != 2 || got[0] != `lower(COALESCE(email, ''))` {
+		t.Fatalf("parsePostgresTextArray(expression) = %#v", got)
+	}
 	if got := sqliteQuoteIdent(`weird"name`); got != `"weird""name"` {
 		t.Fatalf("sqliteQuoteIdent() = %q", got)
+	}
+}
+
+func TestParsePostgresExpressionIndexColumn(t *testing.T) {
+	cols := parsePostgresIndexColumns(
+		[]string{""},
+		[]string{`lower(email) text_ops DESC NULLS LAST`},
+		[]string{"1"},
+		[]string{"text_ops"},
+		nil,
+	)
+	if len(cols) != 1 {
+		t.Fatalf("columns = %d, want 1", len(cols))
+	}
+	col := cols[0]
+	if col.Field != "" || col.Expression != "lower(email)" || col.Sort != "DESC" || col.Nulls != "LAST" || col.OpClass != "text_ops" {
+		t.Fatalf("expression column = %+v", col)
 	}
 }
 

@@ -172,10 +172,14 @@ func (r *resolver) resolveModel(m *ast.ModelDecl) *ir.Model {
 			model.Indexes = append(model.Indexes, r.resolveIndex(attr, false))
 		case "unique":
 			idx := r.resolveIndex(attr, true)
-			model.UniqueConstraints = append(model.UniqueConstraints, &ir.UniqueConstraint{
-				Name:   idx.Name,
-				Fields: idx.Fields,
-			})
+			if indexHasExpression(idx) {
+				model.Indexes = append(model.Indexes, idx)
+			} else {
+				model.UniqueConstraints = append(model.UniqueConstraints, &ir.UniqueConstraint{
+					Name:   idx.Name,
+					Fields: idx.Fields,
+				})
+			}
 		}
 	}
 
@@ -393,10 +397,24 @@ func resolveIndexColumns(fields []string, args []ast.AttributeArg) []ir.IndexCol
 				cols[i].OpClass = value
 			case "collate", "collation":
 				cols[i].Collation = value
+			case "expression", "expressions":
+				cols[i].Expression = value
 			}
 		}
 	}
 	return cols
+}
+
+func indexHasExpression(idx *ir.Index) bool {
+	if idx == nil {
+		return false
+	}
+	for _, col := range idx.Columns {
+		if strings.TrimSpace(col.Expression) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func indexOptionAt(values []string, idx int) string {

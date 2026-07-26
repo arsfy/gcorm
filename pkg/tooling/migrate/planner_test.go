@@ -241,6 +241,64 @@ func TestDiff_AddIndex(t *testing.T) {
 	}
 }
 
+func TestDDLExpressionUniqueIndex(t *testing.T) {
+	user := testModel("User", testField("id", "Int"), testField("email", "String"))
+	user.DBName = "users"
+	user.Indexes = []*ir.Index{{
+		Name:     "uq_users_email_ci",
+		Fields:   []string{"email"},
+		Columns:  []ir.IndexColumn{{Field: "email", Expression: "lower(email)"}},
+		IsUnique: true,
+	}}
+
+	cs := Diff(nil, testSchema(user))
+	sql := DDLGenerator{Dialect: "postgresql", Schema: cs.New}.GenerateUp(cs)
+	want := `CREATE UNIQUE INDEX "uq_users_email_ci" ON "users" (lower(email));`
+	if !strings.Contains(sql, want) {
+		t.Fatalf("missing expression unique index SQL:\nwant: %s\n got:\n%s", want, sql)
+	}
+}
+
+func TestDDLExpressionIndexPreservesCommas(t *testing.T) {
+	change := Change{
+		Type:     AddIndex,
+		Model:    "users",
+		NewValue: "idx_users_email_fallback",
+		Details: map[string]string{
+			"fields":      "email",
+			"expressions": `["lower(COALESCE(email, ''))"]`,
+		},
+	}
+	want := `CREATE INDEX "idx_users_email_fallback" ON "users" (lower(COALESCE(email, '')));`
+	if got := (DDLGenerator{Dialect: "postgresql"}).addIndexSQL(change); got != want {
+		t.Fatalf("expression index SQL = %q, want %q", got, want)
+	}
+}
+
+func TestDiffExpressionIndexMatchesIntrospection(t *testing.T) {
+	oldUser := testModel("User", testField("email", "String"))
+	oldUser.DBName = "users"
+	oldUser.Indexes = []*ir.Index{{
+		Name:     "uq_users_email_ci",
+		Fields:   []string{""},
+		Columns:  []ir.IndexColumn{{Expression: "(lower(email))", Sort: "ASC", OpClass: "text_ops"}},
+		IsUnique: true,
+	}}
+	newUser := testModel("User", testField("email", "String"))
+	newUser.DBName = "users"
+	newUser.Indexes = []*ir.Index{{
+		Name:     "uq_users_email_ci",
+		Fields:   []string{"email"},
+		Columns:  []ir.IndexColumn{{Field: "email", Expression: "lower(email)"}},
+		IsUnique: true,
+	}}
+
+	cs := Diff(testSchema(oldUser), testSchema(newUser))
+	if len(cs.Changes) != 0 {
+		t.Fatalf("equivalent expression index should be stable, got %+v", cs.Changes)
+	}
+}
+
 func TestDiff_IndexOptionsTriggerRecreate(t *testing.T) {
 	userOld := testModel("User", testField("id", "Int"), testField("email", "String"))
 	userOld.Indexes = []*ir.Index{{

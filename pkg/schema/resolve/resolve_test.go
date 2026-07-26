@@ -486,6 +486,39 @@ func TestResolveIndexPredicateAndColumnOptions(t *testing.T) {
 	}
 }
 
+func TestResolveExpressionIndexes(t *testing.T) {
+	ds := docSet(&ast.Document{Models: []ast.ModelDecl{{
+		Name:   "User",
+		Fields: []ast.FieldDecl{{Name: "email", Type: ast.FieldType{Name: "String"}}},
+		Attributes: []ast.Attribute{
+			{Name: "index", IsModelLevel: true, Args: []ast.AttributeArg{
+				{Value: ast.ArrayLiteral{Elements: []ast.Expression{ast.Identifier{Name: "email"}}}},
+				{Name: "expression", Value: ast.StringLiteral{Value: "lower(email)"}},
+			}},
+			{Name: "unique", IsModelLevel: true, Args: []ast.AttributeArg{
+				{Value: ast.ArrayLiteral{Elements: []ast.Expression{ast.Identifier{Name: "email"}}}},
+				{Name: "name", Value: ast.StringLiteral{Value: "uq_users_email_ci"}},
+				{Name: "expression", Value: ast.StringLiteral{Value: "lower(email)"}},
+			}},
+		},
+	}}})
+
+	schema, errs := Resolve(ds)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	model := schema.Models[0]
+	if len(model.Indexes) != 2 || len(model.UniqueConstraints) != 0 {
+		t.Fatalf("indexes = %d, unique constraints = %d", len(model.Indexes), len(model.UniqueConstraints))
+	}
+	if got := model.Indexes[0].Columns[0].Expression; got != "lower(email)" {
+		t.Fatalf("index expression = %q", got)
+	}
+	if !model.Indexes[1].IsUnique || model.Indexes[1].Name != "uq_users_email_ci" {
+		t.Fatalf("expression unique index = %+v", model.Indexes[1])
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 9. Resolve @@id composite
 // ---------------------------------------------------------------------------

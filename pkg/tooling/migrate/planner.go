@@ -3,6 +3,7 @@
 package migrate
 
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"unicode"
@@ -310,11 +311,20 @@ func indexDetails(idx *ir.Index) map[string]string {
 		details["where"] = idx.Where
 	}
 	cols := effectiveIndexColumns(idx)
+	details["expressions"] = encodeIndexExpressions(indexColumnValues(cols, func(c ir.IndexColumn) string { return c.Expression }))
 	details["sorts"] = strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return c.Sort }), ",")
 	details["nulls"] = strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return c.Nulls }), ",")
 	details["opclasses"] = strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return c.OpClass }), ",")
 	details["collations"] = strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return c.Collation }), ",")
 	return details
+}
+
+func encodeIndexExpressions(expressions []string) string {
+	encoded, err := json.Marshal(expressions)
+	if err != nil {
+		return "[]"
+	}
+	return string(encoded)
 }
 
 func indexSignature(idx *ir.Index) string {
@@ -323,7 +333,13 @@ func indexSignature(idx *ir.Index) string {
 	}
 	cols := effectiveIndexColumns(idx)
 	return strings.Join([]string{
-		strings.Join(idx.Fields, ","),
+		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string {
+			if strings.TrimSpace(c.Expression) != "" {
+				return ""
+			}
+			return c.Field
+		}), ","),
+		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexExpression(c.Expression) }), ","),
 		boolStr(idx.IsUnique),
 		normalizeIndexPredicate(idx.Where),
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexSort(c.Sort) }), ","),
@@ -331,6 +347,14 @@ func indexSignature(idx *ir.Index) string {
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexOpClass(c.OpClass) }), ","),
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexCollation(c.Collation) }), ","),
 	}, "\x00")
+}
+
+func normalizeIndexExpression(expression string) string {
+	expression = strings.TrimSpace(expression)
+	for hasWrappingParens(expression) {
+		expression = strings.TrimSpace(expression[1 : len(expression)-1])
+	}
+	return strings.Join(strings.Fields(expression), " ")
 }
 
 func normalizeIndexPredicate(where string) string {
@@ -633,7 +657,11 @@ func effectiveIndexName(model *ir.Model, idx *ir.Index) string {
 	if idx.Name != "" {
 		return idx.Name
 	}
-	return defaultIndexName(model, normalizeFieldNames(model, idx.Fields))
+	name := defaultIndexName(model, normalizeFieldNames(model, idx.Fields))
+	if idx.IsUnique {
+		return "uq_" + strings.TrimPrefix(name, "idx_")
+	}
+	return name
 }
 
 func defaultIndexName(model *ir.Model, fields []string) string {
@@ -965,7 +993,9 @@ func normalizeIndexColumns(model *ir.Model, idx *ir.Index) []ir.IndexColumn {
 	out := make([]ir.IndexColumn, len(cols))
 	for i, col := range cols {
 		out[i] = col
-		out[i].Field = resolveColumnName(model, col.Field)
+		if strings.TrimSpace(col.Expression) == "" {
+			out[i].Field = resolveColumnName(model, col.Field)
+		}
 	}
 	return out
 }

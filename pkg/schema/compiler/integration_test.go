@@ -89,6 +89,35 @@ enum Role {
 	}
 }
 
+func TestIntegrationPostgresExpressionUnique(t *testing.T) {
+	result := parseAndCompile(t, `
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id    Int    @id
+  email String
+
+  @@unique([email], name: "uq_users_email_ci", expression: "lower(email)")
+}
+`)
+	if result.HasErrors() {
+		t.Fatalf("unexpected errors: %v", result.Errors)
+	}
+	model := result.Schema.Models[0]
+	if len(model.Indexes) != 1 || !model.Indexes[0].IsUnique {
+		t.Fatalf("expression unique index = %+v", model.Indexes)
+	}
+	if got := model.Indexes[0].Columns[0].Expression; got != "lower(email)" {
+		t.Fatalf("expression = %q", got)
+	}
+	if len(model.UniqueConstraints) != 0 {
+		t.Fatalf("expression unique must not be a table constraint: %+v", model.UniqueConstraints)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 2. Multi-model schema with relations
 // ---------------------------------------------------------------------------

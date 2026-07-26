@@ -2,6 +2,7 @@
 package migrate
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -146,10 +147,7 @@ func (g DDLGenerator) sqliteRebuildTableSQL(table string, cs *Changeset) string 
 	}
 	fmt.Fprintf(&b, "DROP TABLE %s;\nALTER TABLE %s RENAME TO %s;", g.quoteID(table), g.quoteID(temp), g.quoteID(table))
 	for _, idx := range newModel.Indexes {
-		name := idx.Name
-		if name == "" {
-			name = defaultIndexName(newModel, normalizeFieldNames(newModel, idx.Fields))
-		}
+		name := effectiveIndexName(newModel, idx)
 		unique := ""
 		if idx.IsUnique {
 			unique = "UNIQUE "
@@ -298,10 +296,7 @@ func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
 	b.WriteString("\n);")
 
 	for _, idx := range model.Indexes {
-		name := idx.Name
-		if name == "" {
-			name = fmt.Sprintf("idx_%s_%s", model.TableName(), strings.Join(normalizeFieldNames(model, idx.Fields), "_"))
-		}
+		name := effectiveIndexName(model, idx)
 		unique := ""
 		if idx.IsUnique {
 			unique = "UNIQUE "
@@ -431,11 +426,12 @@ func (g DDLGenerator) indexColumnsSQL(model *ir.Model, idx *ir.Index) string {
 	for _, col := range cols {
 		dbField := resolveColumnName(model, col.Field)
 		parts = append(parts, g.indexColumnSQL(ir.IndexColumn{
-			Field:     dbField,
-			Sort:      col.Sort,
-			Nulls:     col.Nulls,
-			OpClass:   col.OpClass,
-			Collation: col.Collation,
+			Field:      dbField,
+			Expression: col.Expression,
+			Sort:       col.Sort,
+			Nulls:      col.Nulls,
+			OpClass:    col.OpClass,
+			Collation:  col.Collation,
 		}))
 	}
 	return strings.Join(parts, ", ")
@@ -443,6 +439,7 @@ func (g DDLGenerator) indexColumnsSQL(model *ir.Model, idx *ir.Index) string {
 
 func (g DDLGenerator) indexColumnsFromDetails(details map[string]string) string {
 	fields := splitDetailList(details["fields"])
+	expressions := splitIndexExpressions(details["expressions"], len(fields))
 	sorts := splitDetailList(details["sorts"])
 	nulls := splitDetailList(details["nulls"])
 	opclasses := splitDetailList(details["opclasses"])
@@ -450,11 +447,12 @@ func (g DDLGenerator) indexColumnsFromDetails(details map[string]string) string 
 	parts := make([]string, 0, len(fields))
 	for i, field := range fields {
 		parts = append(parts, g.indexColumnSQL(ir.IndexColumn{
-			Field:     field,
-			Sort:      detailAt(sorts, i),
-			Nulls:     detailAt(nulls, i),
-			OpClass:   detailAt(opclasses, i),
-			Collation: detailAt(collations, i),
+			Field:      field,
+			Expression: detailAt(expressions, i),
+			Sort:       detailAt(sorts, i),
+			Nulls:      detailAt(nulls, i),
+			OpClass:    detailAt(opclasses, i),
+			Collation:  detailAt(collations, i),
 		}))
 	}
 	return strings.Join(parts, ", ")
@@ -462,6 +460,9 @@ func (g DDLGenerator) indexColumnsFromDetails(details map[string]string) string 
 
 func (g DDLGenerator) indexColumnSQL(col ir.IndexColumn) string {
 	sql := g.quoteID(col.Field)
+	if strings.TrimSpace(col.Expression) != "" {
+		sql = strings.TrimSpace(col.Expression)
+	}
 	if col.Collation != "" {
 		sql += " COLLATE " + g.collationSQL(col.Collation)
 	}
@@ -496,6 +497,22 @@ func (g DDLGenerator) collationSQL(name string) string {
 func splitDetailList(s string) []string {
 	if s == "" {
 		return nil
+	}
+	return strings.Split(s, ",")
+}
+
+func splitIndexExpressions(s string, count int) []string {
+	if s == "" {
+		if count <= 1 {
+			return nil
+		}
+		return make([]string, count)
+	}
+	if strings.HasPrefix(strings.TrimSpace(s), "[") {
+		var expressions []string
+		if json.Unmarshal([]byte(s), &expressions) == nil {
+			return expressions
+		}
 	}
 	return strings.Split(s, ",")
 }

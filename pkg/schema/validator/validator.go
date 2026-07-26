@@ -685,6 +685,11 @@ func (v *validator) validateModelAttribute(a ast.Attribute, m ast.ModelDecl, fie
 		v.validateConstraintFields(a, m, fieldNames, "@@id")
 	case "unique":
 		v.validateConstraintFields(a, m, fieldNames, "@@unique")
+		if fieldArg, ok := indexFieldsArg(a); ok {
+			if arr, ok := fieldArg.Value.(ast.ArrayLiteral); ok {
+				v.validateIndexExpressions(a, len(arr.Elements), "@@unique")
+			}
+		}
 	case "index":
 		fieldArg, ok := indexFieldsArg(a)
 		if !ok {
@@ -746,7 +751,8 @@ func (v *validator) validateConstraintFields(a ast.Attribute, m ast.ModelDecl, f
 			v.addError(arg.Span.Start, fmt.Sprintf("duplicate %s argument %q", label, key))
 		}
 		seenArgs[key] = true
-		if key != "fields" && key != "name" {
+		isUniqueExpression := label == "@@unique" && (key == "expression" || key == "expressions")
+		if key != "fields" && key != "name" && !isUniqueExpression {
 			v.addError(arg.Span.Start, fmt.Sprintf("unknown %s argument %q", label, key))
 		}
 		if key == "name" {
@@ -795,8 +801,32 @@ func (v *validator) validateIndexOptions(a ast.Attribute, fieldCount int) {
 			v.validateIndexOptionValues(arg, fieldCount, map[string]bool{"FIRST": true, "LAST": true}, "@@index nulls values must be First or Last")
 		case "opclass", "opclasses", "ops", "collate", "collation":
 			v.validateIndexOptionValues(arg, fieldCount, nil, "")
+		case "expression", "expressions":
+			v.validateIndexExpressionArg(arg, fieldCount, "@@index")
 		default:
 			v.addWarning(arg.Span.Start, fmt.Sprintf("unknown @@index argument %q", arg.Name))
+		}
+	}
+}
+
+func (v *validator) validateIndexExpressions(a ast.Attribute, fieldCount int, label string) {
+	for _, arg := range a.Args {
+		if arg.Name == "expression" || arg.Name == "expressions" {
+			v.validateIndexExpressionArg(arg, fieldCount, label)
+		}
+	}
+}
+
+func (v *validator) validateIndexExpressionArg(arg ast.AttributeArg, fieldCount int, label string) {
+	values := indexOptionExprs(arg.Value)
+	_, isArray := arg.Value.(ast.ArrayLiteral)
+	if len(values) != fieldCount && (fieldCount > 1 || isArray) {
+		v.addError(arg.Span.Start, fmt.Sprintf("%s %s option has %d value(s), expected 1 or %d", label, arg.Name, len(values), fieldCount))
+		return
+	}
+	for _, expr := range values {
+		if _, ok := expr.(ast.StringLiteral); !ok {
+			v.addError(expr.ExprSpan().Start, label+" "+arg.Name+" values must be strings")
 		}
 	}
 }

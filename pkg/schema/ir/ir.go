@@ -148,11 +148,12 @@ type Index struct {
 
 // IndexColumn holds per-column options for a model-level index.
 type IndexColumn struct {
-	Field     string
-	Sort      string // "ASC" or "DESC"
-	Nulls     string // "FIRST" or "LAST"
-	OpClass   string // PostgreSQL operator class, e.g. int8_ops
-	Collation string // Collation name, e.g. pg_catalog.default
+	Field      string
+	Expression string // Raw database index expression, e.g. lower(email); replaces Field when set
+	Sort       string // "ASC" or "DESC"
+	Nulls      string // "FIRST" or "LAST"
+	OpClass    string // PostgreSQL operator class, e.g. int8_ops
+	Collation  string // Collation name, e.g. pg_catalog.default
 }
 
 // PrimaryKey holds the resolved primary key for a model.

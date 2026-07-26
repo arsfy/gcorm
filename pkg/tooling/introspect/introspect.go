@@ -43,9 +43,10 @@ type ColumnInfo struct {
 
 // IndexInfo describes a database index.
 type IndexInfo struct {
-	Name     string
-	Columns  []string
-	IsUnique bool
+	Name        string
+	Columns     []string
+	Expressions []string
+	IsUnique    bool
 }
 
 // ForeignKeyInfo describes a foreign key relationship.
@@ -159,7 +160,16 @@ func tablesFromIR(schema *ir.Schema) []TableInfo {
 			t.Columns = append(t.Columns, c)
 		}
 		for _, idx := range model.Indexes {
-			t.Indexes = append(t.Indexes, IndexInfo{Name: idx.Name, Columns: append([]string(nil), idx.Fields...), IsUnique: idx.IsUnique})
+			info := IndexInfo{Name: idx.Name, Columns: append([]string(nil), idx.Fields...), IsUnique: idx.IsUnique}
+			if len(idx.Columns) > 0 {
+				info.Columns = make([]string, len(idx.Columns))
+				info.Expressions = make([]string, len(idx.Columns))
+				for i, col := range idx.Columns {
+					info.Columns[i] = col.Field
+					info.Expressions[i] = col.Expression
+				}
+			}
+			t.Indexes = append(t.Indexes, info)
 		}
 		for _, uc := range model.UniqueConstraints {
 			t.Indexes = append(t.Indexes, IndexInfo{Name: uc.Name, Columns: append([]string(nil), uc.Fields...), IsUnique: true})
@@ -279,7 +289,7 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 
 		// Model-level indexes.
 		for _, idx := range t.Indexes {
-			cols := mappedNames(fieldNames[t.Name], idx.Columns)
+			cols := indexSchemaFields(t, idx, fieldNames[t.Name])
 			if len(cols) == 0 {
 				continue
 			}
@@ -287,11 +297,14 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 			if idx.IsUnique {
 				kind = "unique"
 			}
+			args := []string{"[" + strings.Join(cols, ", ") + "]"}
 			if idx.Name != "" {
-				fmt.Fprintf(&b, "\n  @@%s([%s], name: %q)\n", kind, strings.Join(cols, ", "), idx.Name)
-			} else {
-				fmt.Fprintf(&b, "\n  @@%s([%s])\n", kind, strings.Join(cols, ", "))
+				args = append(args, fmt.Sprintf("name: %q", idx.Name))
 			}
+			if hasIndexExpressions(idx.Expressions) {
+				args = append(args, formatIndexExpressions(idx.Expressions))
+			}
+			fmt.Fprintf(&b, "\n  @@%s(%s)\n", kind, strings.Join(args, ", "))
 		}
 
 		if modelName != t.Name {
@@ -306,6 +319,71 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 	}
 
 	return b.String()
+}
+
+func indexSchemaFields(table TableInfo, idx IndexInfo, mapping map[string]string) []string {
+	out := make([]string, 0, len(idx.Columns))
+	for i, column := range idx.Columns {
+		if name := mapping[column]; name != "" {
+			out = append(out, name)
+			continue
+		}
+		expression := ""
+		if i < len(idx.Expressions) {
+			expression = idx.Expressions[i]
+		}
+		for _, candidate := range table.Columns {
+			if postgresExpressionReferencesColumn(expression, candidate.Name) {
+				out = append(out, mapping[candidate.Name])
+				break
+			}
+		}
+	}
+	return out
+}
+
+func postgresExpressionReferencesColumn(expression, column string) bool {
+	for _, candidate := range []string{column, `"` + strings.ReplaceAll(column, `"`, `""`) + `"`} {
+		for start := 0; ; {
+			i := strings.Index(expression[start:], candidate)
+			if i < 0 {
+				break
+			}
+			i += start
+			beforeOK := i == 0 || !isIdentifierByte(expression[i-1])
+			end := i + len(candidate)
+			afterOK := end == len(expression) || !isIdentifierByte(expression[end])
+			if beforeOK && afterOK {
+				return true
+			}
+			start = end
+		}
+	}
+	return false
+}
+
+func isIdentifierByte(b byte) bool {
+	return b == '_' || b >= '0' && b <= '9' || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
+}
+
+func hasIndexExpressions(expressions []string) bool {
+	for _, expression := range expressions {
+		if strings.TrimSpace(expression) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func formatIndexExpressions(expressions []string) string {
+	if len(expressions) == 1 {
+		return fmt.Sprintf("expression: %q", expressions[0])
+	}
+	values := make([]string, len(expressions))
+	for i, expression := range expressions {
+		values[i] = fmt.Sprintf("%q", expression)
+	}
+	return "expressions: [" + strings.Join(values, ", ") + "]"
 }
 
 func sanitizeModelName(name string) string {

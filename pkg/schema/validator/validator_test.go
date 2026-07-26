@@ -550,6 +550,27 @@ func TestIndexWithPredicateAndColumnOptions(t *testing.T) {
 	requireNoErrors(t, r)
 }
 
+func TestIndexAndUniqueExpressions(t *testing.T) {
+	model := ast.ModelDecl{
+		Name:   "User",
+		Fields: []ast.FieldDecl{{Name: "email", Type: ast.FieldType{Name: "String"}}},
+		Attributes: []ast.Attribute{
+			{Name: "index", IsModelLevel: true, Args: []ast.AttributeArg{
+				posArg(arrayLit(ident("email"))),
+				namedArg("expression", strLit("lower(email)")),
+			}},
+			{Name: "unique", IsModelLevel: true, Args: []ast.AttributeArg{
+				posArg(arrayLit(ident("email"))),
+				namedArg("expression", strLit("lower(email)")),
+			}},
+		},
+	}
+	requireNoErrors(t, Validate(&ast.Document{Models: []ast.ModelDecl{model}}))
+
+	model.Attributes[0].Args[1] = namedArg("expression", ident("email"))
+	requireErrors(t, Validate(&ast.Document{Models: []ast.ModelDecl{model}}), "values must be strings")
+}
+
 func TestIndexOptionLengthValidation(t *testing.T) {
 	doc := &ast.Document{
 		Models: []ast.ModelDecl{{
