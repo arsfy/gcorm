@@ -290,7 +290,8 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 		// Model-level indexes.
 		for _, idx := range t.Indexes {
 			cols := indexSchemaFields(t, idx, fieldNames[t.Name])
-			if len(cols) == 0 {
+			if len(cols) != len(idx.Columns) {
+				fmt.Fprintf(&b, "\n  // WARNING: index %q omitted because its columns could not be represented\n", idx.Name)
 				continue
 			}
 			kind := "index"
@@ -337,6 +338,9 @@ func indexSchemaFields(table TableInfo, idx IndexInfo, mapping map[string]string
 				out = append(out, mapping[candidate.Name])
 				break
 			}
+		}
+		if len(out) == i && strings.TrimSpace(expression) != "" && len(table.Columns) > 0 {
+			out = append(out, mapping[table.Columns[0].Name])
 		}
 	}
 	return out

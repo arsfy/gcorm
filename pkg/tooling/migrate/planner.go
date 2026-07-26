@@ -354,7 +354,130 @@ func normalizeIndexExpression(expression string) string {
 	for hasWrappingParens(expression) {
 		expression = strings.TrimSpace(expression[1 : len(expression)-1])
 	}
+	expression = stripPostgresTextCasts(expression)
+	for {
+		next := stripRedundantIdentifierParens(expression)
+		if next == expression {
+			break
+		}
+		expression = next
+	}
 	return strings.Join(strings.Fields(expression), " ")
+}
+
+func stripPostgresTextCasts(expression string) string {
+	var b strings.Builder
+	for i := 0; i < len(expression); {
+		if expression[i] == '\'' {
+			end := postgresStringLiteralEnd(expression, i)
+			b.WriteString(expression[i:end])
+			i = end
+			continue
+		}
+		if !strings.HasPrefix(expression[i:], "::") {
+			b.WriteByte(expression[i])
+			i++
+			continue
+		}
+		castStart := i + 2
+		castEnd := postgresCastTypeEnd(expression, castStart)
+		if castEnd > castStart && isPostgresTextLikeCast(expression[castStart:castEnd]) {
+			i = castEnd
+			continue
+		}
+		b.WriteString("::")
+		i += 2
+	}
+	return b.String()
+}
+
+func postgresStringLiteralEnd(s string, start int) int {
+	for i := start + 1; i < len(s); i++ {
+		if s[i] != '\'' {
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '\'' {
+			i++
+			continue
+		}
+		return i + 1
+	}
+	return len(s)
+}
+
+func stripRedundantIdentifierParens(expression string) string {
+	var b strings.Builder
+	changed := false
+	for i := 0; i < len(expression); i++ {
+		if expression[i] == '\'' {
+			end := postgresStringLiteralEnd(expression, i)
+			b.WriteString(expression[i:end])
+			i = end - 1
+			continue
+		}
+		if expression[i] == '"' {
+			end := postgresQuotedIdentifierEnd(expression, i)
+			b.WriteString(expression[i:end])
+			i = end - 1
+			continue
+		}
+		if expression[i] != '(' {
+			b.WriteByte(expression[i])
+			continue
+		}
+		end := matchingParenIndex(expression, i)
+		if end == -1 {
+			b.WriteByte(expression[i])
+			continue
+		}
+		inner := strings.TrimSpace(expression[i+1 : end])
+		if !isSimplePostgresIdentifier(inner) {
+			b.WriteByte(expression[i])
+			continue
+		}
+		b.WriteString(inner)
+		i = end
+		changed = true
+	}
+	if !changed {
+		return expression
+	}
+	return b.String()
+}
+
+func postgresQuotedIdentifierEnd(s string, start int) int {
+	for i := start + 1; i < len(s); i++ {
+		if s[i] != '"' {
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '"' {
+			i++
+			continue
+		}
+		return i + 1
+	}
+	return len(s)
+}
+
+func isSimplePostgresIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); {
+		end := postgresIdentifierEnd(value, i)
+		if end == i {
+			return false
+		}
+		i = end
+		if i == len(value) {
+			return true
+		}
+		if value[i] != '.' {
+			return false
+		}
+		i++
+	}
+	return true
 }
 
 func normalizeIndexPredicate(where string) string {
@@ -532,6 +655,19 @@ func matchingParenIndex(s string, start int) int {
 	depth := 0
 	for i := start; i < len(s); i++ {
 		switch s[i] {
+		case '\'':
+			i = postgresStringLiteralEnd(s, i) - 1
+		case '"':
+			for i++; i < len(s); i++ {
+				if s[i] != '"' {
+					continue
+				}
+				if i+1 < len(s) && s[i+1] == '"' {
+					i++
+					continue
+				}
+				break
+			}
 		case '(':
 			depth++
 		case ')':
@@ -695,6 +831,15 @@ func compareUniques(cs *Changeset, model string, oldM, newM *ir.Model) {
 			cs.add(Change{
 				Type: DropUnique, Model: model, OldValue: ou.Name,
 				Details: map[string]string{"fields": strings.Join(ou.Fields, ",")},
+			})
+		case nu.Name != "" && ou.Name != nu.Name:
+			cs.add(Change{
+				Type: DropUnique, Model: model, OldValue: ou.Name,
+				Details: map[string]string{"fields": strings.Join(ou.Fields, ",")},
+			})
+			cs.add(Change{
+				Type: AddUnique, Model: model, NewValue: nu.Name,
+				Details: map[string]string{"fields": strings.Join(nu.Fields, ",")},
 			})
 		}
 	}

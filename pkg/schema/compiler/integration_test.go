@@ -118,6 +118,66 @@ model User {
 	}
 }
 
+func TestIntegrationExpressionIndexValidation(t *testing.T) {
+	t.Run("requires explicit name", func(t *testing.T) {
+		result := parseAndCompile(t, `
+model User {
+  id    Int @id
+  email String
+  @@index([email], expression: "lower(email)")
+}`)
+		if !result.HasErrors() || !strings.Contains(result.Errors[0].Error(), "requires an explicit non-empty name") {
+			t.Fatalf("errors = %v", result.Errors)
+		}
+	})
+
+	t.Run("postgresql only", func(t *testing.T) {
+		result := parseAndCompile(t, `
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+model User {
+  id    Int @id
+  email String
+  @@index([email], name: "idx_users_email_ci", expression: "lower(email)")
+}`)
+		if !result.HasErrors() || !strings.Contains(result.Errors[len(result.Errors)-1].Error(), "only supported by postgresql") {
+			t.Fatalf("errors = %v", result.Errors)
+		}
+	})
+
+	t.Run("expression unique is not a foreign key target", func(t *testing.T) {
+		result := parseAndCompile(t, `
+model User {
+  id    Int @id
+  email String
+  posts Post[]
+  @@unique([email], name: "uq_users_email_ci", expression: "lower(email)")
+}
+model Post {
+  id        Int @id
+  userEmail String
+  user      User @relation(fields: [userEmail], references: [email])
+}`)
+		if !result.HasErrors() || !strings.Contains(result.Errors[len(result.Errors)-1].Error(), "must match an id or unique constraint") {
+			t.Fatalf("errors = %v", result.Errors)
+		}
+	})
+
+	t.Run("duplicate expression anchors are allowed", func(t *testing.T) {
+		result := parseAndCompile(t, `
+model User {
+  id    Int @id
+  email String
+  @@unique([email, email], name: "uq_users_email_forms", expressions: ["lower(email)", "upper(email)"])
+}`)
+		if result.HasErrors() {
+			t.Fatalf("errors = %v", result.Errors)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // 2. Multi-model schema with relations
 // ---------------------------------------------------------------------------

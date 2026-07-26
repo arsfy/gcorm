@@ -1,0 +1,62 @@
+## v0.1.12
+
+### Added
+
+- Added PostgreSQL expression indexes and expression-backed unique keys through
+  `expression` / `expressions` on `@@index` and `@@unique`, including partial
+  indexes, per-column options, migration diffing, database introspection, and
+  schema regeneration.
+- Added schema snapshots to migration manifests so incremental migrations diff
+  against the previous migration state without retaining datasource credentials.
+- Added `ExecContext`, `QueryContext`, and `QueryRowContext` to both `DB` and
+  transactional executors.
+- Added PostgreSQL enum introspection with target-schema mapping preservation.
+- Expanded generated project documentation with a GCORM introduction and CLI
+  command overview.
+
+### Changed
+
+- Expression indexes are PostgreSQL-only and now require an explicit, non-empty
+  database index name.
+- Newly generated unique constraints use deterministic explicit names, including
+  field-level `@unique` constraints created with a table.
+- Generated SQL now quotes identifiers consistently and schema validation rejects
+  more invalid names, relations, index options, and datasource combinations.
+- SQL placeholder rewriting now understands PostgreSQL question-mark operators,
+  quoted strings, comments, and dollar-quoted blocks.
+- Migration manifests and CLI summaries report changes in the same dependency-safe
+  order used by generated DDL.
+
+### Dependencies
+
+- Updated the Go language version from 1.26.3 to 1.26.5.
+- Updated `github.com/jackc/pgx/v5` from 5.9.2 to 5.10.0.
+- Updated `golang.org/x/text` from 0.29.0 to 0.40.0.
+- Updated `modernc.org/sqlite` from 1.50.1 to 1.54.0.
+- Updated supporting indirect modules, including `golang.org/x/sync` 0.22.0,
+  `golang.org/x/sys` 0.46.0, and `modernc.org/libc` 1.74.1.
+
+### Fixed
+
+- Fixed migration ordering when converting between a regular unique constraint
+  and an expression-backed unique index: indexes and constraints are dropped
+  before replacements are created in both up and down migrations.
+- Fixed removal of historical unnamed PostgreSQL unique constraints by handling
+  both GCORM deterministic names and PostgreSQL-generated `*_key` names.
+- Fixed expression index diff churn caused by PostgreSQL deparsing text columns as
+  expressions such as `lower((email)::text)`.
+- Fixed relation validation incorrectly accepting expression-backed unique keys as
+  foreign-key targets.
+- Fixed expression index rollback generation when the existing index was loaded
+  from PostgreSQL introspection.
+- Fixed expression index name collisions, empty expressions, unsupported dialect
+  output, and silently omitted introspected indexes.
+- Fixed PostgreSQL partial-index predicate diff churn caused by text literal casts.
+- Fixed SQL dialect edge cases and improved MySQL db-push error handling.
+
+### Upgrade Notes
+
+- Existing expression indexes without an explicit `name` must be updated before
+  compiling with v0.1.12.
+- Migration manifests created by older releases without `schemaSnapshot` cannot be
+  used as an incremental diff baseline; create a new baseline migration first.

@@ -299,6 +299,112 @@ func TestDiffExpressionIndexMatchesIntrospection(t *testing.T) {
 	}
 }
 
+func TestDiffExpressionIndexNormalizesPostgresTextCast(t *testing.T) {
+	oldUser := testModel("User", testField("email", "String"))
+	oldUser.DBName = "users"
+	oldUser.Indexes = []*ir.Index{{
+		Name:    "idx_users_email_ci",
+		Fields:  []string{""},
+		Columns: []ir.IndexColumn{{Expression: "lower((email)::text)", Sort: "ASC", OpClass: "text_ops"}},
+	}}
+	newUser := testModel("User", testField("email", "String"))
+	newUser.DBName = "users"
+	newUser.Indexes = []*ir.Index{{
+		Name:    "idx_users_email_ci",
+		Fields:  []string{"email"},
+		Columns: []ir.IndexColumn{{Field: "email", Expression: "lower(email)"}},
+	}}
+
+	if changes := Diff(testSchema(oldUser), testSchema(newUser)).Changes; len(changes) != 0 {
+		t.Fatalf("postgres text cast should not recreate expression index: %+v", changes)
+	}
+}
+
+func TestNormalizeIndexExpressionPreservesQuotedParentheses(t *testing.T) {
+	got := normalizeIndexExpression(`coalesce((email)::text, '(')`)
+	want := `coalesce(email, '(')`
+	if got != want {
+		t.Fatalf("normalized expression = %q, want %q", got, want)
+	}
+}
+
+func TestUniqueConstraintToExpressionIndexDropsBeforeCreate(t *testing.T) {
+	oldUser := testModel("User", testField("email", "String"))
+	oldUser.DBName = "users"
+	oldUser.UniqueConstraints = []*ir.UniqueConstraint{{Name: "uq_users_email_ci", Fields: []string{"email"}}}
+	newUser := testModel("User", testField("email", "String"))
+	newUser.DBName = "users"
+	newUser.Indexes = []*ir.Index{{
+		Name:     "uq_users_email_ci",
+		Fields:   []string{"email"},
+		Columns:  []ir.IndexColumn{{Field: "email", Expression: "lower(email)"}},
+		IsUnique: true,
+	}}
+
+	cs := Diff(testSchema(oldUser), testSchema(newUser))
+	sql := (DDLGenerator{Dialect: "postgresql", Schema: cs.New}).GenerateUp(cs)
+	drop := strings.Index(sql, `DROP CONSTRAINT IF EXISTS "uq_users_email_ci"`)
+	create := strings.Index(sql, `CREATE UNIQUE INDEX "uq_users_email_ci"`)
+	if drop < 0 || create < 0 || drop > create {
+		t.Fatalf("unique conversion must drop before create:\n%s", sql)
+	}
+}
+
+func TestUnnamedUniqueDropCoversCanonicalAndLegacyNames(t *testing.T) {
+	change := Change{Type: DropUnique, Model: "users", Details: map[string]string{"fields": "email"}}
+	sql := (DDLGenerator{Dialect: "postgresql"}).dropUniqueSQL(change)
+	for _, name := range []string{`"uq_users_email"`, `"users_email_key"`} {
+		if !strings.Contains(sql, name) {
+			t.Fatalf("drop SQL %q does not include %s", sql, name)
+		}
+	}
+}
+
+func TestExpressionIndexRollbackFromIntrospectionKeepsExpression(t *testing.T) {
+	change := Change{
+		Type:     DropIndex,
+		Model:    "users",
+		OldValue: "idx_users_email_ci",
+		Details: map[string]string{
+			"fields":      "",
+			"expressions": `["lower(email)"]`,
+			"unique":      "false",
+		},
+	}
+	cs := &Changeset{Changes: []Change{change}}
+	down := (DDLGenerator{Dialect: "postgresql"}).GenerateDown(cs)
+	want := `CREATE INDEX "idx_users_email_ci" ON "users" (lower(email));`
+	if !strings.Contains(down, want) {
+		t.Fatalf("down SQL = %q, want %q", down, want)
+	}
+}
+
+func TestExpressionIndexDDLRejectsNonPostgres(t *testing.T) {
+	change := Change{
+		Type:     AddIndex,
+		Model:    "users",
+		NewValue: "idx_users_email_ci",
+		Details: map[string]string{
+			"fields":      "email",
+			"expressions": `["lower(email)"]`,
+		},
+	}
+	if sql := (DDLGenerator{Dialect: "mysql"}).addIndexSQL(change); !strings.Contains(sql, "not supported") {
+		t.Fatalf("mysql expression index SQL = %q", sql)
+	}
+}
+
+func TestExplicitUniqueRenameRecreatesConstraint(t *testing.T) {
+	oldUser := testModel("User", testField("email", "String"))
+	oldUser.UniqueConstraints = []*ir.UniqueConstraint{{Name: "uq_old", Fields: []string{"email"}}}
+	newUser := testModel("User", testField("email", "String"))
+	newUser.UniqueConstraints = []*ir.UniqueConstraint{{Name: "uq_new", Fields: []string{"email"}}}
+	changes := Diff(testSchema(oldUser), testSchema(newUser)).Changes
+	if len(changes) != 2 || changes[0].Type != DropUnique || changes[1].Type != AddUnique {
+		t.Fatalf("unique rename changes = %+v", changes)
+	}
+}
+
 func TestDiff_IndexOptionsTriggerRecreate(t *testing.T) {
 	userOld := testModel("User", testField("id", "Int"), testField("email", "String"))
 	userOld.Indexes = []*ir.Index{{

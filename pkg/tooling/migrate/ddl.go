@@ -153,7 +153,7 @@ func (g DDLGenerator) sqliteRebuildTableSQL(table string, cs *Changeset) string 
 			unique = "UNIQUE "
 		}
 		b.WriteString("\n")
-		b.WriteString(g.createIndexSQL(name, table, unique, g.indexColumnsSQL(newModel, idx), idx.Where))
+		b.WriteString(g.createIndexSQL(name, table, unique, g.indexColumnsSQL(newModel, idx), idx.Where, indexHasExpressions(idx)))
 	}
 	return b.String()
 }
@@ -259,13 +259,10 @@ func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
 		cols = append(cols, fmt.Sprintf("  PRIMARY KEY (%s)", strings.Join(quoted, ", ")))
 	}
 
-	for _, uc := range model.UniqueConstraints {
+	for _, uc := range modelUniqueConstraints(model) {
 		fields := g.quoteIDs(normalizeFieldNames(model, uc.Fields))
-		if uc.Name != "" {
-			cols = append(cols, fmt.Sprintf("  CONSTRAINT %s UNIQUE (%s)", g.quoteID(uc.Name), strings.Join(fields, ", ")))
-			continue
-		}
-		cols = append(cols, fmt.Sprintf("  UNIQUE (%s)", strings.Join(fields, ", ")))
+		name := effectiveUniqueName(model.TableName(), uc.Name, normalizeFieldNames(model, uc.Fields))
+		cols = append(cols, fmt.Sprintf("  CONSTRAINT %s UNIQUE (%s)", g.quoteID(name), strings.Join(fields, ", ")))
 	}
 
 	if g.Dialect == "sqlite" {
@@ -302,7 +299,7 @@ func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
 			unique = "UNIQUE "
 		}
 		b.WriteString("\n")
-		b.WriteString(g.createIndexSQL(name, model.TableName(), unique, g.indexColumnsSQL(model, idx), idx.Where))
+		b.WriteString(g.createIndexSQL(name, model.TableName(), unique, g.indexColumnsSQL(model, idx), idx.Where, indexHasExpressions(idx)))
 	}
 	return b.String()
 }
@@ -405,10 +402,13 @@ func (g DDLGenerator) addIndexSQL(c Change) string {
 	if c.Details["unique"] == "true" {
 		unique = "UNIQUE "
 	}
-	return g.createIndexSQL(name, c.Model, unique, g.indexColumnsFromDetails(c.Details), c.Details["where"])
+	return g.createIndexSQL(name, c.Model, unique, g.indexColumnsFromDetails(c.Details), c.Details["where"], detailsHaveExpressions(c.Details))
 }
 
-func (g DDLGenerator) createIndexSQL(name, tableName, unique, columns, where string) string {
+func (g DDLGenerator) createIndexSQL(name, tableName, unique, columns, where string, hasExpression bool) string {
+	if hasExpression && g.Dialect != "postgresql" {
+		return fmt.Sprintf("-- %s: PostgreSQL expression index %s is not supported", strings.ToUpper(g.Dialect), name)
+	}
 	if strings.TrimSpace(where) != "" && g.Dialect == "mysql" {
 		return fmt.Sprintf("-- MySQL: partial indexes are not supported for index %s", name)
 	}
@@ -439,11 +439,15 @@ func (g DDLGenerator) indexColumnsSQL(model *ir.Model, idx *ir.Index) string {
 
 func (g DDLGenerator) indexColumnsFromDetails(details map[string]string) string {
 	fields := splitDetailList(details["fields"])
-	expressions := splitIndexExpressions(details["expressions"], len(fields))
+	expressions := splitIndexExpressions(details["expressions"])
 	sorts := splitDetailList(details["sorts"])
 	nulls := splitDetailList(details["nulls"])
 	opclasses := splitDetailList(details["opclasses"])
 	collations := splitDetailList(details["collations"])
+	count := maxInt(len(fields), len(expressions), len(sorts), len(nulls), len(opclasses), len(collations))
+	if len(fields) < count {
+		fields = append(fields, make([]string, count-len(fields))...)
+	}
 	parts := make([]string, 0, len(fields))
 	for i, field := range fields {
 		parts = append(parts, g.indexColumnSQL(ir.IndexColumn{
@@ -501,12 +505,9 @@ func splitDetailList(s string) []string {
 	return strings.Split(s, ",")
 }
 
-func splitIndexExpressions(s string, count int) []string {
+func splitIndexExpressions(s string) []string {
 	if s == "" {
-		if count <= 1 {
-			return nil
-		}
-		return make([]string, count)
+		return nil
 	}
 	if strings.HasPrefix(strings.TrimSpace(s), "[") {
 		var expressions []string
@@ -515,6 +516,34 @@ func splitIndexExpressions(s string, count int) []string {
 		}
 	}
 	return strings.Split(s, ",")
+}
+
+func maxInt(values ...int) int {
+	max := 0
+	for _, value := range values {
+		if value > max {
+			max = value
+		}
+	}
+	return max
+}
+
+func indexHasExpressions(idx *ir.Index) bool {
+	for _, col := range effectiveIndexColumns(idx) {
+		if strings.TrimSpace(col.Expression) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func detailsHaveExpressions(details map[string]string) bool {
+	for _, expression := range splitIndexExpressions(details["expressions"]) {
+		if strings.TrimSpace(expression) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func detailAt(values []string, idx int) string {
@@ -540,9 +569,7 @@ func (g DDLGenerator) dropIndexSQL(c Change) string {
 func (g DDLGenerator) addUniqueSQL(c Change) string {
 	fields := g.quoteIDs(strings.Split(c.Details["fields"], ","))
 	name := c.NewValue
-	if name == "" {
-		name = fmt.Sprintf("uq_%s_%s", c.Model, c.Details["fields"])
-	}
+	name = effectiveUniqueName(c.Model, name, strings.Split(c.Details["fields"], ","))
 	if g.Dialect == "postgresql" {
 		return fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s UNIQUE (%s);",
 			g.quoteID(c.Model), g.quoteID(name), strings.Join(fields, ", "))
@@ -553,17 +580,62 @@ func (g DDLGenerator) addUniqueSQL(c Change) string {
 
 func (g DDLGenerator) dropUniqueSQL(c Change) string {
 	name := c.OldValue
-	if name == "" {
-		name = fmt.Sprintf("uq_%s_%s", c.Model, c.Details["fields"])
-	}
+	fields := strings.Split(c.Details["fields"], ",")
 	switch g.Dialect {
 	case "postgresql":
+		if name == "" {
+			canonical := effectiveUniqueName(c.Model, "", fields)
+			legacy := postgresDefaultUniqueName(c.Model, fields)
+			return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;\nALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;",
+				g.quoteID(c.Model), g.quoteID(canonical), g.quoteID(c.Model), g.quoteID(legacy))
+		}
 		return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;", g.quoteID(c.Model), g.quoteID(name))
 	case "mysql":
+		name = effectiveUniqueName(c.Model, name, fields)
 		return fmt.Sprintf("DROP INDEX %s ON %s;", g.quoteID(name), g.quoteID(c.Model))
 	default:
+		name = effectiveUniqueName(c.Model, name, fields)
 		return fmt.Sprintf("DROP INDEX IF EXISTS %s;", g.quoteID(name))
 	}
+}
+
+func effectiveUniqueName(table, name string, fields []string) string {
+	if name != "" {
+		return name
+	}
+	return "uq_" + table + "_" + strings.Join(fields, "_")
+}
+
+func postgresDefaultUniqueName(table string, fields []string) string {
+	return table + "_" + strings.Join(fields, "_") + "_key"
+}
+
+func modelUniqueConstraints(model *ir.Model) []*ir.UniqueConstraint {
+	if model == nil {
+		return nil
+	}
+	out := make([]*ir.UniqueConstraint, 0, len(model.UniqueConstraints)+len(model.Fields))
+	seen := make(map[string]bool)
+	for _, uc := range model.UniqueConstraints {
+		key := strings.Join(uc.Fields, "\x00")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, uc)
+	}
+	for _, field := range model.ScalarFields() {
+		if !field.IsUnique || field.IsID {
+			continue
+		}
+		key := field.Name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, &ir.UniqueConstraint{Fields: []string{field.Name}})
+	}
+	return out
 }
 
 func (g DDLGenerator) changePKSQL(c Change) string {
@@ -639,11 +711,30 @@ func (g DDLGenerator) orderedChanges(cs *Changeset) []Change {
 
 	ordered := make([]Change, 0, len(cs.Changes))
 	ordered = append(ordered, dropFKs...)
-	ordered = append(ordered, others...)
+	ordered = append(ordered, orderOtherChanges(others)...)
 	ordered = append(ordered, g.sortTableChanges(createTables, cs.New, false)...)
 	ordered = append(ordered, addFKs...)
 	ordered = append(ordered, g.sortTableChanges(dropTables, cs.Old, true)...)
 	return ordered
+}
+
+func orderOtherChanges(changes []Change) []Change {
+	ordered := append([]Change(nil), changes...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return schemaChangePriority(ordered[i].Type) < schemaChangePriority(ordered[j].Type)
+	})
+	return ordered
+}
+
+func schemaChangePriority(changeType ChangeType) int {
+	switch changeType {
+	case DropIndex, DropUnique:
+		return 0
+	case AddIndex, AddUnique:
+		return 2
+	default:
+		return 1
+	}
 }
 
 func (g DDLGenerator) sortTableChanges(changes []Change, schema *ir.Schema, reverse bool) []Change {
@@ -961,7 +1052,7 @@ func (g DDLGenerator) columnDefForTable(model *ir.Model, f *ir.Field) string {
 		parts = append(parts, "NOT NULL")
 	}
 
-	if f.IsUnique && !f.IsID {
+	if f.IsUnique && !f.IsID && model == nil {
 		parts = append(parts, "UNIQUE")
 	}
 

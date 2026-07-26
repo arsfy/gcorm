@@ -87,6 +87,7 @@ func Validate(doc *ast.Document) *ValidationResult {
 	for _, e := range doc.Enums {
 		v.validateEnum(e)
 	}
+	v.validateExpressionIndexProvider(&ast.DocumentSet{Documents: []*ast.Document{doc}})
 	v.validateCrossReferences(&ast.DocumentSet{Documents: []*ast.Document{doc}})
 	return v.result
 }
@@ -153,6 +154,7 @@ func ValidateDocumentSet(ds *ast.DocumentSet) *ValidationResult {
 	}
 
 	// Cross-reference validation.
+	v.validateExpressionIndexProvider(ds)
 	v.validateCrossReferences(ds)
 
 	return v.result
@@ -690,6 +692,7 @@ func (v *validator) validateModelAttribute(a ast.Attribute, m ast.ModelDecl, fie
 				v.validateIndexExpressions(a, len(arr.Elements), "@@unique")
 			}
 		}
+		v.validateExpressionIndexName(a, "@@unique")
 	case "index":
 		fieldArg, ok := indexFieldsArg(a)
 		if !ok {
@@ -706,6 +709,7 @@ func (v *validator) validateModelAttribute(a ast.Attribute, m ast.ModelDecl, fie
 				}
 			}
 			v.validateIndexOptions(a, len(arr.Elements))
+			v.validateExpressionIndexName(a, "@@index")
 		} else {
 			v.addError(fieldArg.Span.Start, "@@index fields argument must be an array")
 		}
@@ -761,7 +765,8 @@ func (v *validator) validateConstraintFields(a ast.Attribute, m ast.ModelDecl, f
 			}
 		}
 	}
-	for _, elem := range arr.Elements {
+	expressions := attributeIndexExpressions(a, len(arr.Elements))
+	for i, elem := range arr.Elements {
 		id, ok := elem.(ast.Identifier)
 		if !ok {
 			v.addError(elem.ExprSpan().Start, label+" fields must be identifiers")
@@ -770,11 +775,60 @@ func (v *validator) validateConstraintFields(a ast.Attribute, m ast.ModelDecl, f
 		if !fieldNames[id.Name] {
 			v.addError(id.Span.Start, fmt.Sprintf("%s references unknown field %q in model %q", label, id.Name, m.Name))
 		}
-		if seenFields[id.Name] {
+		isExpressionItem := i < len(expressions) && strings.TrimSpace(expressions[i]) != ""
+		if seenFields[id.Name] && !isExpressionItem {
 			v.addError(id.Span.Start, fmt.Sprintf("%s contains duplicate field %q", label, id.Name))
 		}
 		seenFields[id.Name] = true
 	}
+}
+
+func (v *validator) validateExpressionIndexName(a ast.Attribute, label string) {
+	if !attributeHasIndexExpression(a) {
+		return
+	}
+	for _, arg := range a.Args {
+		if arg.Name != "name" {
+			continue
+		}
+		if value, ok := arg.Value.(ast.StringLiteral); ok && strings.TrimSpace(value.Value) != "" {
+			return
+		}
+	}
+	v.addError(a.Span.Start, label+" with expressions requires an explicit non-empty name")
+}
+
+func attributeHasIndexExpression(a ast.Attribute) bool {
+	for _, expression := range attributeIndexExpressions(a, 0) {
+		if strings.TrimSpace(expression) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func attributeIndexExpressions(a ast.Attribute, fieldCount int) []string {
+	for _, arg := range a.Args {
+		if arg.Name != "expression" && arg.Name != "expressions" {
+			continue
+		}
+		values := indexOptionExprs(arg.Value)
+		out := make([]string, len(values))
+		for i, value := range values {
+			if literal, ok := value.(ast.StringLiteral); ok {
+				out[i] = literal.Value
+			}
+		}
+		if len(out) == 1 && fieldCount > 1 {
+			repeated := make([]string, fieldCount)
+			for i := range repeated {
+				repeated[i] = out[0]
+			}
+			return repeated
+		}
+		return out
+	}
+	return nil
 }
 
 func indexFieldsArg(a ast.Attribute) (ast.AttributeArg, bool) {
@@ -824,10 +878,19 @@ func (v *validator) validateIndexExpressionArg(arg ast.AttributeArg, fieldCount 
 		v.addError(arg.Span.Start, fmt.Sprintf("%s %s option has %d value(s), expected 1 or %d", label, arg.Name, len(values), fieldCount))
 		return
 	}
+	hasExpression := false
 	for _, expr := range values {
-		if _, ok := expr.(ast.StringLiteral); !ok {
+		literal, ok := expr.(ast.StringLiteral)
+		if !ok {
 			v.addError(expr.ExprSpan().Start, label+" "+arg.Name+" values must be strings")
+			continue
 		}
+		if strings.TrimSpace(literal.Value) != "" {
+			hasExpression = true
+		}
+	}
+	if !hasExpression {
+		v.addError(arg.Span.Start, label+" "+arg.Name+" must contain at least one non-empty expression")
 	}
 }
 
@@ -953,6 +1016,9 @@ func (v *validator) validateCrossReferences(ds *ast.DocumentSet) {
 				if a.Name != "id" && a.Name != "unique" {
 					continue
 				}
+				if a.Name == "unique" && attributeHasIndexExpression(a) {
+					continue
+				}
 				if arg, ok := indexFieldsArg(a); ok {
 					if arr, ok := arg.Value.(ast.ArrayLiteral); ok {
 						var names []string
@@ -1027,6 +1093,33 @@ func (v *validator) validateCrossReferences(ds *ast.DocumentSet) {
 					if len(refNames) > 0 && !modelUnique[refModel][strings.Join(refNames, ",")] {
 						v.addError(a.Span.Start, fmt.Sprintf("@relation references on model %q must match an id or unique constraint", refModel))
 					}
+				}
+			}
+		}
+	}
+}
+
+func (v *validator) validateExpressionIndexProvider(ds *ast.DocumentSet) {
+	provider := ""
+	for _, doc := range ds.Documents {
+		for _, datasource := range doc.Datasources {
+			for _, entry := range datasource.Entries {
+				if entry.Key == "provider" {
+					if value, ok := entry.Value.(ast.StringLiteral); ok {
+						provider = value.Value
+					}
+				}
+			}
+		}
+	}
+	if provider == "" || provider == "postgresql" {
+		return
+	}
+	for _, doc := range ds.Documents {
+		for _, model := range doc.Models {
+			for _, attr := range model.Attributes {
+				if (attr.Name == "index" || attr.Name == "unique") && attributeHasIndexExpression(attr) {
+					v.addError(attr.Span.Start, fmt.Sprintf("@@%s expressions are only supported by postgresql", attr.Name))
 				}
 			}
 		}

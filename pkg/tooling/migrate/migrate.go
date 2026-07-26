@@ -139,6 +139,7 @@ func runDiff(args []string) error {
 	gen := DDLGenerator{Dialect: dialect, Schema: newSchema}
 	upSQL := gen.GenerateUp(cs)
 	downSQL := gen.GenerateDown(cs)
+	orderedChanges := gen.orderedChanges(cs)
 
 	// Write migration files.
 	timestamp := time.Now().UTC().Format("20060102_150405")
@@ -159,7 +160,7 @@ func runDiff(args []string) error {
 	var destructiveOps []string
 	reviewRequired := false
 
-	for _, c := range cs.Changes {
+	for _, c := range orderedChanges {
 		changeRecords = append(changeRecords, ChangeRecord{
 			Type:     string(c.Type),
 			Model:    c.Model,
@@ -206,7 +207,7 @@ func runDiff(args []string) error {
 
 	// Print summary.
 	fmt.Printf("Created migration %s with %d change(s):\n", dirName, len(cs.Changes))
-	for _, c := range cs.Changes {
+	for _, c := range orderedChanges {
 		fmt.Printf("  %s %s", c.Type, c.Model)
 		if c.Field != "" {
 			fmt.Printf(".%s", c.Field)

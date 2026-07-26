@@ -152,6 +152,24 @@ func TestGenerateSchemaWithExpressionUniqueIndex(t *testing.T) {
 	}
 }
 
+func TestGenerateSchemaPreservesConstantExpressionIndex(t *testing.T) {
+	tables := []TableInfo{{
+		Name:    "events",
+		Columns: []ColumnInfo{{Name: "id", DataType: "INT", IsPrimaryKey: true}},
+		Indexes: []IndexInfo{{
+			Name:        "idx_events_constant",
+			Columns:     []string{""},
+			Expressions: []string{"1"},
+		}},
+	}}
+
+	schema := GenerateSchema("postgresql", tables)
+	want := `@@index([id], name: "idx_events_constant", expression: "1")`
+	if !strings.Contains(schema, want) {
+		t.Fatalf("constant expression index was not preserved:\n%s", schema)
+	}
+}
+
 func TestGenerateSchemaSanitizesNamesAndPreservesCompositeConstraints(t *testing.T) {
 	tables := []TableInfo{{Name: "user-data", Columns: []ColumnInfo{{Name: "1st", DataType: "INT", IsPrimaryKey: true}, {Name: "User ID", DataType: "INT", IsPrimaryKey: true}, {Name: "user-id", DataType: "TEXT"}}, Indexes: []IndexInfo{{Name: "uq_user", Columns: []string{"User ID", "user-id"}, IsUnique: true}}}}
 	schema := GenerateSchema("sqlite", tables)

@@ -557,18 +557,23 @@ func TestIndexAndUniqueExpressions(t *testing.T) {
 		Attributes: []ast.Attribute{
 			{Name: "index", IsModelLevel: true, Args: []ast.AttributeArg{
 				posArg(arrayLit(ident("email"))),
+				namedArg("name", strLit("idx_users_email_ci")),
 				namedArg("expression", strLit("lower(email)")),
 			}},
 			{Name: "unique", IsModelLevel: true, Args: []ast.AttributeArg{
 				posArg(arrayLit(ident("email"))),
+				namedArg("name", strLit("uq_users_email_ci")),
 				namedArg("expression", strLit("lower(email)")),
 			}},
 		},
 	}
 	requireNoErrors(t, Validate(&ast.Document{Models: []ast.ModelDecl{model}}))
 
-	model.Attributes[0].Args[1] = namedArg("expression", ident("email"))
+	model.Attributes[0].Args[2] = namedArg("expression", ident("email"))
 	requireErrors(t, Validate(&ast.Document{Models: []ast.ModelDecl{model}}), "values must be strings")
+
+	model.Attributes[0].Args[2] = namedArg("expression", strLit(""))
+	requireErrors(t, Validate(&ast.Document{Models: []ast.ModelDecl{model}}), "at least one non-empty expression")
 }
 
 func TestIndexOptionLengthValidation(t *testing.T) {

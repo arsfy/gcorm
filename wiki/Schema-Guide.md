@@ -201,6 +201,10 @@ Index arguments:
 - `expression` or `expressions`: raw PostgreSQL index expressions. An
   expression replaces the field at the same position in the generated index.
 
+Indexes and unique keys that use `expression` or `expressions` must provide an
+explicit, non-empty `name`. This keeps multiple expressions over the same field
+unambiguous during schema diffing.
+
 For a composite expression index, provide one expression entry per field. Use
 an empty string for positions that should remain ordinary columns:
 
@@ -225,8 +229,9 @@ Single-column example:
 `where` and `expression(s)` are database SQL, not GCORM expressions. Use
 database column names, including names declared with `@map`, in these values.
 Partial indexes are supported by PostgreSQL and SQLite. Expression options are
-intended for PostgreSQL. MySQL does not support partial indexes, so GCORM will
-not emit a valid MySQL partial index for schemas that use `where`.
+PostgreSQL-only; schemas using them with MySQL or SQLite fail validation. MySQL
+does not support partial indexes, so GCORM will not emit a valid MySQL partial
+index for schemas that use `where`.
 
 ## Relations
 
