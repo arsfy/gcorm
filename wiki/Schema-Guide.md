@@ -162,7 +162,8 @@ Common model attributes:
 
 ## Advanced Indexes
 
-`@@index` supports partial indexes and per-column index options:
+`@@index` supports partial indexes, PostgreSQL expressions, and per-column
+index options. `@@unique` also supports PostgreSQL expressions:
 
 ```gcorm
 model Announcement {
@@ -180,6 +181,13 @@ model Announcement {
     collate: ["pg_catalog.default", "pg_catalog.default"]
   )
 }
+
+model User {
+  id    Int
+  email String
+
+  @@unique([email], name: "uq_users_email_ci", expression: "lower(email)")
+}
 ```
 
 Index arguments:
@@ -190,6 +198,23 @@ Index arguments:
 - `nulls`: `First` or `Last`, either one value or one value per field.
 - `opclass`, `opclasses`, or `ops`: PostgreSQL operator class names.
 - `collate` or `collation`: collation names, such as `pg_catalog.default`.
+- `expression` or `expressions`: raw PostgreSQL index expressions. An
+  expression replaces the field at the same position in the generated index.
+
+For a composite expression index, provide one expression entry per field. Use
+an empty string for positions that should remain ordinary columns:
+
+```gcorm
+@@unique(
+  [tenantId, email],
+  name: "uq_users_tenant_email_ci",
+  expressions: ["", "lower(email)"]
+)
+```
+
+This generates a PostgreSQL unique index on `tenantId, lower(email)`. PostgreSQL
+implements expression uniqueness with `CREATE UNIQUE INDEX`, rather than a
+table-level `UNIQUE` constraint.
 
 Single-column example:
 
@@ -197,10 +222,11 @@ Single-column example:
 @@index([clickhouseRecordedAt], name: "idx_ihce_retry", where: "clickhouse_recorded_at IS NULL")
 ```
 
-`where` is database SQL, not a GCORM expression. Use database column names in
-the predicate. Partial indexes are supported by PostgreSQL and SQLite. MySQL
-does not support partial indexes, so GCORM will not emit a valid MySQL partial
-index for schemas that use `where`.
+`where` and `expression(s)` are database SQL, not GCORM expressions. Use
+database column names, including names declared with `@map`, in these values.
+Partial indexes are supported by PostgreSQL and SQLite. Expression options are
+intended for PostgreSQL. MySQL does not support partial indexes, so GCORM will
+not emit a valid MySQL partial index for schemas that use `where`.
 
 ## Relations
 
