@@ -320,6 +320,63 @@ func TestDiffExpressionIndexNormalizesPostgresTextCast(t *testing.T) {
 	}
 }
 
+func TestDiffExpressionIndexNormalizesPostgresCaseAndEnumCast(t *testing.T) {
+	oldAlert := testModel(
+		"AlertInstance",
+		testField("ruleId", "String"),
+		testField("fingerprint", "String"),
+		&ir.Field{Name: "status", Type: ir.FieldKindEnum, EnumType: "AlertStatus"},
+	)
+	oldAlert.DBName = "alert_instances"
+	oldAlert.Indexes = []*ir.Index{{
+		Name:   "alert_instances_active_fingerprint_key",
+		Fields: []string{"rule_id", ""},
+		Columns: []ir.IndexColumn{
+			{Field: "rule_id", OpClass: "uuid_ops"},
+			{Expression: "(\nCASE\n    WHEN (status <> 'RESOLVED'::\"AlertStatus\") THEN fingerprint\n    ELSE NULL::text\nEND)", OpClass: "text_ops"},
+		},
+		IsUnique: true,
+	}}
+	oldSchema := testSchema(oldAlert)
+	oldSchema.Enums = []*ir.Enum{{Name: "AlertStatus"}}
+
+	newAlert := testModel(
+		"AlertInstance",
+		testField("ruleId", "String"),
+		testField("fingerprint", "String"),
+		&ir.Field{Name: "status", Type: ir.FieldKindEnum, EnumType: "AlertStatus"},
+	)
+	newAlert.DBName = "alert_instances"
+	newAlert.Fields[0].DBName = "rule_id"
+	newAlert.Indexes = []*ir.Index{{
+		Name:   "alert_instances_active_fingerprint_key",
+		Fields: []string{"ruleId", "fingerprint"},
+		Columns: []ir.IndexColumn{
+			{Field: "ruleId"},
+			{Field: "fingerprint", Expression: "(CASE WHEN status <> 'RESOLVED' THEN fingerprint END)"},
+		},
+		IsUnique: true,
+	}}
+	newSchema := testSchema(newAlert)
+	newSchema.Enums = []*ir.Enum{{Name: "AlertStatus"}}
+
+	if changes := Diff(oldSchema, newSchema).Changes; len(changes) != 0 {
+		t.Fatalf("PostgreSQL CASE and enum normalization should keep the index stable: %+v", changes)
+	}
+}
+
+func TestNormalizeIndexExpressionPreservesNonEnumCastAndCaseElse(t *testing.T) {
+	enumTypes := map[string]struct{}{"AlertStatus": {}}
+	got := normalizeIndexExpressionWithEnums(
+		`CASE WHEN (status = '1'::integer) THEN value ELSE 0 END`,
+		enumTypes,
+	)
+	want := `CASE WHEN status = '1'::integer THEN value ELSE 0 END`
+	if got != want {
+		t.Fatalf("normalized expression = %q, want %q", got, want)
+	}
+}
+
 func TestNormalizeIndexExpressionPreservesQuotedParentheses(t *testing.T) {
 	got := normalizeIndexExpression(`coalesce((email)::text, '(')`)
 	want := `coalesce(email, '(')`

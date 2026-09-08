@@ -163,7 +163,7 @@ func (cs *Changeset) add(c Change) {
 func compareModels(cs *Changeset, oldSchema, newSchema *ir.Schema, oldM, newM *ir.Model) {
 	tableName := newM.TableName()
 	compareFields(cs, tableName, oldM.ScalarFields(), newM.ScalarFields())
-	compareIndexes(cs, tableName, oldM, newM)
+	compareIndexes(cs, tableName, oldSchema, newSchema, oldM, newM)
 	compareUniques(cs, tableName, oldM, newM)
 	comparePrimaryKey(cs, tableName, oldM, newM)
 	compareForeignKeys(cs, tableName, oldSchema, newSchema, oldM, newM)
@@ -267,7 +267,7 @@ func fieldTypeSignature(f *ir.Field) string {
 // Indexes
 // ---------------------------------------------------------------------------
 
-func compareIndexes(cs *Changeset, model string, oldM, newM *ir.Model) {
+func compareIndexes(cs *Changeset, model string, oldSchema, newSchema *ir.Schema, oldM, newM *ir.Model) {
 	oldMap := mapIndexes(oldM, oldM.Indexes)
 	newMap := mapIndexes(newM, newM.Indexes)
 	allKeys := mergedSortedKeys(oldMap, newMap)
@@ -288,7 +288,7 @@ func compareIndexes(cs *Changeset, model string, oldM, newM *ir.Model) {
 				Details: indexDetails(oi),
 			})
 		default:
-			if indexSignature(oi) != indexSignature(ni) {
+			if indexSignature(oldSchema, oi) != indexSignature(newSchema, ni) {
 				cs.add(Change{
 					Type: DropIndex, Model: model, OldValue: oi.Name,
 					Details: indexDetails(oi),
@@ -327,10 +327,11 @@ func encodeIndexExpressions(expressions []string) string {
 	return string(encoded)
 }
 
-func indexSignature(idx *ir.Index) string {
+func indexSignature(schema *ir.Schema, idx *ir.Index) string {
 	if idx == nil {
 		return ""
 	}
+	enumTypes := postgresEnumTypeNames(schema)
 	cols := effectiveIndexColumns(idx)
 	return strings.Join([]string{
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string {
@@ -339,7 +340,9 @@ func indexSignature(idx *ir.Index) string {
 			}
 			return c.Field
 		}), ","),
-		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexExpression(c.Expression) }), ","),
+		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string {
+			return normalizeIndexExpressionWithEnums(c.Expression, enumTypes)
+		}), ","),
 		boolStr(idx.IsUnique),
 		normalizeIndexPredicate(idx.Where),
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexSort(c.Sort) }), ","),
@@ -350,11 +353,24 @@ func indexSignature(idx *ir.Index) string {
 }
 
 func normalizeIndexExpression(expression string) string {
+	return normalizeIndexExpressionWithEnums(expression, nil)
+}
+
+func normalizeIndexExpressionWithEnums(expression string, enumTypes map[string]struct{}) string {
 	expression = strings.TrimSpace(expression)
 	for hasWrappingParens(expression) {
 		expression = strings.TrimSpace(expression[1 : len(expression)-1])
 	}
+	expression = stripPostgresImplicitCaseElseNull(expression)
 	expression = stripPostgresTextCasts(expression)
+	expression = stripPostgresEnumLiteralCasts(expression, enumTypes)
+	for {
+		next := stripPostgresCaseWhenParens(expression)
+		if next == expression {
+			break
+		}
+		expression = next
+	}
 	for {
 		next := stripRedundantIdentifierParens(expression)
 		if next == expression {
@@ -363,6 +379,179 @@ func normalizeIndexExpression(expression string) string {
 		expression = next
 	}
 	return strings.Join(strings.Fields(expression), " ")
+}
+
+func postgresEnumTypeNames(schema *ir.Schema) map[string]struct{} {
+	if schema == nil || len(schema.Enums) == 0 {
+		return nil
+	}
+	types := make(map[string]struct{}, len(schema.Enums))
+	for _, enum := range schema.Enums {
+		if enum == nil {
+			continue
+		}
+		name := enum.DBName
+		if name == "" {
+			name = enum.Name
+		}
+		if name != "" {
+			types[name] = struct{}{}
+		}
+	}
+	return types
+}
+
+func stripPostgresEnumLiteralCasts(expression string, enumTypes map[string]struct{}) string {
+	if len(enumTypes) == 0 {
+		return expression
+	}
+	var b strings.Builder
+	for i := 0; i < len(expression); {
+		if expression[i] != '\'' {
+			b.WriteByte(expression[i])
+			i++
+			continue
+		}
+		end := postgresStringLiteralEnd(expression, i)
+		b.WriteString(expression[i:end])
+		i = end
+		if !strings.HasPrefix(expression[i:], "::") {
+			continue
+		}
+		castStart := i + 2
+		castEnd := postgresCastTypeEnd(expression, castStart)
+		if castEnd == castStart || !isPostgresEnumCast(expression[castStart:castEnd], enumTypes) {
+			continue
+		}
+		i = castEnd
+	}
+	return b.String()
+}
+
+func isPostgresEnumCast(castType string, enumTypes map[string]struct{}) bool {
+	name := strings.TrimSpace(castType)
+	name = strings.ReplaceAll(name, `"`, "")
+	if _, ok := enumTypes[name]; ok {
+		return true
+	}
+	if dot := strings.LastIndexByte(name, '.'); dot >= 0 {
+		_, ok := enumTypes[name[dot+1:]]
+		return ok
+	}
+	return false
+}
+
+func stripPostgresImplicitCaseElseNull(expression string) string {
+	var b strings.Builder
+	for i := 0; i < len(expression); {
+		switch expression[i] {
+		case '\'':
+			end := postgresStringLiteralEnd(expression, i)
+			b.WriteString(expression[i:end])
+			i = end
+			continue
+		case '"':
+			end := postgresQuotedIdentifierEnd(expression, i)
+			b.WriteString(expression[i:end])
+			i = end
+			continue
+		}
+		if sqlKeywordAt(expression, i, "ELSE") {
+			if endStart, ok := implicitCaseElseNullEnd(expression, i); ok {
+				i = endStart
+				continue
+			}
+		}
+		b.WriteByte(expression[i])
+		i++
+	}
+	return b.String()
+}
+
+func implicitCaseElseNullEnd(expression string, elseStart int) (int, bool) {
+	i := skipSQLSpace(expression, elseStart+len("ELSE"))
+	if !sqlKeywordAt(expression, i, "NULL") {
+		return 0, false
+	}
+	i = skipSQLSpace(expression, i+len("NULL"))
+	if strings.HasPrefix(expression[i:], "::") {
+		castEnd := postgresCastTypeEnd(expression, i+2)
+		if castEnd == i+2 {
+			return 0, false
+		}
+		i = skipSQLSpace(expression, castEnd)
+	}
+	if !sqlKeywordAt(expression, i, "END") {
+		return 0, false
+	}
+	return i, true
+}
+
+func stripPostgresCaseWhenParens(expression string) string {
+	var b strings.Builder
+	for i := 0; i < len(expression); {
+		switch expression[i] {
+		case '\'':
+			end := postgresStringLiteralEnd(expression, i)
+			b.WriteString(expression[i:end])
+			i = end
+			continue
+		case '"':
+			end := postgresQuotedIdentifierEnd(expression, i)
+			b.WriteString(expression[i:end])
+			i = end
+			continue
+		}
+		if !sqlKeywordAt(expression, i, "WHEN") {
+			b.WriteByte(expression[i])
+			i++
+			continue
+		}
+		keywordEnd := i + len("WHEN")
+		conditionStart := skipSQLSpace(expression, keywordEnd)
+		if conditionStart >= len(expression) || expression[conditionStart] != '(' {
+			b.WriteString(expression[i:keywordEnd])
+			i = keywordEnd
+			continue
+		}
+		conditionEnd := matchingParenIndex(expression, conditionStart)
+		if conditionEnd < 0 || !sqlKeywordAt(expression, skipSQLSpace(expression, conditionEnd+1), "THEN") {
+			b.WriteString(expression[i:keywordEnd])
+			i = keywordEnd
+			continue
+		}
+		b.WriteString(expression[i:conditionStart])
+		b.WriteString(strings.TrimSpace(expression[conditionStart+1 : conditionEnd]))
+		i = conditionEnd + 1
+	}
+	return b.String()
+}
+
+func skipSQLSpace(s string, start int) int {
+	for start < len(s) {
+		switch s[start] {
+		case ' ', '\t', '\n', '\r':
+			start++
+		default:
+			return start
+		}
+	}
+	return start
+}
+
+func sqlKeywordAt(s string, start int, keyword string) bool {
+	end := start + len(keyword)
+	if start < 0 || end > len(s) || !strings.EqualFold(s[start:end], keyword) {
+		return false
+	}
+	if start > 0 && isSQLIdentifierByte(s[start-1]) {
+		return false
+	}
+	return end == len(s) || !isSQLIdentifierByte(s[end])
+}
+
+func isSQLIdentifierByte(ch byte) bool {
+	return ch == '_' || ch == '$' || ch >= '0' && ch <= '9' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z'
 }
 
 func stripPostgresTextCasts(expression string) string {
