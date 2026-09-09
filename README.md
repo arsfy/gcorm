@@ -1,6 +1,6 @@
 # GCORM
 
-![Golang](https://img.shields.io/badge/-Golang%201.26-00acd7?style=flat-square&logo=go&logoColor=white)
+![Golang](https://img.shields.io/badge/-Golang%201.27-00acd7?style=flat-square&logo=go&logoColor=white)
 
 GCORM is a schema-first ORM toolkit for Go. It provides a Prisma-like schema
 language, a Go code generator, type-safe query builders, migration planning, and
@@ -51,6 +51,12 @@ Or run it from a checkout:
 
 ```sh
 go run ./cmd/gco help
+```
+
+Or upgrade:
+
+```sh
+gco upgrade
 ```
 
 ## Quick Start
