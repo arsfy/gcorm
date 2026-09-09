@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
+	"strings"
 
 	"github.com/arsfy/gcorm/internal/config"
 	"github.com/arsfy/gcorm/internal/upgrade"
@@ -112,26 +113,62 @@ Flags:
   --config <path>    Path to configuration file`)
 }
 
+// splitFlag splits a "--name=value" argument into its name and value parts.
+// hasValue reports whether an attached "=value" part was present.
+func splitFlag(arg string) (name, value string, hasValue bool) {
+	if i := strings.IndexByte(arg, '='); i >= 0 {
+		return arg[:i], arg[i+1:], true
+	}
+	return arg, "", false
+}
+
+// flagValue returns the value for a flag that requires one, consuming the
+// next argument (via i) when no "=value" part was attached. It reports an
+// error when the value is missing, empty, or another flag follows.
+func flagValue(args []string, i *int, name, value string, hasValue bool) (string, error) {
+	if hasValue {
+		if value == "" {
+			return "", fmt.Errorf("flag %s requires a non-empty value", name)
+		}
+		return value, nil
+	}
+	if *i+1 >= len(args) || strings.HasPrefix(args[*i+1], "-") {
+		return "", fmt.Errorf("flag %s requires a value", name)
+	}
+	*i++
+	if args[*i] == "" {
+		return "", fmt.Errorf("flag %s requires a non-empty value", name)
+	}
+	return args[*i], nil
+}
+
 func runValidate(args []string) error {
 	schemaPath := ""
 	configPath := ""
 
 	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--schema":
-			if i+1 < len(args) {
-				schemaPath = args[i+1]
-				i++
+		name, value, hasValue := splitFlag(args[i])
+		switch name {
+		case "--schema", "-schema":
+			v, err := flagValue(args, &i, name, value, hasValue)
+			if err != nil {
+				return err
 			}
-		case "--config":
-			if i+1 < len(args) {
-				configPath = args[i+1]
-				i++
+			schemaPath = v
+		case "--config", "-config":
+			v, err := flagValue(args, &i, name, value, hasValue)
+			if err != nil {
+				return err
+			}
+			configPath = v
+		default:
+			if strings.HasPrefix(name, "-") {
+				return fmt.Errorf("unknown flag: %s", name)
 			}
 		}
 	}
 
-	cfg, _, err := config.Load(configPath)
+	cfg, cfgPath, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -145,7 +182,7 @@ func runValidate(args []string) error {
 	if schemaPath != "" {
 		roots = []string{schemaPath}
 	} else {
-		roots, err = config.DiscoverSchemaRoots(cfg, cwd)
+		roots, err = config.DiscoverSchemaRoots(cfg, cwd, cfgPath)
 		if err != nil {
 			return err
 		}

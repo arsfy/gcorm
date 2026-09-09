@@ -551,3 +551,233 @@ func TestGenerateEmptySchema(t *testing.T) {
 		t.Errorf("expected 1 file for empty schema, got %d", len(files))
 	}
 }
+
+func TestClientDialectMatchesDatasource(t *testing.T) {
+	tests := []struct {
+		provider string
+		want     string
+	}{
+		{provider: "postgresql", want: `dialect: "postgresql"`},
+		{provider: "mysql", want: `dialect: "mysql"`},
+		{provider: "sqlite", want: `dialect: "sqlite"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.provider, func(t *testing.T) {
+			s := testSchema()
+			s.Datasource.Provider = tt.provider
+			g := NewGenerator(s)
+			files, err := g.Generate()
+			if err != nil {
+				t.Fatalf("Generate() error: %v", err)
+			}
+			client := fileContent(t, files, "client/client.go")
+			if !strings.Contains(client, tt.want) {
+				t.Errorf("client.go should default dialect from datasource provider; want %q", tt.want)
+			}
+		})
+	}
+}
+
+func TestGenerateNameConflicts(t *testing.T) {
+	scalarField := func(name string) *ir.Field {
+		return &ir.Field{Name: name, Type: ir.FieldKindScalar, ScalarType: "String"}
+	}
+	modelWithFields := func(name string, fields ...*ir.Field) *ir.Model {
+		return &ir.Model{Name: name, Fields: fields}
+	}
+
+	tests := []struct {
+		name    string
+		models  []*ir.Model
+		wantErr string
+	}{
+		{
+			name: "model name collides with derived suffix type",
+			models: []*ir.Model{
+				modelWithFields("User", scalarField("id")),
+				modelWithFields("UserQuery", scalarField("id")),
+			},
+			wantErr: `conflicts with generated type "UserQuery"`,
+		},
+		{
+			name: "model name collides with derived query config type",
+			models: []*ir.Model{
+				modelWithFields("User", scalarField("id")),
+				modelWithFields("UserQueryConfig", scalarField("id")),
+			},
+			wantErr: `conflicts with generated type "UserQueryConfig"`,
+		},
+		{
+			name: "model name collides with derived create input type",
+			models: []*ir.Model{
+				modelWithFields("User", scalarField("id")),
+				modelWithFields("UserCreateInput", scalarField("id")),
+			},
+			wantErr: `conflicts with generated type "UserCreateInput"`,
+		},
+		{
+			name: "cross-model field helper collision",
+			models: []*ir.Model{
+				modelWithFields("User", scalarField("nameX")),
+				modelWithFields("UserName", scalarField("x")),
+			},
+			wantErr: "both generate helper type",
+		},
+		{
+			name: "model names differing only in case",
+			models: []*ir.Model{
+				modelWithFields("User", scalarField("id")),
+				modelWithFields("USER", scalarField("id")),
+			},
+			wantErr: "collide",
+		},
+		{
+			name: "duplicate model names",
+			models: []*ir.Model{
+				modelWithFields("User", scalarField("id")),
+				modelWithFields("User", scalarField("id")),
+			},
+			wantErr: "collide",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &ir.Schema{
+				Datasource: &ir.Datasource{Provider: "postgresql"},
+				Models:     tt.models,
+			}
+			g := NewGenerator(s)
+			_, err := g.Generate()
+			if err == nil {
+				t.Fatal("Generate() should report the name conflict before generating code")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Generate() error = %q, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestGenerateOptionalScalarsNoDoublePointer(t *testing.T) {
+	s := &ir.Schema{
+		Datasource: &ir.Datasource{Provider: "postgresql"},
+		Models: []*ir.Model{
+			{
+				Name: "Account",
+				Fields: []*ir.Field{
+					{Name: "id", Type: ir.FieldKindScalar, ScalarType: "String", IsID: true},
+					{Name: "name", Type: ir.FieldKindScalar, ScalarType: "String", IsOptional: true},
+					{Name: "nickname", Type: ir.FieldKindScalar, ScalarType: "String", IsOptional: true, IsUnique: true},
+				},
+				PrimaryKey: &ir.PrimaryKey{Fields: []string{"id"}},
+			},
+		},
+	}
+	g := NewGenerator(s)
+	files, err := g.Generate()
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+	query := fileContent(t, files, "query/account.go")
+
+	if strings.Contains(query, "**") {
+		t.Errorf("query/account.go should not contain double pointers:\n%s", query)
+	}
+	if !regexp.MustCompile(`(?m)\bName\s+\*string\b`).MatchString(query) {
+		t.Error("CreateInput should use *string for optional scalar fields")
+	}
+	if !regexp.MustCompile(`(?m)\bNickname\s+\*string\b`).MatchString(query) {
+		t.Error("WhereUniqueInput should use *string for optional unique fields")
+	}
+}
+
+func TestGenerateMappedNamesAreQuoted(t *testing.T) {
+	s := &ir.Schema{
+		Datasource: &ir.Datasource{Provider: "postgresql"},
+		Models: []*ir.Model{
+			{
+				Name:   "Mapped",
+				DBName: `odd"table`,
+				Fields: []*ir.Field{
+					{Name: "id", Type: ir.FieldKindScalar, ScalarType: "String", IsID: true},
+					{Name: "oddCol", DBName: `odd"col`, Type: ir.FieldKindScalar, ScalarType: "String"},
+				},
+				PrimaryKey: &ir.PrimaryKey{Fields: []string{"id"}},
+			},
+		},
+	}
+	g := NewGenerator(s)
+	files, err := g.Generate()
+	if err != nil {
+		t.Fatalf("Generate() error: %v", err)
+	}
+
+	models := fileContent(t, files, "model/models.go")
+	if !strings.Contains(models, `db:"odd\"col"`) {
+		t.Errorf("models.go should escape @map column names in struct tags:\n%s", models)
+	}
+
+	query := fileContent(t, files, "query/mapped.go")
+	if !strings.Contains(query, `const MappedTable = "odd\"table"`) {
+		t.Errorf("query/mapped.go should escape @@map table names:\n%s", query)
+	}
+	if !strings.Contains(query, `const MappedOddColColumn = "odd\"col"`) {
+		t.Errorf("query/mapped.go should escape @map column constants:\n%s", query)
+	}
+	if !strings.Contains(query, `Field: "odd\"col"`) {
+		t.Errorf("query/mapped.go should escape column names in where clauses:\n%s", query)
+	}
+
+	client := fileContent(t, files, "client/client.go")
+	if !strings.Contains(client, `case "odd\"col":`) {
+		t.Errorf("client.go should escape column names in field quoting switch:\n%s", client)
+	}
+}
+
+func TestGenerateRequiresModulePath(t *testing.T) {
+	t.Chdir(t.TempDir()) // no go.mod in this directory tree
+
+	s := &ir.Schema{
+		Datasource: &ir.Datasource{Provider: "postgresql"},
+		Models: []*ir.Model{
+			{
+				Name: "User",
+				Fields: []*ir.Field{
+					{Name: "id", Type: ir.FieldKindScalar, ScalarType: "String", IsID: true},
+				},
+			},
+		},
+	}
+
+	t.Run("errors without go.mod or WithModulePath", func(t *testing.T) {
+		g := NewGenerator(s)
+		_, err := g.Generate()
+		if err == nil {
+			t.Fatal("Generate() should fail when the module path cannot be determined")
+		}
+		if !strings.Contains(err.Error(), "cannot determine the Go module path") {
+			t.Fatalf("Generate() error = %q", err)
+		}
+	})
+
+	t.Run("succeeds with WithModulePath", func(t *testing.T) {
+		g := NewGenerator(s, WithModulePath("example.com/acme/gen"))
+		files, err := g.Generate()
+		if err != nil {
+			t.Fatalf("Generate() error: %v", err)
+		}
+		client := fileContent(t, files, "client/client.go")
+		if !strings.Contains(client, `"example.com/acme/gen/model"`) {
+			t.Errorf("client.go should import the configured module path:\n%s", client)
+		}
+	})
+
+	t.Run("empty schema does not require a module path", func(t *testing.T) {
+		g := NewGenerator(&ir.Schema{})
+		if _, err := g.Generate(); err != nil {
+			t.Fatalf("Generate() error for empty schema: %v", err)
+		}
+	})
+}

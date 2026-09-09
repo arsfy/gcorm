@@ -1,12 +1,14 @@
 package introspect
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/arsfy/gcorm/pkg/schema/compiler"
+	"github.com/arsfy/gcorm/pkg/schema/ir"
 	"github.com/arsfy/gcorm/pkg/schema/parser"
 )
 
@@ -315,5 +317,522 @@ func TestStripPostgresDefaultCastOnlyRemovesTrailingCast(t *testing.T) {
 		if got := stripPostgresDefaultCast(tt.input); got != tt.want {
 			t.Errorf("stripPostgresDefaultCast(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestIntrospectDriver(t *testing.T) {
+	tests := []struct {
+		provider string
+		want     string
+	}{
+		{"postgresql", "pgx"},
+		{"sqlite", "sqlite"},
+		{"mysql", "mysql"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.provider, func(t *testing.T) {
+			if got := introspectDriver(tt.provider); got != tt.want {
+				t.Errorf("introspectDriver(%q) = %q, want %q", tt.provider, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTablesFromIRNil(t *testing.T) {
+	if got := tablesFromIR(nil); got != nil {
+		t.Errorf("tablesFromIR(nil) = %#v, want nil", got)
+	}
+}
+
+func TestTablesFromIR(t *testing.T) {
+	schema := &ir.Schema{Models: []*ir.Model{
+		{
+			Name:   "User",
+			DBName: "users",
+			Schema: "app",
+			Fields: []*ir.Field{
+				{Name: "id", ScalarType: "Int", IsID: true},
+				{Name: "tenant", DBName: "tenant_id", ScalarType: "Int"},
+				{Name: "email", ScalarType: "String", IsUnique: true},
+				{Name: "createdAt", ScalarType: "DateTime", IsOptional: true, Default: &ir.DefaultValue{IsFunction: true, FuncName: "now"}},
+				{Name: "age", ScalarType: "Int", Default: &ir.DefaultValue{Value: "18"}},
+				{Name: "posts", Type: ir.FieldKindRelation, ModelType: "Post"},
+			},
+			PrimaryKey: &ir.PrimaryKey{Fields: []string{"id", "tenant_id"}, IsComposite: true},
+			Indexes: []*ir.Index{
+				{Name: "idx_age", Fields: []string{"age"}},
+				{Name: "idx_email_expr", Columns: []ir.IndexColumn{{Field: "email", Expression: "lower(email)"}}, IsUnique: true},
+			},
+			UniqueConstraints: []*ir.UniqueConstraint{
+				{Name: "uq_email_age", Fields: []string{"email", "age"}},
+			},
+			Relations: []*ir.Relation{
+				{ConstraintName: "fk_age", Fields: []string{"age"}, ToModel: "Post", References: []string{"id"}, OnDelete: "CASCADE", OnUpdate: "SET NULL"},
+				{ToModel: "Post"}, // no fields: must be skipped
+			},
+		},
+	}}
+
+	tables := tablesFromIR(schema)
+	if len(tables) != 1 {
+		t.Fatalf("tablesFromIR returned %d tables, want 1", len(tables))
+	}
+	tb := tables[0]
+	if tb.Name != "users" || tb.Schema != "app" {
+		t.Fatalf("table = %#v", tb)
+	}
+	if len(tb.Columns) != 5 {
+		t.Fatalf("columns = %#v", tb.Columns)
+	}
+	id, tenant, email, createdAt, age := tb.Columns[0], tb.Columns[1], tb.Columns[2], tb.Columns[3], tb.Columns[4]
+	if !id.IsPrimaryKey {
+		t.Errorf("id.IsPrimaryKey = false, want true")
+	}
+	if tenant.Name != "tenant_id" || !tenant.IsPrimaryKey {
+		t.Errorf("tenant column = %#v, want DBName mapped and primary key via pk list", tenant)
+	}
+	if !email.IsUnique {
+		t.Errorf("email.IsUnique = false, want true")
+	}
+	if !createdAt.IsNullable || createdAt.Default != "now()" {
+		t.Errorf("createdAt column = %#v, want nullable with now() default", createdAt)
+	}
+	if age.Default != "18" {
+		t.Errorf("age.Default = %q, want %q", age.Default, "18")
+	}
+
+	if len(tb.Indexes) != 3 {
+		t.Fatalf("indexes = %#v", tb.Indexes)
+	}
+	if tb.Indexes[0].Name != "idx_age" || tb.Indexes[0].IsUnique {
+		t.Errorf("index[0] = %#v", tb.Indexes[0])
+	}
+	exprIdx := tb.Indexes[1]
+	if exprIdx.Name != "idx_email_expr" || !exprIdx.IsUnique ||
+		len(exprIdx.Columns) != 1 || exprIdx.Columns[0] != "email" ||
+		len(exprIdx.Expressions) != 1 || exprIdx.Expressions[0] != "lower(email)" {
+		t.Errorf("expression index = %#v", exprIdx)
+	}
+	uc := tb.Indexes[2]
+	if uc.Name != "uq_email_age" || !uc.IsUnique || len(uc.Columns) != 2 {
+		t.Errorf("unique constraint index = %#v", uc)
+	}
+
+	if len(tb.FKs) != 1 {
+		t.Fatalf("fks = %#v", tb.FKs)
+	}
+	fk := tb.FKs[0]
+	if fk.Name != "fk_age" || fk.RefTable != "Post" || fk.OnDelete != "CASCADE" || fk.OnUpdate != "SET NULL" ||
+		len(fk.Columns) != 1 || fk.Columns[0] != "age" || len(fk.RefColumns) != 1 || fk.RefColumns[0] != "id" {
+		t.Errorf("fk = %#v", fk)
+	}
+}
+
+func TestRunWithSQLite(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "app.db")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{
+		`PRAGMA foreign_keys = ON`,
+		`CREATE TABLE users (
+			id INTEGER PRIMARY KEY,
+			email TEXT NOT NULL UNIQUE,
+			name TEXT,
+			created_at DATETIME DEFAULT (datetime('now'))
+		)`,
+		`CREATE TABLE posts (
+			id INTEGER PRIMARY KEY,
+			title TEXT NOT NULL,
+			author_id INTEGER NOT NULL,
+			FOREIGN KEY(author_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX idx_posts_title ON posts(title)`,
+	}
+	for _, stmt := range statements {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("exec %q: %v", stmt, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := filepath.Join(dir, "out")
+	if err := Run([]string{"--url", dbPath, "--output", outDir}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "schema.gcorm"))
+	if err != nil {
+		t.Fatalf("read generated schema: %v", err)
+	}
+	content := string(data)
+	for _, want := range []string{
+		`provider = "sqlite"`,
+		`model Users {`,
+		`model Posts {`,
+		`@relation(fields: [author_id], references: [id]`,
+		`onDelete: Cascade`,
+		`@@index([title], name: "idx_posts_title")`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("generated schema missing %q\nGot:\n%s", want, content)
+		}
+	}
+	if result := compiler.CompileFile("schema.gcorm", data); result.HasErrors() {
+		t.Fatalf("generated schema invalid: %v\n%s", result.Errors, content)
+	}
+}
+
+func TestRunConnectError(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := Run([]string{"--url", filepath.Join(blocker, "x.db")})
+	if err == nil {
+		t.Fatal("expected error for unreachable database")
+	}
+	if !strings.Contains(err.Error(), "connect database") {
+		t.Fatalf("error = %v, want connect database failure", err)
+	}
+}
+
+func TestRunInvalidURL(t *testing.T) {
+	err := Run([]string{"--url", "postgresql://exa mple/db", "--provider", "postgresql"})
+	if err == nil {
+		t.Fatal("expected error for invalid connection URL")
+	}
+}
+
+func TestGenerateSchemaWithRelations(t *testing.T) {
+	tables := []TableInfo{
+		{
+			Name:    "users",
+			Columns: []ColumnInfo{{Name: "id", DataType: "INT", IsPrimaryKey: true}},
+		},
+		{
+			Name: "posts",
+			Columns: []ColumnInfo{
+				{Name: "id", DataType: "INT", IsPrimaryKey: true},
+				{Name: "author_id", DataType: "INT"},
+				{Name: "orphan_id", DataType: "INT"},
+			},
+			FKs: []ForeignKeyInfo{
+				{Name: "fk_author", Columns: []string{"author_id"}, RefTable: "users", RefColumns: []string{"id"}, OnDelete: "CASCADE", OnUpdate: "SET NULL"},
+				// Unknown referenced table: refModel falls back to a sanitized name,
+				// then the relation is skipped because reference columns cannot be mapped.
+				{Columns: []string{"orphan_id"}, RefTable: "missing_table", RefColumns: []string{"id"}},
+				// Mismatched column counts: relation is skipped.
+				{Columns: []string{"author_id"}, RefTable: "users"},
+			},
+		},
+	}
+
+	schema := GenerateSchema("postgresql", tables)
+	want := `Users @relation(fields: [author_id], references: [id], name: "fk_author", onDelete: Cascade, onUpdate: SetNull)`
+	if !strings.Contains(schema, want) {
+		t.Fatalf("missing relation line %q:\n%s", want, schema)
+	}
+	if strings.Contains(schema, "orphan_id]") || strings.Contains(schema, "MissingTable @relation") {
+		t.Fatalf("unmappable relations should have been omitted:\n%s", schema)
+	}
+}
+
+func TestGenerateSchemaOmitsUnrepresentableIndex(t *testing.T) {
+	tables := []TableInfo{{
+		Name:    "events",
+		Columns: []ColumnInfo{{Name: "id", DataType: "INT", IsPrimaryKey: true}},
+		Indexes: []IndexInfo{{Name: "idx_bad", Columns: []string{"no_such_column"}}},
+	}}
+
+	schema := GenerateSchema("postgresql", tables)
+	want := `// WARNING: index "idx_bad" omitted because its columns could not be represented`
+	if !strings.Contains(schema, want) {
+		t.Fatalf("missing warning comment:\n%s", schema)
+	}
+}
+
+func TestGenerateSchemaWithMultiExpressionIndex(t *testing.T) {
+	tables := []TableInfo{{
+		Name: "docs",
+		Columns: []ColumnInfo{
+			{Name: "id", DataType: "INT", IsPrimaryKey: true},
+			{Name: "a", DataType: "TEXT"},
+			{Name: "b", DataType: "TEXT"},
+		},
+		Indexes: []IndexInfo{{
+			Name:        "idx_docs_expr",
+			Columns:     []string{"", ""},
+			Expressions: []string{"lower(a)", "upper(b)"},
+		}},
+	}}
+
+	schema := GenerateSchema("postgresql", tables)
+	want := `@@index([a, b], name: "idx_docs_expr", expressions: ["lower(a)", "upper(b)"])`
+	if !strings.Contains(schema, want) {
+		t.Fatalf("missing multi-expression index:\n%s", schema)
+	}
+}
+
+func TestGenerateSchemaWithSchemaNamespace(t *testing.T) {
+	tables := []TableInfo{{
+		Name:    "users",
+		Schema:  "app",
+		Columns: []ColumnInfo{{Name: "id", DataType: "INT", IsPrimaryKey: true}},
+	}}
+
+	schema := GenerateSchema("postgresql", tables)
+	if !strings.Contains(schema, `@@schema("app")`) {
+		t.Fatalf("missing @@schema:\n%s", schema)
+	}
+}
+
+func TestReferentialAction(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"CASCADE", "Cascade"},
+		{"cascade", "Cascade"},
+		{"RESTRICT", "Restrict"},
+		{"SET NULL", "SetNull"},
+		{"set null", "SetNull"},
+		{"SET DEFAULT", "SetDefault"},
+		{"NO ACTION", "NoAction"},
+		{"", "NoAction"},
+		{"something-else", "NoAction"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want+"/"+tt.input, func(t *testing.T) {
+			if got := referentialAction(tt.input); got != tt.want {
+				t.Errorf("referentialAction(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatIndexExpressions(t *testing.T) {
+	if got := formatIndexExpressions([]string{"lower(email)"}); got != `expression: "lower(email)"` {
+		t.Errorf("single expression = %q", got)
+	}
+	if got := formatIndexExpressions([]string{"lower(a)", "upper(b)"}); got != `expressions: ["lower(a)", "upper(b)"]` {
+		t.Errorf("multiple expressions = %q", got)
+	}
+	if got := formatIndexExpressions(nil); got != `expressions: []` {
+		t.Errorf("empty expressions = %q", got)
+	}
+}
+
+func TestWriteSchemaFileErrors(t *testing.T) {
+	dir := t.TempDir()
+
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteSchemaFile(filepath.Join(blocker, "sub"), "schema.gcorm", "content"); err == nil {
+		t.Error("expected error when output dir cannot be created")
+	}
+
+	subdir := filepath.Join(dir, "out", "schema.gcorm")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteSchemaFile(filepath.Join(dir, "out"), "schema.gcorm", "content"); err == nil {
+		t.Error("expected error when schema file path is a directory")
+	}
+}
+
+func TestIsPostgresCastType(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"", false},
+		{"[]", false},
+		{"text", true},
+		{"text[]", true},
+		{"character varying", true},
+		{"timestamp with time zone", true},
+		{"numeric(10,2)", true},
+		{"varchar()", false},
+		{"varchar(abc)", false},
+		{"some thing", false},
+		{"te!xt", false},
+		{"my_schema.my_type", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := isPostgresCastType(tt.input); got != tt.want {
+				t.Errorf("isPostgresCastType(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUnquoteSQLDefault(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"a", "a"},
+		{"'abc'", "abc"},
+		{"'O''Reilly'", "O'Reilly"},
+		{`"a""b"`, `a"b`},
+		{"'abc", "'abc"},
+		{`"abc`, `"abc`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := unquoteSQLDefault(tt.input); got != tt.want {
+				t.Errorf("unquoteSQLDefault(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasWrappingDefaultParens(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"", false},
+		{"(", false},
+		{"()", true},
+		{"(a)", true},
+		{"((a))", true},
+		{"(a)+(b)", false},
+		{"(a", false},
+		{"a)", false},
+		{"(')')", true},
+		{"('a'')')", true},
+		{`("(")`, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := hasWrappingDefaultParens(tt.input); got != tt.want {
+				t.Errorf("hasWrappingDefaultParens(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSanitizeNameFallbacks(t *testing.T) {
+	if got := sanitizeModelName(""); got != "Model" {
+		t.Errorf(`sanitizeModelName("") = %q, want "Model"`, got)
+	}
+	if got := sanitizeFieldName(""); got != "field" {
+		t.Errorf(`sanitizeFieldName("") = %q, want "field"`, got)
+	}
+	if got := sanitizeModelName("123"); got != "Model123" {
+		t.Errorf(`sanitizeModelName("123") = %q, want "Model123"`, got)
+	}
+	if got := sanitizeFieldName("1st"); got != "field1st" {
+		t.Errorf(`sanitizeFieldName("1st") = %q, want "field1st"`, got)
+	}
+	if got := sanitizeFieldName("Name"); got != "name" {
+		t.Errorf(`sanitizeFieldName("Name") = %q, want "name"`, got)
+	}
+}
+
+func TestPostgresExpressionReferencesColumn(t *testing.T) {
+	tests := []struct {
+		expression string
+		column     string
+		want       bool
+	}{
+		{"lower(email)", "email", true},
+		{"lower(email)", "mail", false},
+		{`lower("email")`, "email", true},
+		{`lower("em""ail")`, `em"ail`, true},
+		{"email_address", "email", false},
+		{"email", "email", true},
+		{"", "email", false},
+	}
+	for _, tt := range tests {
+		if got := postgresExpressionReferencesColumn(tt.expression, tt.column); got != tt.want {
+			t.Errorf("postgresExpressionReferencesColumn(%q, %q) = %v, want %v", tt.expression, tt.column, got, tt.want)
+		}
+	}
+}
+
+func TestMapDefaultForType(t *testing.T) {
+	tests := []struct {
+		def       string
+		fieldType string
+		want      string
+	}{
+		{"1", "Boolean", "true"},
+		{"TRUE", "Boolean", "true"},
+		{"0", "Boolean", "false"},
+		{"false", "Boolean", "false"},
+		{"'t'", "Boolean", `"t"`},
+		{"-3.5", "Float", "-3.5"},
+		{"abc", "Int", `"abc"`},
+		{"(1 + 2)", "", `"1 + 2"`},
+		{"AUTOINCREMENT", "", "autoincrement()"},
+	}
+	for _, tt := range tests {
+		got := mapDefaultForType(tt.def, tt.fieldType)
+		if got != tt.want {
+			t.Errorf("mapDefaultForType(%q, %q) = %q, want %q", tt.def, tt.fieldType, got, tt.want)
+		}
+	}
+}
+
+func TestIsSQLStringLiteral(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"", false},
+		{"'", false},
+		{"'abc'", true},
+		{"'a''b'", true},
+		{"'abc'::text", true},
+		{"'abc' junk", false},
+		{`"abc"`, true},
+		{"abc", false},
+		{"'a", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := isSQLStringLiteral(tt.input); got != tt.want {
+				t.Errorf("isSQLStringLiteral(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMapSQLTypeAdditional(t *testing.T) {
+	tests := []struct {
+		provider string
+		sqlType  string
+		want     string
+	}{
+		{"mysql", "CHAR(36)", "UUID"},
+		{"postgresql", "BIGSERIAL", "BigInt"},
+		{"postgresql", "SERIAL", "Int"},
+		{"postgresql", "TINYINT(1)", "Int"}, // Boolean mapping is mysql-only
+		{"postgresql", "FLOAT8", "Float"},
+		{"postgresql", "REAL", "Float"},
+		{"postgresql", "NUMERIC(12,4)", "Decimal"},
+		{"postgresql", "DATE", "DateTime"},
+		{"mysql", "VARBINARY(16)", "Bytes"},
+		{"postgresql", "JSON", "Json"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.provider+"_"+tt.sqlType, func(t *testing.T) {
+			if got := mapSQLType(tt.provider, tt.sqlType); got != tt.want {
+				t.Errorf("mapSQLType(%q, %q) = %q, want %q", tt.provider, tt.sqlType, got, tt.want)
+			}
+		})
 	}
 }

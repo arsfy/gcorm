@@ -95,13 +95,37 @@ func loadFile(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// DiscoverSchemaRoots finds schema root directories.
-func DiscoverSchemaRoots(cfg *Config, cwd string) ([]string, error) {
+// ConfigDir returns the absolute directory containing the configuration file
+// at configPath, or "" when no configuration file was loaded.
+func ConfigDir(configPath string) (string, error) {
+	if configPath == "" {
+		return "", nil
+	}
+	abs, err := filepath.Abs(configPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve config path %s: %w", configPath, err)
+	}
+	return filepath.Dir(abs), nil
+}
+
+// DiscoverSchemaRoots finds schema root directories. Relative schemaRoots
+// entries are resolved against the directory containing the loaded
+// configuration file (configPath), or against cwd when no configuration
+// file was found.
+func DiscoverSchemaRoots(cfg *Config, cwd, configPath string) ([]string, error) {
 	if len(cfg.SchemaRoots) > 0 {
+		base := cwd
+		if configPath != "" {
+			dir, err := ConfigDir(configPath)
+			if err != nil {
+				return nil, err
+			}
+			base = dir
+		}
 		var abs []string
 		for _, r := range cfg.SchemaRoots {
 			if !filepath.IsAbs(r) {
-				r = filepath.Join(cwd, r)
+				r = filepath.Join(base, r)
 			}
 			abs = append(abs, filepath.Clean(r))
 		}
@@ -138,6 +162,7 @@ func DiscoverSchemaFiles(roots []string) ([]string, error) {
 
 	var files []string
 	for _, root := range roots {
+		root = resolveSymlinkRoot(root)
 		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -162,6 +187,21 @@ func DiscoverSchemaFiles(roots []string) ([]string, error) {
 
 	sortStrings(files)
 	return files, nil
+}
+
+// resolveSymlinkRoot resolves a symlinked walk root to its target so that
+// filepath.Walk (which uses Lstat and does not follow symlinks) descends
+// into it. Non-symlink or unresolvable roots are returned unchanged.
+func resolveSymlinkRoot(root string) string {
+	info, err := os.Lstat(root)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return root
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return root
+	}
+	return resolved
 }
 
 func sortStrings(s []string) {

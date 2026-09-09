@@ -73,21 +73,10 @@ func (g DDLGenerator) postgresEnumChanges(cs *Changeset) string {
 		return ""
 	}
 	for _, e := range cs.New.Enums {
-		name := e.Name
-		if e.DBName != "" {
-			name = e.DBName
-		}
+		name := enumDBName(cs.New, e.Name)
 		old := oldEnums[e.Name]
 		if old == nil {
-			values := make([]string, len(e.Values))
-			for i, v := range e.Values {
-				value := v.Name
-				if v.DBName != "" {
-					value = v.DBName
-				}
-				values[i] = quoteSQLString(value)
-			}
-			statements = append(statements, "CREATE TYPE "+g.quoteID(name)+" AS ENUM ("+strings.Join(values, ", ")+");")
+			statements = append(statements, g.postgresCreateEnumSQL(e))
 			continue
 		}
 		seen := map[string]bool{}
@@ -107,6 +96,39 @@ func (g DDLGenerator) postgresEnumChanges(cs *Changeset) string {
 	return strings.Join(statements, "\n")
 }
 
+// enumDBName returns the database name of an enum type, honoring @@map.
+// It falls back to the given name when the enum is not in the schema.
+func enumDBName(schema *ir.Schema, name string) string {
+	if e := findEnum(schema, name); e != nil && e.DBName != "" {
+		return e.DBName
+	}
+	return name
+}
+
+// postgresCreateEnumSQL renders a guarded CREATE TYPE for an enum.
+// PostgreSQL has no CREATE TYPE IF NOT EXISTS, so a DO block swallows
+// duplicate_object errors to tolerate schema drift.
+func (g DDLGenerator) postgresCreateEnumSQL(e *ir.Enum) string {
+	values := make([]string, len(e.Values))
+	for i, v := range e.Values {
+		value := v.Name
+		if v.DBName != "" {
+			value = v.DBName
+		}
+		values[i] = quoteSQLString(value)
+	}
+	name := e.Name
+	if e.DBName != "" {
+		name = e.DBName
+	}
+	stmt := "CREATE TYPE " + g.quoteID(name) + " AS ENUM (" + strings.Join(values, ", ") + ");"
+	delimiter := "$$"
+	for strings.Contains(stmt, delimiter) {
+		delimiter = "$gco" + delimiter[1:]
+	}
+	return "DO " + delimiter + " BEGIN\n" + stmt + "\nEXCEPTION WHEN duplicate_object THEN NULL;\nEND " + delimiter + ";"
+}
+
 func sqliteRequiresRebuild(t ChangeType) bool {
 	switch t {
 	case DropColumn, AlterType, AlterNull, AlterDefault, AddUnique, DropUnique, ChangePK, AddFK, DropFK:
@@ -121,8 +143,7 @@ func (g DDLGenerator) sqliteRebuildTableSQL(table string, cs *Changeset) string 
 		return "-- SQLite table rebuild unavailable for " + table
 	}
 	temp := "__gco_new_" + table
-	create := g.createTableSQL(Change{Type: CreateTable, Model: table}, cs)
-	create = strings.Replace(create, "CREATE TABLE "+g.quoteID(table), "CREATE TABLE "+g.quoteID(temp), 1)
+	create := g.createTableDefinitionSQL(newModel, temp, cs.New)
 	oldModel := findModel(cs.Old, table)
 	oldCols := map[string]bool{}
 	if oldModel != nil {
@@ -216,7 +237,7 @@ func (g DDLGenerator) changeToUp(c Change, cs *Changeset) string {
 		return "" // PostgreSQL additions are emitted in postgresEnumChanges; SQLite stores enum values as text.
 	case DropEnum:
 		if g.Dialect == "postgresql" {
-			return "DROP TYPE " + g.quoteID(c.Model) + ";"
+			return "DROP TYPE " + g.quoteID(enumDBName(cs.Old, c.Model)) + ";"
 		}
 		return ""
 	default:
@@ -225,15 +246,39 @@ func (g DDLGenerator) changeToUp(c Change, cs *Changeset) string {
 }
 
 func (g DDLGenerator) mysqlRefreshEnumColumns(enumName string) string {
-	if g.Schema == nil {
+	return g.mysqlRefreshEnumColumnsFrom(g.Schema, enumName)
+}
+
+// mysqlRefreshEnumColumnsFrom re-emits MODIFY COLUMN for every column using
+// the named enum, taking the enum values from the given schema. The column
+// definition is built without an inline UNIQUE clause: repeated MODIFY
+// statements would otherwise accumulate duplicate unique indexes.
+func (g DDLGenerator) mysqlRefreshEnumColumnsFrom(schema *ir.Schema, enumName string) string {
+	if schema == nil {
 		return ""
 	}
+	enumType := "TEXT"
+	if enum := findEnum(schema, enumName); enum != nil {
+		values := make([]string, len(enum.Values))
+		for i, value := range enum.Values {
+			values[i] = quoteSQLString(value.Name)
+		}
+		enumType = "ENUM(" + strings.Join(values, ", ") + ")"
+	}
 	var statements []string
-	for _, m := range g.Schema.Models {
+	for _, m := range schema.Models {
 		for _, f := range m.ScalarFields() {
-			if f.Type == ir.FieldKindEnum && f.EnumType == enumName {
-				statements = append(statements, fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s;", g.quoteID(m.TableName()), g.columnDef(f)))
+			if f.Type != ir.FieldKindEnum || f.EnumType != enumName {
+				continue
 			}
+			parts := []string{g.quoteID(columnName(f)), enumType}
+			if !f.IsOptional {
+				parts = append(parts, "NOT NULL")
+			}
+			if f.Default != nil {
+				parts = append(parts, "DEFAULT "+g.defaultExprForField(f))
+			}
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s;", g.quoteID(m.TableName()), strings.Join(parts, " ")))
 		}
 	}
 	return strings.Join(statements, "\n")
@@ -246,7 +291,22 @@ func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("CREATE TABLE %s (\n", g.quoteID(model.TableName())))
+	b.WriteString(g.createTableDefinitionSQL(model, model.TableName(), cs.New))
+	for _, idx := range model.Indexes {
+		name := effectiveIndexName(model, idx)
+		unique := ""
+		if idx.IsUnique {
+			unique = "UNIQUE "
+		}
+		b.WriteString("\n")
+		b.WriteString(g.createIndexSQL(name, model.TableName(), unique, g.indexColumnsSQL(model, idx), idx.Where, indexHasExpressions(idx)))
+	}
+	return b.String()
+}
+
+func (g DDLGenerator) createTableDefinitionSQL(model *ir.Model, tableName string, schema *ir.Schema) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE TABLE %s (\n", g.quoteID(tableName))
 
 	var cols []string
 	for _, f := range model.ScalarFields() {
@@ -270,7 +330,7 @@ func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
 			if len(rel.Fields) == 0 || len(rel.References) == 0 {
 				continue
 			}
-			target := findModel(cs.New, rel.ToModel)
+			target := findModel(schema, rel.ToModel)
 			refTable := rel.ToModel
 			if target != nil {
 				refTable = target.TableName()
@@ -291,16 +351,6 @@ func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
 
 	b.WriteString(strings.Join(cols, ",\n"))
 	b.WriteString("\n);")
-
-	for _, idx := range model.Indexes {
-		name := effectiveIndexName(model, idx)
-		unique := ""
-		if idx.IsUnique {
-			unique = "UNIQUE "
-		}
-		b.WriteString("\n")
-		b.WriteString(g.createIndexSQL(name, model.TableName(), unique, g.indexColumnsSQL(model, idx), idx.Where, indexHasExpressions(idx)))
-	}
 	return b.String()
 }
 
@@ -327,7 +377,7 @@ func (g DDLGenerator) alterTypeSQL(c Change) string {
 		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s;", tbl, col, newType)
 	case "mysql":
 		if c.NewField != nil {
-			return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s;", tbl, g.columnDef(c.NewField))
+			return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s;", tbl, g.columnDefForModify(c.NewField))
 		}
 		return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s;", tbl, col, newType)
 	default: // sqlite
@@ -349,7 +399,7 @@ func (g DDLGenerator) alterNullSQL(c Change) string {
 		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;", tbl, col)
 	case "mysql":
 		if c.NewField != nil {
-			return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s;", tbl, g.columnDef(c.NewField))
+			return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s;", tbl, g.columnDefForModify(c.NewField))
 		}
 		return fmt.Sprintf("-- MySQL: nullability change requires the full column definition for %s.%s", c.Model, c.Field)
 	default: // sqlite
@@ -669,7 +719,11 @@ func (g DDLGenerator) addFKSQL(c Change) string {
 	localFields := g.quoteIDs(strings.Split(c.Details["fields"], ","))
 	refFields := g.quoteIDs(strings.Split(c.Details["references"], ","))
 	refTable := g.quoteID(c.Details["toModel"])
-	constraintName := g.quoteID(fmt.Sprintf("fk_%s_%s", c.Model, c.Details["fields"]))
+	name := c.Details["name"]
+	if name == "" {
+		name = fmt.Sprintf("fk_%s_%s", c.Model, c.Details["fields"])
+	}
+	constraintName := g.quoteID(name)
 
 	sql := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
 		tbl, constraintName, strings.Join(localFields, ", "),
@@ -689,6 +743,8 @@ func (g DDLGenerator) orderedChanges(cs *Changeset) []Change {
 	}
 
 	dropFKs := make([]Change, 0)
+	createEnums := make([]Change, 0)
+	dropEnums := make([]Change, 0)
 	others := make([]Change, 0)
 	createTables := make([]Change, 0)
 	addFKs := make([]Change, 0)
@@ -696,6 +752,10 @@ func (g DDLGenerator) orderedChanges(cs *Changeset) []Change {
 
 	for _, c := range cs.Changes {
 		switch c.Type {
+		case CreateEnum:
+			createEnums = append(createEnums, c)
+		case DropEnum:
+			dropEnums = append(dropEnums, c)
 		case DropFK:
 			dropFKs = append(dropFKs, c)
 		case CreateTable:
@@ -710,11 +770,13 @@ func (g DDLGenerator) orderedChanges(cs *Changeset) []Change {
 	}
 
 	ordered := make([]Change, 0, len(cs.Changes))
+	ordered = append(ordered, createEnums...)
 	ordered = append(ordered, dropFKs...)
 	ordered = append(ordered, orderOtherChanges(others)...)
 	ordered = append(ordered, g.sortTableChanges(createTables, cs.New, false)...)
 	ordered = append(ordered, addFKs...)
 	ordered = append(ordered, g.sortTableChanges(dropTables, cs.Old, true)...)
+	ordered = append(ordered, dropEnums...)
 	return ordered
 }
 
@@ -870,6 +932,9 @@ func (g DDLGenerator) dropFKSQL(c Change) string {
 // ---------------------------------------------------------------------------
 
 func (g DDLGenerator) changeToDown(c Change, cs *Changeset) string {
+	if cs != nil && cs.Old != nil {
+		g.Schema = cs.Old
+	}
 	switch c.Type {
 	case CreateTable:
 		return fmt.Sprintf("DROP TABLE %s;", g.quoteID(c.Model))
@@ -881,15 +946,18 @@ func (g DDLGenerator) changeToDown(c Change, cs *Changeset) string {
 		return fmt.Sprintf("-- WARNING: destructive — cannot restore column %s.%s without original definition", c.Model, c.Field)
 	case AlterType:
 		rev := c
-		rev.NewValue = c.OldValue
+		rev.OldValue, rev.NewValue = c.NewValue, c.OldValue
+		rev.OldField, rev.NewField = c.NewField, c.OldField
 		return "-- REVIEW REQUIRED: reverting type change\n" + g.alterTypeSQL(rev)
 	case AlterNull:
 		rev := c
-		rev.NewValue = c.OldValue
+		rev.OldValue, rev.NewValue = c.NewValue, c.OldValue
+		rev.OldField, rev.NewField = c.NewField, c.OldField
 		return "-- REVIEW REQUIRED: reverting nullability change\n" + g.alterNullSQL(rev)
 	case AlterDefault:
 		rev := c
-		rev.NewValue = c.OldValue
+		rev.OldValue, rev.NewValue = c.NewValue, c.OldValue
+		rev.OldField, rev.NewField = c.NewField, c.OldField
 		return g.alterDefaultSQL(rev)
 	case AddIndex:
 		rev := c
@@ -918,6 +986,32 @@ func (g DDLGenerator) changeToDown(c Change, cs *Changeset) string {
 	case DropFK:
 		rev := c
 		return g.addFKSQL(rev)
+	case CreateEnum:
+		if g.Dialect == "postgresql" {
+			return "DROP TYPE IF EXISTS " + g.quoteID(enumDBName(cs.New, c.Model)) + ";"
+		}
+		return "" // MySQL and SQLite enums are inline column types; nothing to drop.
+	case DropEnum:
+		if g.Dialect == "postgresql" {
+			if enum := findEnum(cs.Old, c.Model); enum != nil {
+				return g.postgresCreateEnumSQL(enum)
+			}
+			return "-- WARNING: destructive — cannot recreate enum " + c.Model + " without original schema"
+		}
+		return "" // MySQL and SQLite enums are inline column types; nothing to recreate.
+	case AlterEnum:
+		switch g.Dialect {
+		case "postgresql":
+			// PostgreSQL enum values cannot be removed; a true revert requires
+			// recreating the type and rewriting dependent columns.
+			return "-- REVIEW REQUIRED: cannot revert enum change for " + c.Model + "; PostgreSQL enum values cannot be removed"
+		case "mysql":
+			if sql := g.mysqlRefreshEnumColumnsFrom(cs.Old, c.Model); sql != "" {
+				return sql
+			}
+			return "-- REVIEW REQUIRED: cannot revert enum change for " + c.Model + " without original schema"
+		}
+		return "" // SQLite stores enum values as text.
 	default:
 		return fmt.Sprintf("-- unsupported reverse for change type: %s", c.Type)
 	}
@@ -1031,10 +1125,21 @@ func (g DDLGenerator) sqlTypeSignature(typeName string) string {
 // ---------------------------------------------------------------------------
 
 func (g DDLGenerator) columnDef(f *ir.Field) string {
-	return g.columnDefForTable(nil, f)
+	return g.columnDefInternal(nil, f, true)
+}
+
+// columnDefForModify renders a column definition for ALTER TABLE ... MODIFY
+// COLUMN. Inline UNIQUE is omitted: each MODIFY would otherwise create a new
+// duplicate unique index on MySQL.
+func (g DDLGenerator) columnDefForModify(f *ir.Field) string {
+	return g.columnDefInternal(nil, f, false)
 }
 
 func (g DDLGenerator) columnDefForTable(model *ir.Model, f *ir.Field) string {
+	return g.columnDefInternal(model, f, true)
+}
+
+func (g DDLGenerator) columnDefInternal(model *ir.Model, f *ir.Field, allowInlineUnique bool) string {
 	name := columnName(f)
 	if g.sqliteInlineAutoIncrementPrimaryKeyColumn(model) == name {
 		return strings.Join([]string{g.quoteID(name), "INTEGER", "PRIMARY KEY", "AUTOINCREMENT"}, " ")
@@ -1052,7 +1157,7 @@ func (g DDLGenerator) columnDefForTable(model *ir.Model, f *ir.Field) string {
 		parts = append(parts, "NOT NULL")
 	}
 
-	if f.IsUnique && !f.IsID && model == nil {
+	if allowInlineUnique && f.IsUnique && !f.IsID && model == nil {
 		parts = append(parts, "UNIQUE")
 	}
 
@@ -1108,7 +1213,7 @@ func (g DDLGenerator) columnSQLType(f *ir.Field) string {
 	}
 	if f.Type == ir.FieldKindEnum {
 		if g.Dialect == "postgresql" {
-			return g.quoteID(f.EnumType)
+			return g.quoteID(enumDBName(g.Schema, f.EnumType))
 		}
 		if g.Dialect == "mysql" {
 			if enum := findEnum(g.Schema, f.EnumType); enum != nil {
@@ -1186,6 +1291,9 @@ func quoteSQLString(value string) string {
 }
 
 func (g DDLGenerator) defaultExprForChange(c Change) string {
+	if c.NewField != nil && c.NewField.Default != nil {
+		return g.defaultExprForField(c.NewField)
+	}
 	if f := findField(g.Schema, c.Model, c.Field); f != nil && f.Default != nil {
 		return g.defaultExprForField(f)
 	}
@@ -1217,9 +1325,7 @@ func (g DDLGenerator) arrayDefaultExpr(d *ir.DefaultValue) string {
 		if len(values) == 0 {
 			return "'[]'"
 		}
-		parts := make([]string, len(values))
-		copy(parts, values)
-		return "'" + "[" + strings.Join(parts, ",") + "]" + "'"
+		return quoteSQLString("[" + strings.Join(values, ",") + "]")
 	}
 }
 
@@ -1241,7 +1347,7 @@ func (g DDLGenerator) defaultExpr(val string) string {
 	}
 	for _, ch := range val {
 		if (ch < '0' || ch > '9') && ch != '.' && ch != '-' {
-			return "'" + val + "'"
+			return quoteSQLString(val)
 		}
 	}
 	return val

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/arsfy/gcorm/pkg/schema/ast"
 )
@@ -48,8 +49,13 @@ func ParseMulti(files map[string][]byte) (*ast.DocumentSet, error) {
 	var firstErr error
 	for _, name := range names {
 		doc, err := Parse(name, files[name])
-		if err != nil && firstErr == nil {
-			firstErr = err
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			// Skip failed files: Parse may return a nil document (lexer
+			// errors) or a partial one, and neither is safe to compile.
+			continue
 		}
 		ds.Documents = append(ds.Documents, doc)
 		ds.Files = append(ds.Files, name)
@@ -113,6 +119,9 @@ func (p *parser) makeComment(tok Token) ast.Comment {
 	if len(text) > 0 && text[0] == ' ' {
 		text = text[1:]
 	}
+	// In CRLF files the comment token extends to (but excludes) the \n,
+	// leaving a trailing \r in the text.
+	text = strings.TrimSuffix(text, "\r")
 	return ast.Comment{
 		Text:  text,
 		IsDoc: isDoc,
@@ -161,16 +170,19 @@ func (p *parser) peekNextMeaningful() TokenType {
 
 func tokenSpan(tok Token) ast.Span {
 	end := tok.Pos
-	end.Column += len(tok.Value)
-	end.Offset += len(tok.Value)
+	length := len(tok.Value)
+	columns := utf8.RuneCountInString(tok.Value)
+	if tok.RawLen > 0 {
+		length = tok.RawLen
+		columns = tok.RawColumns
+	}
+	end.Column += columns
+	end.Offset += length
 	return ast.Span{Start: tok.Pos, End: end}
 }
 
 func spanFromTo(a, b Token) ast.Span {
-	end := b.Pos
-	end.Column += len(b.Value)
-	end.Offset += len(b.Value)
-	return ast.Span{Start: a.Pos, End: end}
+	return ast.Span{Start: a.Pos, End: tokenSpan(b).End}
 }
 
 // ---------------------------------------------------------------------------
@@ -457,11 +469,14 @@ func (p *parser) parseAttribute(isModelLevel bool) ast.Attribute {
 		name = lastTok.Value
 		// Dotted names like db.VarChar.
 		for p.peek() == TokenDot {
-			p.advance() // .
-			if p.peek() == TokenIdent {
-				lastTok = p.advance()
-				name += "." + lastTok.Value
+			dotTok := p.current()
+			if p.pos+1 >= len(p.tokens) || p.tokens[p.pos+1].Type != TokenIdent {
+				p.addError(dotTok.Pos, "expected identifier after '.' in attribute name")
+				break
 			}
+			p.advance() // .
+			lastTok = p.advance()
+			name += "." + lastTok.Value
 		}
 	} else {
 		p.addError(p.current().Pos, "expected attribute name after @")
@@ -569,11 +584,14 @@ func (p *parser) parseIdentOrFuncCall() ast.Expression {
 
 	// Dotted identifier (e.g. db.uuid).
 	for p.peek() == TokenDot {
-		p.advance()
-		if p.peek() == TokenIdent {
-			lastTok = p.advance()
-			name += "." + lastTok.Value
+		dotTok := p.current()
+		if p.pos+1 >= len(p.tokens) || p.tokens[p.pos+1].Type != TokenIdent {
+			p.addError(dotTok.Pos, "expected identifier after '.'")
+			break
 		}
+		p.advance() // .
+		lastTok = p.advance()
+		name += "." + lastTok.Value
 	}
 
 	// Allow horizontal whitespace before ( for function calls.

@@ -73,6 +73,14 @@ type GeneratedFile struct {
 
 // Generate produces all Go source files for the schema.
 func (g *Generator) Generate() ([]*GeneratedFile, error) {
+	if err := validateSchemaNames(g.schema); err != nil {
+		return nil, err
+	}
+
+	if len(g.schema.Models) > 0 && g.baseImportPath() == "" {
+		return nil, fmt.Errorf("cannot determine the Go module path for generated imports in output %q: no go.mod found in the output directory or any parent; pass WithModulePath to set the base import path explicitly", g.output)
+	}
+
 	var files []*GeneratedFile
 
 	// Generate model types.
@@ -186,6 +194,75 @@ func (g *Generator) generateQueries() ([]*GeneratedFile, error) {
 	return files, nil
 }
 
+// generatedTypeSuffixes are the query-package types that share a namespace
+// with model query variables. Client-package types do not collide with them.
+var generatedTypeSuffixes = []string{
+	"Query", "QueryOption", "QueryConfig",
+	"WhereClause", "OrderByClause", "IncludeClause",
+	"TakeOption", "SkipOption", "SetClause",
+	"AggregateOption", "AggregateResult", "GroupByResult",
+	"CreateInput", "CreateNestedInput", "WhereUniqueInput",
+}
+
+// validateSchemaNames rejects schemas whose model or field names would produce
+// colliding Go identifiers or generated file names.
+func validateSchemaNames(s *ir.Schema) error {
+	// Model names that differ only in case map to the same generated query
+	// file (strings.ToLower(name) + ".go") and would overwrite each other.
+	seenLower := make(map[string]string, len(s.Models))
+	for _, m := range s.Models {
+		key := strings.ToLower(m.Name)
+		if prev, ok := seenLower[key]; ok {
+			return fmt.Errorf("model names %q and %q collide: both generate query/%s.go", prev, m.Name, key)
+		}
+		seenLower[key] = m.Name
+	}
+
+	modelNames := make(map[string]bool, len(s.Models))
+	for _, m := range s.Models {
+		modelNames[m.Name] = true
+	}
+
+	// A model name must not collide with a type name derived from another
+	// model (e.g. model "UserQuery" vs. type "UserQuery" from model "User").
+	for _, m := range s.Models {
+		for _, suffix := range generatedTypeSuffixes {
+			derived := m.Name + suffix
+			if modelNames[derived] {
+				return fmt.Errorf("model name %q conflicts with generated type %q for model %q; rename one of the models", derived, derived, m.Name)
+			}
+		}
+	}
+
+	// Field helper types are named lower(model) + Upper(field); two distinct
+	// model+field pairs can produce the same helper (e.g. User.nameX and
+	// UserName.x both yield userNameXField).
+	type fieldRef struct{ model, field string }
+	helpers := make(map[string]fieldRef)
+	for _, m := range s.Models {
+		fields := make(map[string]string, len(m.Fields))
+		for _, f := range m.Fields {
+			field := toUpperFirst(f.Name)
+			if prev, ok := fields[field]; ok {
+				return fmt.Errorf("fields %s.%s and %s.%s both generate Go field %q; rename one of the fields", m.Name, prev, m.Name, f.Name, field)
+			}
+			fields[field] = f.Name
+			kind := "Field"
+			if f.Type == ir.FieldKindRelation {
+				kind = "Relation"
+			}
+			helper := toLowerFirst(m.Name) + field + kind
+			if prev, ok := helpers[helper]; ok {
+				return fmt.Errorf("fields %s.%s and %s.%s both generate helper type %q; rename one of the fields",
+					prev.model, prev.field, m.Name, f.Name, helper)
+			}
+			helpers[helper] = fieldRef{model: m.Name, field: f.Name}
+		}
+	}
+
+	return nil
+}
+
 // generateClient produces the main client entry point.
 func (g *Generator) generateClient() (*GeneratedFile, error) {
 	models := make([]*ir.Model, len(g.schema.Models))
@@ -219,6 +296,7 @@ func (g *Generator) renderTemplate(name, tmplSrc string, data any) ([]byte, erro
 		"scalarCols":        scalarColumns,
 		"hasEnumFields":     hasEnumFields,
 		"quote":             func(s string) string { return fmt.Sprintf("%q", s) },
+		"quoteTagValue":     func(s string) string { return strings.ReplaceAll(fmt.Sprintf("%q", s), "`", `\x60`) },
 		"tableName":         func(m *ir.Model) string { return m.TableName() },
 		"quotedTableName":   func(m *ir.Model) string { return quoteGeneratedIdentifier(g.schema.Datasource, m.TableName()) },
 		"columnCSV":         columnCSV,
@@ -258,7 +336,7 @@ func quoteGeneratedIdentifier(ds *ir.Datasource, name string) string {
 	if dialect == "mysql" {
 		return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 	}
-	return `\"` + strings.ReplaceAll(name, `"`, `\"\"`) + `\"`
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 func quotedColumnCSV(ds *ir.Datasource, m *ir.Model) string {
@@ -300,7 +378,14 @@ func goTypeForField(f *ir.Field) string {
 
 func queryGoTypeForField(f *ir.Field) string {
 	if f.Type == ir.FieldKindEnum {
-		return "model." + f.EnumType
+		base := "model." + f.EnumType
+		if f.IsList {
+			return "[]" + base
+		}
+		if f.IsOptional {
+			return "*" + base
+		}
+		return base
 	}
 	return goTypeForField(f)
 }
@@ -331,26 +416,26 @@ func (g *Generator) baseImportPath() string {
 		return strings.TrimSuffix(g.modulePath, "/")
 	}
 
-	modulePath := findModulePath()
+	output, err := filepath.Abs(g.output)
+	if err != nil {
+		return ""
+	}
+	modulePath, moduleDir := findModule(output)
 	if modulePath == "" {
 		return ""
 	}
 
-	output := strings.TrimSpace(filepath.ToSlash(filepath.Clean(g.output)))
-	output = strings.TrimPrefix(output, "./")
-	output = strings.TrimPrefix(output, "/")
-	if output == "" || output == "." {
-		return modulePath
-	}
-	return modulePath + "/" + output
-}
-
-func findModulePath() string {
-	dir, err := os.Getwd()
+	rel, err := filepath.Rel(moduleDir, output)
 	if err != nil {
 		return ""
 	}
+	if rel == "." {
+		return modulePath
+	}
+	return modulePath + "/" + filepath.ToSlash(rel)
+}
 
+func findModule(dir string) (modulePath, moduleDir string) {
 	for {
 		data, err := os.ReadFile(filepath.Join(dir, "go.mod"))
 		if err == nil {
@@ -359,7 +444,7 @@ func findModulePath() string {
 				if strings.HasPrefix(line, "module ") {
 					fields := strings.Fields(line)
 					if len(fields) >= 2 {
-						return fields[1]
+						return fields[1], dir
 					}
 				}
 			}
@@ -367,7 +452,7 @@ func findModulePath() string {
 
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return ""
+			return "", ""
 		}
 		dir = parent
 	}

@@ -1523,3 +1523,261 @@ func TestDDLUnsupportedChangeComments(t *testing.T) {
 		t.Fatalf("changeToDown() = %q", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Planner helper edge cases
+// ---------------------------------------------------------------------------
+
+func TestNormalizeReferentialAction(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"  ", ""},
+		{"Cascade", "CASCADE"},
+		{"cascade", "CASCADE"},
+		{"RESTRICT", "RESTRICT"},
+		{"NoAction", "NO ACTION"},
+		{"no_action", "NO ACTION"},
+		{"no action", "NO ACTION"},
+		{"SetNull", "SET NULL"},
+		{"set_null", "SET NULL"},
+		{"SetDefault", "SET DEFAULT"},
+		{"set default", "SET DEFAULT"},
+		{"custom action", "CUSTOM ACTION"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := normalizeReferentialAction(tt.input); got != tt.want {
+				t.Fatalf("normalizeReferentialAction(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDiffForeignKeyNoActionMatchesImplicitDefault(t *testing.T) {
+	user := testModel("User", testField("id", "String"))
+	user.DBName = "users"
+
+	// Introspected schemas spell out NO ACTION; the schema language leaves it implicit.
+	oldPost := testModel("Post", testField("id", "String"), testField("authorId", "String"))
+	oldPost.DBName = "posts"
+	oldRel := testRelation("Post", "User", []string{"authorId"}, []string{"id"})
+	oldRel.OnDelete = "NO ACTION"
+	oldPost.Relations = []*ir.Relation{oldRel}
+
+	newPost := testModel("Post", testField("id", "String"), testField("authorId", "String"))
+	newPost.DBName = "posts"
+	newPost.Relations = []*ir.Relation{testRelation("Post", "User", []string{"authorId"}, []string{"id"})}
+
+	cs := Diff(testSchema(oldPost, user), testSchema(newPost, user))
+	if len(cs.Changes) != 0 {
+		t.Fatalf("implicit NO ACTION should match introspected NO ACTION, got: %+v", cs.Changes)
+	}
+}
+
+func TestCoalesceHelpers(t *testing.T) {
+	if got := coalesce(); got != "" {
+		t.Fatalf("coalesce() = %q, want empty", got)
+	}
+	if got := coalesce("", "", "x", "y"); got != "x" {
+		t.Fatalf("coalesce() = %q, want x", got)
+	}
+
+	if got := coalesceField(); got != nil {
+		t.Fatalf("coalesceField() = %v, want nil", got)
+	}
+	first := testField("a", "Int")
+	if got := coalesceField(nil, first, testField("b", "Int")); got != first {
+		t.Fatalf("coalesceField() = %v, want first non-nil field", got)
+	}
+}
+
+func TestIsCastBoundary(t *testing.T) {
+	if !isCastBoundary("abc", 3) {
+		t.Fatal("isCastBoundary at end of string should be true")
+	}
+	if isCastBoundary("abc", 0) {
+		t.Fatal("isCastBoundary on a letter should be false")
+	}
+	if isCastBoundary("_x", 0) {
+		t.Fatal("isCastBoundary on underscore should be false")
+	}
+	if !isCastBoundary("(x", 0) {
+		t.Fatal("isCastBoundary on '(' should be true")
+	}
+}
+
+func TestPostgresCastTypeEndCharacterVarying(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int
+	}{
+		{"character varying", len("character varying")},
+		{"character varying(10)", len("character varying(10)")},
+		{"character varyingx", len("character")}, // no boundary: falls back to identifier scan
+		{"varchar(10)", len("varchar(10)")},
+		{"numeric(10,2)[]", len("numeric(10,2)[]")},
+		{"pg_catalog.text", len("pg_catalog.text")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := postgresCastTypeEnd(tt.input, 0); got != tt.want {
+				t.Fatalf("postgresCastTypeEnd(%q) = %d, want %d", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeIndexPredicateStripsCharacterVaryingCastWithLength(t *testing.T) {
+	got := normalizeIndexPredicate(`name = 'x'::character varying(10)`)
+	want := `name = 'x'`
+	if got != want {
+		t.Fatalf("normalizeIndexPredicate() = %q, want %q", got, want)
+	}
+}
+
+func TestMatchingParenIndex(t *testing.T) {
+	tests := []struct {
+		input string
+		start int
+		want  int
+	}{
+		{"(a(b)c)", 0, 6},
+		{"(a", 0, -1},
+		{"(')')", 0, 4},  // paren inside string literal is ignored
+		{`(")")x`, 0, 4}, // paren inside quoted identifier is ignored
+		{"(a)(b)", 0, 2}, // stops at first balanced close
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := matchingParenIndex(tt.input, tt.start); got != tt.want {
+				t.Fatalf("matchingParenIndex(%q, %d) = %d, want %d", tt.input, tt.start, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTopoSortTables(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		if got := topoSortTables(testSchema(), nil); got != nil {
+			t.Fatalf("topoSortTables(empty) = %v, want nil", got)
+		}
+	})
+
+	t.Run("nil schema sorts alphabetically", func(t *testing.T) {
+		got := topoSortTables(nil, []string{"b", "a"})
+		if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+			t.Fatalf("topoSortTables(nil schema) = %v", got)
+		}
+	})
+
+	t.Run("cycle keeps all tables", func(t *testing.T) {
+		a := testModel("A", testField("id", "Int"), testField("bId", "Int"))
+		a.Relations = []*ir.Relation{testRelation("A", "B", []string{"bId"}, []string{"id"})}
+		b := testModel("B", testField("id", "Int"), testField("aId", "Int"))
+		b.Relations = []*ir.Relation{testRelation("B", "A", []string{"aId"}, []string{"id"})}
+
+		got := topoSortTables(testSchema(a, b), []string{"A", "B"})
+		if len(got) != 2 {
+			t.Fatalf("topoSortTables(cycle) = %v, want both tables", got)
+		}
+	})
+
+	t.Run("self reference ignored", func(t *testing.T) {
+		m := testModel("Node", testField("id", "Int"), testField("parentId", "Int"))
+		m.Relations = []*ir.Relation{testRelation("Node", "Node", []string{"parentId"}, []string{"id"})}
+
+		got := topoSortTables(testSchema(m), []string{"Node"})
+		if len(got) != 1 || got[0] != "Node" {
+			t.Fatalf("topoSortTables(self reference) = %v", got)
+		}
+	})
+}
+
+func TestFormatDefault(t *testing.T) {
+	tests := []struct {
+		name  string
+		input *ir.DefaultValue
+		want  string
+	}{
+		{"nil", nil, ""},
+		{"array", &ir.DefaultValue{IsArray: true, ArrayValue: []string{"a", "b"}}, "[a,b]"},
+		{"function with args", &ir.DefaultValue{IsFunction: true, FuncName: "nextval", FuncArgs: []string{"seq", "1"}}, "nextval(seq,1)"},
+		{"function no args", &ir.DefaultValue{IsFunction: true, FuncName: "now"}, "now()"},
+		{"plain value", &ir.DefaultValue{Value: "42"}, "42"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatDefault(tt.input); got != tt.want {
+				t.Fatalf("formatDefault() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSplitIndexExpressions(t *testing.T) {
+	if got := splitIndexExpressions(""); got != nil {
+		t.Fatalf("splitIndexExpressions(empty) = %v, want nil", got)
+	}
+	if got := splitIndexExpressions(`["lower(email)", "upper(name)"]`); len(got) != 2 || got[0] != "lower(email)" || got[1] != "upper(name)" {
+		t.Fatalf("splitIndexExpressions(json) = %v", got)
+	}
+	if got := splitIndexExpressions("a,b"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("splitIndexExpressions(csv) = %v", got)
+	}
+	// Malformed JSON falls back to comma splitting.
+	if got := splitIndexExpressions(`["unclosed`); len(got) != 1 || got[0] != `["unclosed` {
+		t.Fatalf("splitIndexExpressions(malformed json) = %v", got)
+	}
+}
+
+func TestEffectiveIndexNameNil(t *testing.T) {
+	if got := effectiveIndexName(testModel("User"), nil); got != "" {
+		t.Fatalf("effectiveIndexName(nil) = %q, want empty", got)
+	}
+}
+
+func TestDDLChangeToUpByChangeType(t *testing.T) {
+	user := testModel("users", testField("id", "Int"), testField("email", "String"))
+	cs := &Changeset{New: testSchema(user)}
+	gen := DDLGenerator{Dialect: "postgresql", Schema: cs.New}
+
+	tests := []struct {
+		name   string
+		change Change
+		want   string
+	}{
+		{"drop table", Change{Type: DropTable, Model: "users"}, `DROP TABLE "users";`},
+		{"add column with field", Change{Type: AddColumn, Model: "users", Field: "email", NewValue: "String"}, `ALTER TABLE "users" ADD COLUMN "email" TEXT NOT NULL;`},
+		{"add column without field", Change{Type: AddColumn, Model: "users", Field: "ghost", NewValue: "Int"}, `ALTER TABLE "users" ADD COLUMN "ghost" INTEGER;`},
+		{"drop column", Change{Type: DropColumn, Model: "users", Field: "email"}, `ALTER TABLE "users" DROP COLUMN "email";`},
+		{"change pk", Change{Type: ChangePK, Model: "users", OldValue: "id", NewValue: "email"}, `ALTER TABLE "users" ADD PRIMARY KEY ("email");`},
+		{"add fk", Change{Type: AddFK, Model: "users", Details: map[string]string{"fields": "email", "references": "id", "toModel": "others"}}, `ALTER TABLE "users" ADD CONSTRAINT "fk_users_email" FOREIGN KEY ("email") REFERENCES "others" ("id");`},
+		{"create enum", Change{Type: CreateEnum, Model: "Role"}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := gen.changeToUp(tt.change, cs)
+			if tt.want == "" {
+				if got != "" {
+					t.Fatalf("changeToUp() = %q, want empty", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tt.want) {
+				t.Fatalf("changeToUp() = %q, want substring %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDDLDefaultExprBooleanLiterals(t *testing.T) {
+	gen := DDLGenerator{Dialect: "postgresql"}
+	for _, val := range []string{"true", "false"} {
+		if got := gen.defaultExpr(val); got != val {
+			t.Fatalf("defaultExpr(%q) = %q, want passthrough", val, got)
+		}
+	}
+}

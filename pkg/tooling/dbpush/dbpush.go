@@ -254,7 +254,7 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 
 	gen := migrate.DDLGenerator{Dialect: provider, Schema: targetSchema}
 	sqlText := gen.GenerateUp(cs)
-	stmts, unsupported := splitStatements(sqlText)
+	stmts, unsupported := splitStatements(sqlText, provider)
 	if len(unsupported) > 0 {
 		return nil, fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
 	}
@@ -341,7 +341,7 @@ func pushCompiledMySQL(ctx context.Context, db *sql.DB, targetSchema *ir.Schema,
 
 	gen := migrate.DDLGenerator{Dialect: "mysql", Schema: targetSchema}
 	sqlText := gen.GenerateUp(cs)
-	stmts, unsupported := splitStatements(sqlText)
+	stmts, unsupported := splitStatements(sqlText, "mysql")
 	if len(unsupported) > 0 {
 		return nil, fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
 	}
@@ -387,7 +387,7 @@ func planWithoutIntrospection(targetSchema *ir.Schema, schemaHash string) (*Resu
 	}
 
 	gen := migrate.DDLGenerator{Dialect: provider, Schema: targetSchema}
-	stmts, unsupported := splitStatements(gen.GenerateUp(cs))
+	stmts, unsupported := splitStatements(gen.GenerateUp(cs), provider)
 	if len(unsupported) > 0 {
 		return nil, fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
 	}
@@ -719,13 +719,13 @@ func statementSummary(stmt string) string {
 	return summary
 }
 
-func splitStatements(sqlText string) ([]string, []string) {
-	parts := splitSQLStatements(sqlText)
+func splitStatements(sqlText, dialect string) ([]string, []string) {
+	parts := splitSQLStatements(sqlText, dialect)
 	stmts := make([]string, 0, len(parts))
 	var unsupported []string
 
 	for _, part := range parts {
-		cleaned, comments := stripTopLevelSQLComments(part)
+		cleaned, comments := stripTopLevelSQLComments(part, dialect)
 		unsupported = append(unsupported, comments...)
 		stmt := strings.TrimSpace(cleaned)
 		if stmt != "" {
@@ -736,11 +736,12 @@ func splitStatements(sqlText string) ([]string, []string) {
 	return stmts, unsupported
 }
 
-func splitSQLStatements(sqlText string) []string {
+func splitSQLStatements(sqlText, dialect string) []string {
 	var parts []string
 	var b strings.Builder
 	state := "normal"
 	dollarTag := ""
+	singleEscape := false
 
 	for i := 0; i < len(sqlText); i++ {
 		c := sqlText[i]
@@ -748,7 +749,7 @@ func splitSQLStatements(sqlText string) []string {
 		switch state {
 		case "single":
 			b.WriteByte(c)
-			if c == '\\' && i+1 < len(sqlText) {
+			if singleEscape && c == '\\' && i+1 < len(sqlText) {
 				i++
 				b.WriteByte(sqlText[i])
 				continue
@@ -763,7 +764,7 @@ func splitSQLStatements(sqlText string) []string {
 			}
 		case "double":
 			b.WriteByte(c)
-			if c == '\\' && i+1 < len(sqlText) {
+			if dialect == "mysql" && c == '\\' && i+1 < len(sqlText) {
 				i++
 				b.WriteByte(sqlText[i])
 				continue
@@ -815,6 +816,7 @@ func splitSQLStatements(sqlText string) []string {
 			case c == '\'':
 				b.WriteByte(c)
 				state = "single"
+				singleEscape = sqlStringBackslashEscapes(sqlText, i, dialect)
 			case c == '"':
 				b.WriteByte(c)
 				state = "double"
@@ -853,11 +855,12 @@ func splitSQLStatements(sqlText string) []string {
 	return parts
 }
 
-func stripTopLevelSQLComments(sqlText string) (string, []string) {
+func stripTopLevelSQLComments(sqlText, dialect string) (string, []string) {
 	var b strings.Builder
 	var unsupported []string
 	state := "normal"
 	dollarTag := ""
+	singleEscape := false
 
 	for i := 0; i < len(sqlText); i++ {
 		c := sqlText[i]
@@ -865,7 +868,7 @@ func stripTopLevelSQLComments(sqlText string) (string, []string) {
 		switch state {
 		case "single":
 			b.WriteByte(c)
-			if c == '\\' && i+1 < len(sqlText) {
+			if singleEscape && c == '\\' && i+1 < len(sqlText) {
 				i++
 				b.WriteByte(sqlText[i])
 				continue
@@ -880,7 +883,7 @@ func stripTopLevelSQLComments(sqlText string) (string, []string) {
 			}
 		case "double":
 			b.WriteByte(c)
-			if c == '\\' && i+1 < len(sqlText) {
+			if dialect == "mysql" && c == '\\' && i+1 < len(sqlText) {
 				i++
 				b.WriteByte(sqlText[i])
 				continue
@@ -922,6 +925,7 @@ func stripTopLevelSQLComments(sqlText string) (string, []string) {
 			case c == '\'':
 				b.WriteByte(c)
 				state = "single"
+				singleEscape = sqlStringBackslashEscapes(sqlText, i, dialect)
 			case c == '"':
 				b.WriteByte(c)
 				state = "double"
@@ -961,6 +965,24 @@ func stripTopLevelSQLComments(sqlText string) (string, []string) {
 	}
 
 	return b.String(), unsupported
+}
+
+// sqlStringBackslashEscapes reports whether a string literal opened at
+// sqlText[i] (a single quote) treats backslash as an escape character.
+// MySQL string literals do by default; in standard SQL only PostgreSQL
+// escape strings (E'...') give backslash escape semantics.
+func sqlStringBackslashEscapes(sqlText string, quoteIdx int, dialect string) bool {
+	if dialect == "mysql" {
+		return true
+	}
+	if quoteIdx < 1 || (sqlText[quoteIdx-1] != 'e' && sqlText[quoteIdx-1] != 'E') {
+		return false
+	}
+	return quoteIdx < 2 || !isSQLIdentChar(sqlText[quoteIdx-2])
+}
+
+func isSQLIdentChar(c byte) bool {
+	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 }
 
 func readDollarQuoteTag(s string) string {
@@ -1410,15 +1432,31 @@ func postgresNativeTypeMatches(formatted string, native *ir.NativeType, isList b
 	case "uuid":
 		expected = "uuid"
 	}
-	if len(native.Args) > 0 {
-		expected += "(" + strings.Join(native.Args, ",") + ")"
-	}
-	if isList {
-		expected += "[]"
-	}
 	actual := strings.ToLower(strings.TrimSpace(formatted))
 	actual = strings.ReplaceAll(actual, ", ", ",")
-	return actual == expected
+	// format_type places type modifiers between the base name and any
+	// trailing qualifiers, e.g. "timestamp(6) without time zone".
+	actualBase, actualArgs, actualIsList := splitPostgresFormattedTypeArgs(actual)
+	if actualBase != expected || actualIsList != isList {
+		return false
+	}
+	return actualArgs == strings.Join(native.Args, ",")
+}
+
+func splitPostgresFormattedTypeArgs(formatted string) (base, args string, isList bool) {
+	s := strings.TrimSpace(formatted)
+	for strings.HasSuffix(s, "[]") {
+		isList = true
+		s = strings.TrimSpace(strings.TrimSuffix(s, "[]"))
+	}
+	if start := strings.Index(s, "("); start >= 0 {
+		if relEnd := strings.Index(s[start:], ")"); relEnd > 0 {
+			end := start + relEnd
+			args = s[start+1 : end]
+			s = strings.Join(strings.Fields(s[:start]+" "+s[end+1:]), " ")
+		}
+	}
+	return s, args, isList
 }
 
 func loadPostgresPrimaryKeys(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
@@ -2190,11 +2228,14 @@ func loadSQLiteIndexColumns(ctx context.Context, db sqlRunner, indexName string)
 	var fields []string
 	for rows.Next() {
 		var seqno, cid int
-		var columnName string
+		var columnName sql.NullString
 		if err := rows.Scan(&seqno, &cid, &columnName); err != nil {
 			return nil, err
 		}
-		fields = append(fields, columnName)
+		if !columnName.Valid {
+			return nil, fmt.Errorf("SQLite expression index %q is not supported; cannot safely plan schema changes", indexName)
+		}
+		fields = append(fields, columnName.String)
 	}
 	return fields, rows.Err()
 }
@@ -2264,6 +2305,10 @@ func postgresNativeType(formatted, scalar string) *ir.NativeType {
 		name = "VarChar"
 	case strings.HasPrefix(lower, "numeric("):
 		name = "Decimal"
+	case strings.HasPrefix(lower, "timestamp(") && strings.Contains(lower, "without time zone"):
+		name = "Timestamp"
+	case strings.HasPrefix(lower, "timestamp(") && strings.Contains(lower, "with time zone"):
+		name = "Timestamptz"
 	case lower == "text" && scalar == "String":
 		return nil
 	default:
@@ -2318,17 +2363,18 @@ func postgresDefaultValue(def string, isIdentity bool) *ir.DefaultValue {
 		return nil
 	}
 	lower := strings.ToLower(def)
+	quotedLiteral := isSQLQuotedLiteralDefault(lower)
 	switch {
-	case strings.Contains(lower, "nextval("):
+	case !quotedLiteral && strings.Contains(lower, "nextval("):
 		return &ir.DefaultValue{IsFunction: true, FuncName: "autoincrement"}
-	case strings.Contains(lower, "uuid"):
+	case !quotedLiteral && (containsSQLFunctionCall(lower, "gen_random_uuid") || containsSQLFunctionCall(lower, "uuid_generate")):
 		return &ir.DefaultValue{IsFunction: true, FuncName: "uuid"}
-	case strings.Contains(lower, "now()"), strings.Contains(lower, "current_timestamp"):
+	case !quotedLiteral && (strings.Contains(lower, "now()") || strings.Contains(lower, "current_timestamp")):
 		return &ir.DefaultValue{IsFunction: true, FuncName: "now"}
 	case strings.HasPrefix(lower, "'{}'::") && postgresDefaultCastIsArray(lower):
 		return &ir.DefaultValue{IsArray: true}
 	case strings.HasPrefix(lower, "'{") && strings.Contains(lower, "}'::") && strings.HasSuffix(lower, "[]"):
-		return &ir.DefaultValue{IsArray: true, ArrayValue: parsePostgresTextArray(strings.Trim(def[:strings.Index(def, "::")], "'"))}
+		return &ir.DefaultValue{IsArray: true, ArrayValue: parsePostgresTextArray(strings.Trim(def[:indexPostgresCastOutsideQuotes(def)], "'"))}
 	case strings.HasPrefix(lower, "array["):
 		return &ir.DefaultValue{IsArray: true, ArrayValue: parsePostgresArrayDefault(def)}
 	default:
@@ -2338,11 +2384,86 @@ func postgresDefaultValue(def string, isIdentity bool) *ir.DefaultValue {
 }
 
 func postgresDefaultCastIsArray(def string) bool {
-	castIdx := strings.Index(def, "::")
+	castIdx := indexPostgresCastOutsideQuotes(def)
 	if castIdx < 0 {
 		return false
 	}
 	return strings.HasSuffix(strings.TrimSpace(def[castIdx+len("::"):]), "[]")
+}
+
+// isSQLQuotedLiteralDefault reports whether def is a quoted string literal,
+// optionally followed by a PostgreSQL ::cast, e.g. 'uuid-v1'::text.
+func isSQLQuotedLiteralDefault(def string) bool {
+	def = strings.TrimSpace(def)
+	if !strings.HasPrefix(def, "'") {
+		return false
+	}
+	i := 1
+	for i < len(def) {
+		if def[i] == '\'' {
+			if i+1 < len(def) && def[i+1] == '\'' {
+				i += 2
+				continue
+			}
+			i++
+			break
+		}
+		i++
+	}
+	rest := strings.TrimSpace(def[i:])
+	return rest == "" || strings.HasPrefix(rest, "::")
+}
+
+// containsSQLFunctionCall reports whether lower contains a call to a function
+// whose name is fn or starts with fn (e.g. fn "uuid" matches "uuid(" and
+// "uuid_generate_v4(", but not the literal "uuid-v1").
+func containsSQLFunctionCall(lower, fn string) bool {
+	for start := 0; start < len(lower); {
+		idx := strings.Index(lower[start:], fn)
+		if idx < 0 {
+			return false
+		}
+		idx += start
+		if idx > 0 && isSQLIdentChar(lower[idx-1]) {
+			start = idx + len(fn)
+			continue
+		}
+		j := idx + len(fn)
+		for j < len(lower) && isSQLIdentChar(lower[j]) {
+			j++
+		}
+		if j < len(lower) && lower[j] == '(' {
+			return true
+		}
+		start = idx + len(fn)
+	}
+	return false
+}
+
+// indexPostgresCastOutsideQuotes returns the index of the first :: cast
+// operator that is not inside a single-quoted string literal.
+func indexPostgresCastOutsideQuotes(def string) int {
+	inString := false
+	for i := 0; i < len(def); i++ {
+		c := def[i]
+		if inString {
+			if c == '\'' {
+				if i+1 < len(def) && def[i+1] == '\'' {
+					i++
+					continue
+				}
+				inString = false
+			}
+			continue
+		}
+		switch {
+		case c == '\'':
+			inString = true
+		case c == ':' && i+1 < len(def) && def[i+1] == ':':
+			return i
+		}
+	}
+	return -1
 }
 
 func parsePostgresArrayDefault(def string) []string {
@@ -2399,7 +2520,7 @@ func splitPostgresArrayDefaultElements(body string) []string {
 
 func normalizePostgresLiteralDefault(def string) string {
 	def = strings.TrimSpace(def)
-	if idx := strings.Index(def, "::"); idx >= 0 {
+	if idx := indexPostgresCastOutsideQuotes(def); idx >= 0 {
 		def = strings.TrimSpace(def[:idx])
 	}
 	if len(def) >= 2 && def[0] == '\'' && def[len(def)-1] == '\'' {
@@ -2413,7 +2534,7 @@ func mysqlScalarType(dataType, columnType string) string {
 	upperType := strings.ToUpper(strings.TrimSpace(dataType))
 	upperColumn := strings.ToUpper(strings.TrimSpace(columnType))
 	switch {
-	case strings.Contains(upperColumn, "CHAR(36)"):
+	case upperColumn == "CHAR(36)":
 		return "UUID"
 	case strings.Contains(upperType, "BIGINT"):
 		return "BigInt"
@@ -2477,15 +2598,18 @@ func mysqlDefaultValue(def, extra string) *ir.DefaultValue {
 	if def == "" {
 		return nil
 	}
-	lower := strings.ToLower(def)
-	switch {
-	case strings.Contains(lower, "uuid"):
-		return &ir.DefaultValue{IsFunction: true, FuncName: "uuid"}
-	case strings.Contains(lower, "current_timestamp"), strings.Contains(lower, "now()"):
-		return &ir.DefaultValue{IsFunction: true, FuncName: "now"}
-	default:
-		return literalDefaultValue(def)
+	lower := strings.ToLower(trimDefaultParens(def))
+	// COLUMN_DEFAULT omits quotes around string literals; EXTRA identifies
+	// expression defaults even when their text is identical to a literal.
+	if strings.Contains(extra, "default_generated") && !isSQLQuotedLiteralDefault(lower) {
+		switch {
+		case containsSQLFunctionCall(lower, "uuid"):
+			return &ir.DefaultValue{IsFunction: true, FuncName: "uuid"}
+		case containsSQLFunctionCall(lower, "now"), containsSQLFunctionCall(lower, "current_timestamp"), lower == "current_timestamp":
+			return &ir.DefaultValue{IsFunction: true, FuncName: "now"}
+		}
 	}
+	return literalDefaultValue(def)
 }
 
 func sqliteScalarType(dataType string) string {

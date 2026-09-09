@@ -693,3 +693,653 @@ func TestModelScalarFields(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 15. ResolveError formatting
+// ---------------------------------------------------------------------------
+
+func TestResolveErrorString(t *testing.T) {
+	withPos := &ResolveError{Message: "boom", Pos: ast.Position{File: "schema.gcorm", Line: 3, Column: 7}}
+	if got, want := withPos.Error(), "schema.gcorm:3:7: boom"; got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+
+	noPos := &ResolveError{Message: "boom"}
+	if got := noPos.Error(); got != "boom" {
+		t.Errorf("Error() = %q, want %q", got, "boom")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 16. Datasource: plain URL, schemas list, empty env()
+// ---------------------------------------------------------------------------
+
+func TestResolveDatasourcePlainURLAndSchemas(t *testing.T) {
+	ds := docSet(&ast.Document{
+		Datasources: []ast.DatasourceDecl{{
+			Name: "db",
+			Entries: []ast.ConfigEntry{
+				{Key: "provider", Value: ast.StringLiteral{Value: "postgresql"}},
+				{Key: "url", Value: ast.StringLiteral{Value: "postgresql://localhost/db"}},
+				{Key: "schemas", Value: ast.ArrayLiteral{Elements: []ast.Expression{
+					ast.StringLiteral{Value: "public"},
+					ast.StringLiteral{Value: "billing"},
+				}}},
+				{Key: "unknownKey", Value: ast.StringLiteral{Value: "ignored"}},
+			},
+		}},
+		Models: []ast.ModelDecl{{Name: "Dummy", Fields: []ast.FieldDecl{
+			{Name: "id", Type: ast.FieldType{Name: "Int"}},
+		}}},
+	})
+
+	schema, errs := Resolve(ds)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	d := schema.Datasource
+	if d.URLIsEnv {
+		t.Error("expected URLIsEnv = false for plain url")
+	}
+	if d.URL != "postgresql://localhost/db" {
+		t.Errorf("url = %q", d.URL)
+	}
+	if len(d.Schemas) != 2 || d.Schemas[0] != "public" || d.Schemas[1] != "billing" {
+		t.Errorf("schemas = %v", d.Schemas)
+	}
+}
+
+func TestResolveDatasourceEnvWithoutArgs(t *testing.T) {
+	ds := docSet(&ast.Document{
+		Datasources: []ast.DatasourceDecl{{
+			Name: "db",
+			Entries: []ast.ConfigEntry{
+				{Key: "url", Value: ast.FunctionCall{Name: "env"}},
+			},
+		}},
+		Models: []ast.ModelDecl{{Name: "Dummy", Fields: []ast.FieldDecl{
+			{Name: "id", Type: ast.FieldType{Name: "Int"}},
+		}}},
+	})
+
+	schema, errs := Resolve(ds)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	d := schema.Datasource
+	if !d.URLIsEnv {
+		t.Error("expected URLIsEnv = true")
+	}
+	if d.EnvVar != "" || d.URL != "" {
+		t.Errorf("envVar = %q, url = %q, want both empty", d.EnvVar, d.URL)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 17. Model-level @@map and @@schema
+// ---------------------------------------------------------------------------
+
+func TestResolveModelMapAndSchema(t *testing.T) {
+	ds := docSet(&ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "User",
+			Fields: []ast.FieldDecl{
+				{Name: "id", Type: ast.FieldType{Name: "Int"}},
+			},
+			Attributes: []ast.Attribute{
+				{Name: "map", IsModelLevel: true, Args: []ast.AttributeArg{
+					{Value: ast.StringLiteral{Value: "users"}},
+				}},
+				{Name: "schema", IsModelLevel: true, Args: []ast.AttributeArg{
+					{Value: ast.StringLiteral{Value: "app"}},
+				}},
+			},
+		}},
+	})
+
+	schema, errs := Resolve(ds)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	m := schema.Models[0]
+	if m.DBName != "users" {
+		t.Errorf("DBName = %q, want %q", m.DBName, "users")
+	}
+	if m.Schema != "app" {
+		t.Errorf("Schema = %q, want %q", m.Schema, "app")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 18. @@unique without expression -> UniqueConstraint
+// ---------------------------------------------------------------------------
+
+func TestResolveUniqueConstraint(t *testing.T) {
+	ds := docSet(&ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "Membership",
+			Fields: []ast.FieldDecl{
+				{Name: "userId", Type: ast.FieldType{Name: "Int"}},
+				{Name: "teamId", Type: ast.FieldType{Name: "Int"}},
+			},
+			Attributes: []ast.Attribute{
+				{Name: "unique", IsModelLevel: true, Args: []ast.AttributeArg{
+					{Name: "fields", Value: ast.ArrayLiteral{Elements: []ast.Expression{
+						ast.Identifier{Name: "userId"},
+						ast.Identifier{Name: "teamId"},
+					}}},
+					{Name: "name", Value: ast.StringLiteral{Value: "uq_membership"}},
+				}},
+			},
+		}},
+	})
+
+	schema, errs := Resolve(ds)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	m := schema.Models[0]
+	if len(m.Indexes) != 0 {
+		t.Fatalf("expected 0 indexes, got %d", len(m.Indexes))
+	}
+	if len(m.UniqueConstraints) != 1 {
+		t.Fatalf("expected 1 unique constraint, got %d", len(m.UniqueConstraints))
+	}
+	uq := m.UniqueConstraints[0]
+	if uq.Name != "uq_membership" {
+		t.Errorf("unique name = %q", uq.Name)
+	}
+	if len(uq.Fields) != 2 || uq.Fields[0] != "userId" || uq.Fields[1] != "teamId" {
+		t.Errorf("unique fields = %v", uq.Fields)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 19. Field attributes: @unique, @updatedAt, @db.*, arg-less attributes
+// ---------------------------------------------------------------------------
+
+func TestResolveFieldAttributes(t *testing.T) {
+	ds := docSet(&ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "User",
+			Fields: []ast.FieldDecl{
+				{
+					Name: "email",
+					Type: ast.FieldType{Name: "String"},
+					Attributes: []ast.Attribute{
+						{Name: "unique"},
+						{Name: "db.VarChar", Args: []ast.AttributeArg{
+							{Value: ast.NumberLiteral{Value: "255"}},
+						}},
+					},
+				},
+				{
+					Name: "updatedAt",
+					Type: ast.FieldType{Name: "DateTime"},
+					Attributes: []ast.Attribute{
+						{Name: "updatedAt"},
+					},
+				},
+				{
+					Name: "nick",
+					Type: ast.FieldType{Name: "String"},
+					Attributes: []ast.Attribute{
+						// Arg-less @map and @default must be no-ops.
+						{Name: "map"},
+						{Name: "default"},
+					},
+				},
+			},
+		}},
+	})
+
+	schema, errs := Resolve(ds)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	fields := schema.Models[0].Fields
+
+	email := fields[0]
+	if !email.IsUnique {
+		t.Error("expected email IsUnique = true")
+	}
+	if email.NativeType == nil {
+		t.Fatal("expected NativeType on email")
+	}
+	if email.NativeType.Name != "VarChar" {
+		t.Errorf("native type name = %q", email.NativeType.Name)
+	}
+	if len(email.NativeType.Args) != 1 || email.NativeType.Args[0] != "255" {
+		t.Errorf("native type args = %v", email.NativeType.Args)
+	}
+
+	if !fields[1].IsUpdatedAt {
+		t.Error("expected updatedAt IsUpdatedAt = true")
+	}
+
+	nick := fields[2]
+	if nick.DBName != "" {
+		t.Errorf("expected empty DBName for arg-less @map, got %q", nick.DBName)
+	}
+	if nick.Default != nil {
+		t.Errorf("expected nil Default for arg-less @default, got %+v", nick.Default)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 20. Default value resolution across literal kinds
+// ---------------------------------------------------------------------------
+
+func TestResolveDefaultKinds(t *testing.T) {
+	cases := []struct {
+		name  string
+		expr  ast.Expression
+		check func(t *testing.T, dv *ir.DefaultValue)
+	}{
+		{
+			name: "string literal",
+			expr: ast.StringLiteral{Value: "hello"},
+			check: func(t *testing.T, dv *ir.DefaultValue) {
+				if !dv.IsString || dv.Value != "hello" {
+					t.Errorf("default = %+v", dv)
+				}
+			},
+		},
+		{
+			name: "number literal",
+			expr: ast.NumberLiteral{Value: "42"},
+			check: func(t *testing.T, dv *ir.DefaultValue) {
+				if !dv.IsNumber || dv.Value != "42" {
+					t.Errorf("default = %+v", dv)
+				}
+			},
+		},
+		{
+			name: "boolean literal",
+			expr: ast.BooleanLiteral{Value: true},
+			check: func(t *testing.T, dv *ir.DefaultValue) {
+				if !dv.IsBool || dv.Value != "true" {
+					t.Errorf("default = %+v", dv)
+				}
+			},
+		},
+		{
+			name: "identifier (enum value)",
+			expr: ast.Identifier{Name: "ADMIN"},
+			check: func(t *testing.T, dv *ir.DefaultValue) {
+				if dv.Value != "ADMIN" || dv.IsFunction || dv.IsString {
+					t.Errorf("default = %+v", dv)
+				}
+			},
+		},
+		{
+			name: "function with args",
+			expr: ast.FunctionCall{Name: "dbgenerated", Args: []ast.Expression{
+				ast.StringLiteral{Value: "gen_random_uuid()"},
+			}},
+			check: func(t *testing.T, dv *ir.DefaultValue) {
+				if !dv.IsFunction || dv.FuncName != "dbgenerated" {
+					t.Errorf("default = %+v", dv)
+				}
+				if len(dv.FuncArgs) != 1 || dv.FuncArgs[0] != "gen_random_uuid()" {
+					t.Errorf("func args = %v", dv.FuncArgs)
+				}
+			},
+		},
+		{
+			name: "array literal with elements",
+			expr: ast.ArrayLiteral{Elements: []ast.Expression{
+				ast.StringLiteral{Value: "a"},
+				ast.StringLiteral{Value: "b"},
+			}},
+			check: func(t *testing.T, dv *ir.DefaultValue) {
+				if !dv.IsArray {
+					t.Errorf("default = %+v", dv)
+				}
+				if len(dv.ArrayValue) != 2 || dv.ArrayValue[0] != "a" || dv.ArrayValue[1] != "b" {
+					t.Errorf("array value = %v", dv.ArrayValue)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ds := docSet(&ast.Document{
+				Models: []ast.ModelDecl{{
+					Name: "T",
+					Fields: []ast.FieldDecl{{
+						Name: "v",
+						Type: ast.FieldType{Name: "String"},
+						Attributes: []ast.Attribute{{
+							Name: "default",
+							Args: []ast.AttributeArg{{Value: tc.expr}},
+						}},
+					}},
+				}},
+			})
+			schema, errs := Resolve(ds)
+			if len(errs) > 0 {
+				t.Fatalf("unexpected errors: %v", errs)
+			}
+			dv := schema.Models[0].Fields[0].Default
+			if dv == nil {
+				t.Fatal("expected Default")
+			}
+			tc.check(t, dv)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 21. Relation variants: OneToOne, name, onDelete/onUpdate
+// ---------------------------------------------------------------------------
+
+func TestResolveRelationVariants(t *testing.T) {
+	ds := docSet(&ast.Document{
+		Models: []ast.ModelDecl{
+			{
+				Name: "Profile",
+				Fields: []ast.FieldDecl{
+					{Name: "id", Type: ast.FieldType{Name: "Int"}},
+					{Name: "userId", Type: ast.FieldType{Name: "Int"}},
+					{
+						Name: "user",
+						Type: ast.FieldType{Name: "User"},
+						Attributes: []ast.Attribute{{
+							Name: "relation",
+							Args: []ast.AttributeArg{
+								{Value: ast.StringLiteral{Value: "UserProfile"}},
+								{Name: "fields", Value: ast.ArrayLiteral{Elements: []ast.Expression{ast.Identifier{Name: "userId"}}}},
+								{Name: "references", Value: ast.ArrayLiteral{Elements: []ast.Expression{ast.Identifier{Name: "id"}}}},
+								{Name: "onDelete", Value: ast.Identifier{Name: "Cascade"}},
+								{Name: "onUpdate", Value: ast.Identifier{Name: "NoAction"}},
+							},
+						}},
+					},
+				},
+			},
+			{
+				Name: "User",
+				Fields: []ast.FieldDecl{
+					{Name: "id", Type: ast.FieldType{Name: "Int"}},
+					// Optional back-reference -> OneToOne; non-relation attrs ignored.
+					{
+						Name:       "profile",
+						Type:       ast.FieldType{Name: "Profile", IsOptional: true},
+						Attributes: []ast.Attribute{{Name: "unique"}},
+					},
+				},
+			},
+		},
+	})
+
+	schema, errs := Resolve(ds)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	profile := schema.Models[0]
+	rel := profile.Relations[0]
+	if rel.Name != "UserProfile" {
+		t.Errorf("relation name = %q", rel.Name)
+	}
+	if rel.OnDelete != "Cascade" {
+		t.Errorf("onDelete = %q", rel.OnDelete)
+	}
+	if rel.OnUpdate != "NoAction" {
+		t.Errorf("onUpdate = %q", rel.OnUpdate)
+	}
+	if rel.Type != ir.RelationManyToOne {
+		t.Errorf("expected ManyToOne, got %v", rel.Type)
+	}
+
+	user := schema.Models[1]
+	if len(user.Relations) != 1 {
+		t.Fatalf("expected 1 relation on User, got %d", len(user.Relations))
+	}
+	if user.Relations[0].Type != ir.RelationOneToOne {
+		t.Errorf("expected OneToOne, got %v", user.Relations[0].Type)
+	}
+}
+
+func TestResolveRelationNameKeyword(t *testing.T) {
+	ds := docSet(&ast.Document{
+		Models: []ast.ModelDecl{
+			{
+				Name: "Post",
+				Fields: []ast.FieldDecl{
+					{Name: "id", Type: ast.FieldType{Name: "Int"}},
+					{
+						Name: "author",
+						Type: ast.FieldType{Name: "User"},
+						Attributes: []ast.Attribute{{
+							Name: "relation",
+							Args: []ast.AttributeArg{
+								{Name: "name", Value: ast.StringLiteral{Value: "PostAuthor"}},
+							},
+						}},
+					},
+				},
+			},
+			{
+				Name:   "User",
+				Fields: []ast.FieldDecl{{Name: "id", Type: ast.FieldType{Name: "Int"}}},
+			},
+		},
+	})
+
+	schema, errs := Resolve(ds)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if got := schema.Models[0].Relations[0].Name; got != "PostAuthor" {
+		t.Errorf("relation name = %q, want %q", got, "PostAuthor")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 22. Self-referencing model (circular reference resolves fine)
+// ---------------------------------------------------------------------------
+
+func TestResolveSelfReference(t *testing.T) {
+	ds := docSet(&ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "Category",
+			Fields: []ast.FieldDecl{
+				{Name: "id", Type: ast.FieldType{Name: "Int"}},
+				{Name: "parentId", Type: ast.FieldType{Name: "Int", IsOptional: true}},
+				{
+					Name: "parent",
+					Type: ast.FieldType{Name: "Category", IsOptional: true},
+					Attributes: []ast.Attribute{{
+						Name: "relation",
+						Args: []ast.AttributeArg{
+							{Name: "fields", Value: ast.ArrayLiteral{Elements: []ast.Expression{ast.Identifier{Name: "parentId"}}}},
+							{Name: "references", Value: ast.ArrayLiteral{Elements: []ast.Expression{ast.Identifier{Name: "id"}}}},
+						},
+					}},
+				},
+				{Name: "children", Type: ast.FieldType{Name: "Category", IsList: true}},
+			},
+		}},
+	})
+
+	schema, errs := Resolve(ds)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	m := schema.Models[0]
+	if len(m.Relations) != 2 {
+		t.Fatalf("expected 2 relations, got %d", len(m.Relations))
+	}
+	if m.Relations[0].FromModel != "Category" || m.Relations[0].ToModel != "Category" {
+		t.Errorf("self relation = %+v", m.Relations[0])
+	}
+	if m.Relations[1].Type != ir.RelationOneToMany {
+		t.Errorf("expected OneToMany for children, got %v", m.Relations[1].Type)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 23. References across documents in the DocumentSet
+// ---------------------------------------------------------------------------
+
+func TestResolveAcrossDocuments(t *testing.T) {
+	ds := &ast.DocumentSet{Documents: []*ast.Document{
+		{Models: []ast.ModelDecl{{
+			Name: "Post",
+			Fields: []ast.FieldDecl{
+				{Name: "id", Type: ast.FieldType{Name: "Int"}},
+				{Name: "author", Type: ast.FieldType{Name: "User"}},
+			},
+		}}},
+		{Models: []ast.ModelDecl{{
+			Name:   "User",
+			Fields: []ast.FieldDecl{{Name: "id", Type: ast.FieldType{Name: "Int"}}},
+		}}},
+	}}
+
+	schema, errs := Resolve(ds)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(schema.Models) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(schema.Models))
+	}
+	if schema.Models[0].Fields[1].Type != ir.FieldKindRelation {
+		t.Errorf("expected relation across documents, got %v", schema.Models[0].Fields[1].Type)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 24. Relation field referencing an undeclared type
+// ---------------------------------------------------------------------------
+
+func TestResolveUnknownRelationTarget(t *testing.T) {
+	ds := docSet(&ast.Document{
+		Models: []ast.ModelDecl{{
+			Name: "Post",
+			Fields: []ast.FieldDecl{
+				{Name: "id", Type: ast.FieldType{Name: "Int"}},
+				{Name: "author", Type: ast.FieldType{Name: "Ghost"}},
+			},
+		}},
+	})
+
+	schema, errs := Resolve(ds)
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 error, got %d: %v", len(errs), errs)
+	}
+	// Falls back to a scalar field and produces no relation.
+	if schema.Models[0].Fields[1].Type != ir.FieldKindScalar {
+		t.Errorf("expected scalar fallback, got %v", schema.Models[0].Fields[1].Type)
+	}
+	if len(schema.Models[0].Relations) != 0 {
+		t.Errorf("expected 0 relations, got %d", len(schema.Models[0].Relations))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 25. Index helper edge cases
+// ---------------------------------------------------------------------------
+
+func TestIndexHasExpressionNil(t *testing.T) {
+	if indexHasExpression(nil) {
+		t.Error("expected false for nil index")
+	}
+}
+
+func TestIndexOptionAt(t *testing.T) {
+	cases := []struct {
+		name   string
+		values []string
+		idx    int
+		want   string
+	}{
+		{"empty values", nil, 0, ""},
+		{"single value broadcasts", []string{"Desc"}, 5, "Desc"},
+		{"within bounds", []string{"a", "b"}, 1, "b"},
+		{"out of bounds", []string{"a", "b"}, 3, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := indexOptionAt(tc.values, tc.idx); got != tc.want {
+				t.Errorf("indexOptionAt(%v, %d) = %q, want %q", tc.values, tc.idx, got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 26. Expression helper edge cases
+// ---------------------------------------------------------------------------
+
+func TestExprToString(t *testing.T) {
+	cases := []struct {
+		name string
+		expr ast.Expression
+		want string
+	}{
+		{"string", ast.StringLiteral{Value: "s"}, "s"},
+		{"number", ast.NumberLiteral{Value: "1.5"}, "1.5"},
+		{"boolean", ast.BooleanLiteral{Value: false}, "false"},
+		{"identifier", ast.Identifier{Name: "Cascade"}, "Cascade"},
+		{"function call", ast.FunctionCall{Name: "now"}, "now(...)"},
+		{"unsupported", ast.ArrayLiteral{}, ""},
+		{"nil", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := exprToString(tc.expr); got != tc.want {
+				t.Errorf("exprToString() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExprToBool(t *testing.T) {
+	if !exprToBool(ast.BooleanLiteral{Value: true}) {
+		t.Error("expected true for BooleanLiteral(true)")
+	}
+	if exprToBool(ast.BooleanLiteral{Value: false}) {
+		t.Error("expected false for BooleanLiteral(false)")
+	}
+	// Non-boolean expression falls back to string comparison.
+	if !exprToBool(ast.Identifier{Name: "true"}) {
+		t.Error("expected true for Identifier(true)")
+	}
+	if exprToBool(ast.Identifier{Name: "yes"}) {
+		t.Error("expected false for Identifier(yes)")
+	}
+}
+
+func TestExprToStringSlice(t *testing.T) {
+	cases := []struct {
+		name string
+		expr ast.Expression
+		want []string
+	}{
+		{"array", ast.ArrayLiteral{Elements: []ast.Expression{
+			ast.Identifier{Name: "a"},
+			ast.StringLiteral{Value: "b"},
+		}}, []string{"a", "b"}},
+		{"identifier", ast.Identifier{Name: "solo"}, []string{"solo"}},
+		{"string literal", ast.StringLiteral{Value: "one"}, []string{"one"}},
+		{"function call", ast.FunctionCall{Name: "now"}, []string{"now(...)"}},
+		{"empty result", nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := exprToStringSlice(tc.expr)
+			if len(got) != len(tc.want) {
+				t.Fatalf("exprToStringSlice() = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("exprToStringSlice() = %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}

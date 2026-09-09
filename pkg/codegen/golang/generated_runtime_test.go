@@ -5,12 +5,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/arsfy/gcorm/pkg/schema/ir"
 )
 
 func TestGeneratedClientBulkCreateAndRawRuntime(t *testing.T) {
+	testGeneratedClient(t, goldenSchema(), generatedRuntimeTestSource)
+}
+
+func testGeneratedClient(t *testing.T, schema *ir.Schema, testSource string) {
+	t.Helper()
 	dir := t.TempDir()
 
-	schema := goldenSchema()
 	gen := NewGenerator(schema, WithModulePath("example.com/gentest/gen"))
 	files, err := gen.Generate()
 	if err != nil {
@@ -31,7 +37,7 @@ func TestGeneratedClientBulkCreateAndRawRuntime(t *testing.T) {
 	}
 
 	testPath := filepath.Join(dir, "gen", "client", "client_runtime_test.go")
-	if err := os.WriteFile(testPath, []byte(generatedRuntimeTestSource), 0o644); err != nil {
+	if err := os.WriteFile(testPath, []byte(testSource), 0o644); err != nil {
 		t.Fatalf("write generated runtime test: %v", err)
 	}
 
@@ -48,6 +54,47 @@ func TestGeneratedClientBulkCreateAndRawRuntime(t *testing.T) {
 	if os.Getenv("GCO_RUN_GENERATED_BENCH") == "1" {
 		t.Logf("generated client benchmarks:\n%s", out)
 	}
+}
+
+func TestGeneratedClientPackageScopedNames(t *testing.T) {
+	schema := goldenSchema()
+	for _, name := range []string{"UserActions", "UserQueryBuilder", "UserCreateBuilder", "UserCreateManyBuilder", "UserUpdateBuilder", "UserDeleteBuilder"} {
+		schema.Models = append(schema.Models, &ir.Model{
+			Name:       name,
+			Fields:     []*ir.Field{{Name: "id", Type: ir.FieldKindScalar, ScalarType: "String", IsID: true}},
+			PrimaryKey: &ir.PrimaryKey{Fields: []string{"id"}},
+		})
+	}
+	schema.Models[0].Fields = append(schema.Models[0].Fields, &ir.Field{Name: "nameX", Type: ir.FieldKindScalar, ScalarType: "String"})
+	schema.Models = append(schema.Models, &ir.Model{
+		Name: "UserName",
+		Fields: []*ir.Field{
+			{Name: "id", Type: ir.FieldKindScalar, ScalarType: "String", IsID: true},
+			{Name: "x", Type: ir.FieldKindRelation, ModelType: "User"},
+		},
+		PrimaryKey: &ir.PrimaryKey{Fields: []string{"id"}},
+	})
+	testGeneratedClient(t, schema, "package client_test\n")
+}
+
+func TestGeneratedClientMappedTags(t *testing.T) {
+	schema := goldenSchema()
+	schema.Models[0].Fields[1].DBName = "email`\"\\column"
+	testGeneratedClient(t, schema, `package client_test
+
+import (
+	"reflect"
+	"testing"
+	"example.com/gentest/gen/model"
+)
+
+func TestMappedTag(t *testing.T) {
+	f, ok := reflect.TypeFor[model.User]().FieldByName("Email")
+	if !ok || f.Tag.Get("db") != "email\x60\"\\column" {
+		t.Fatalf("Email tag = %q", f.Tag)
+	}
+}
+`)
 }
 
 const generatedRuntimeTestSource = `package client_test
@@ -92,6 +139,16 @@ func (c captureConn) QueryContext(ctx context.Context, queryText string, args []
 	captureState.Unlock()
 
 	switch {
+	case strings.Contains(queryText, "GROUP BY"):
+		return &captureRows{
+			cols: []string{"published", "count", "agg"},
+			rows: [][]driver.Value{{true, int64(2), 3.0}},
+		}, nil
+	case strings.HasPrefix(queryText, "SELECT COUNT(*),"):
+		return &captureRows{
+			cols: []string{"count", "agg"},
+			rows: [][]driver.Value{{int64(2), 41.5}},
+		}, nil
 	case strings.Contains(queryText, "RETURNING \"id\""):
 		return &captureRows{cols: []string{"id"}, rows: [][]driver.Value{{"p1"}, {"p2"}}}, nil
 	default:
@@ -268,6 +325,41 @@ func TestRawRejectsNilInterfaceDestination(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "destination type must be a struct") {
 		t.Fatalf("Raw[any]() error = %q", err)
+	}
+}
+
+func TestAggregateMapsUppercaseFn(t *testing.T) {
+	c := openCaptureClient(t)
+	defer c.Close()
+
+	res, err := c.Post.Aggregate(context.Background(), query.PostAggregateOption{Fn: "AVG", Field: query.PostPublishedColumn})
+	if err != nil {
+		t.Fatalf("Aggregate() error: %v", err)
+	}
+	if res.Count != 2 {
+		t.Fatalf("Count = %d, want 2", res.Count)
+	}
+	if got := res.Avg["published"]; got == nil || *got != 41.5 {
+		t.Fatalf("Avg[\"published\"] = %v, want 41.5", got)
+	}
+}
+
+func TestGroupByMapsMixedCaseFn(t *testing.T) {
+	c := openCaptureClient(t)
+	defer c.Close()
+
+	rows, err := c.Post.GroupBy(context.Background(), []string{query.PostPublishedColumn}, query.PostAggregateOption{Fn: "Sum", Field: query.PostPublishedColumn})
+	if err != nil {
+		t.Fatalf("GroupBy() error: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1", len(rows))
+	}
+	if rows[0].Group["published"] != true {
+		t.Fatalf("Group[\"published\"] = %#v, want true", rows[0].Group["published"])
+	}
+	if got := rows[0].Sum["published"]; got == nil || *got != 3.0 {
+		t.Fatalf("Sum[\"published\"] = %v, want 3.0", got)
 	}
 }
 

@@ -6,11 +6,13 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	gcoerr "github.com/arsfy/gcorm/pkg/runtime/errors"
+	_ "modernc.org/sqlite"
 )
 
 // ---------------------------------------------------------------------------
@@ -345,6 +347,131 @@ func TestTxRollbackOnPanic(t *testing.T) {
 	_ = db.Tx(context.Background(), func(_ *Tx) error {
 		panic("test panic")
 	})
+}
+
+func TestTxCallbackCompletedTransaction(t *testing.T) {
+	sentinel := errors.New("callback error")
+
+	tests := []struct {
+		name    string
+		run     func(t *testing.T, tx *Tx) error
+		wantErr error
+	}{
+		{
+			name: "commit inside callback then return nil",
+			run: func(t *testing.T, tx *Tx) error {
+				if err := tx.Commit(); err != nil {
+					t.Errorf("callback Commit() error = %v", err)
+				}
+				return nil
+			},
+			wantErr: nil,
+		},
+		{
+			name: "rollback inside callback then return nil",
+			run: func(t *testing.T, tx *Tx) error {
+				if err := tx.Rollback(); err != nil {
+					t.Errorf("callback Rollback() error = %v", err)
+				}
+				return nil
+			},
+			wantErr: nil,
+		},
+		{
+			name: "commit inside callback then return error",
+			run: func(t *testing.T, tx *Tx) error {
+				if err := tx.Commit(); err != nil {
+					t.Errorf("callback Commit() error = %v", err)
+				}
+				return sentinel
+			},
+			wantErr: sentinel,
+		},
+		{
+			name: "rollback inside callback then return error",
+			run: func(t *testing.T, tx *Tx) error {
+				if err := tx.Rollback(); err != nil {
+					t.Errorf("callback Rollback() error = %v", err)
+				}
+				return sentinel
+			},
+			wantErr: sentinel,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rawDB := openFakeDB(t)
+			defer rawDB.Close()
+
+			db := NewDB(rawDB, &mockDialect{name: "test"})
+			err := db.Tx(context.Background(), func(tx *Tx) error {
+				return tc.run(t, tx)
+			})
+
+			if !errors.Is(err, tc.wantErr) {
+				t.Errorf("Tx() error = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestTxPanicAfterCallbackCommit(t *testing.T) {
+	rawDB := openFakeDB(t)
+	defer rawDB.Close()
+
+	db := NewDB(rawDB, &mockDialect{name: "test"})
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Error("expected panic to be re-raised")
+		}
+		if r != "test panic" {
+			t.Errorf("expected panic value %q, got %v", "test panic", r)
+		}
+	}()
+
+	_ = db.Tx(context.Background(), func(tx *Tx) error {
+		if err := tx.Commit(); err != nil {
+			t.Errorf("callback Commit() error = %v", err)
+		}
+		panic("test panic")
+	})
+}
+
+func TestTxCallbackCommitPersistsSQLite(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "tx.db")
+	rawDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawDB.Close()
+
+	if _, err := rawDB.Exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+
+	db := NewDB(rawDB, &mockDialect{name: "sqlite"})
+	err = db.Tx(context.Background(), func(tx *Tx) error {
+		if _, err := tx.ExecContext(context.Background(), "INSERT INTO items (name) VALUES (?)", "widget"); err != nil {
+			return err
+		}
+		// The callback commits the transaction itself; Tx must not report
+		// "transaction already completed" for the already-committed tx.
+		return tx.Commit()
+	})
+	if err != nil {
+		t.Fatalf("Tx() error = %v, want nil", err)
+	}
+
+	var count int
+	if err := rawDB.QueryRow("SELECT COUNT(*) FROM items").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Errorf("row count = %d, want 1 (callback commit should persist)", count)
+	}
 }
 
 func TestTxDoubleCommitReturnsError(t *testing.T) {

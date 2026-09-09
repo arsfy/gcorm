@@ -22,8 +22,7 @@ func BenchmarkCodegen(b *testing.B) {
 		b.Fatalf("compile errors: %v", result.Errors)
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		gen := NewGenerator(result.Schema)
 		_, err := gen.Generate()
 		if err != nil {

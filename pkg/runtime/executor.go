@@ -96,12 +96,18 @@ func (db *DB) RawDB() *sql.DB {
 
 // Tx executes a function within a database transaction.
 // If the function returns an error, the transaction is rolled back.
-// Otherwise, the transaction is committed.
+// Otherwise, the transaction is committed, unless the function already
+// completed the transaction itself via tx.Commit or tx.Rollback.
 func (db *DB) Tx(ctx context.Context, fn func(tx *Tx) error) error {
 	return db.TxWithOptions(ctx, nil, fn)
 }
 
 // TxWithOptions executes a function within a transaction with specific options.
+// If fn returns an error, the transaction is rolled back (unless fn already
+// completed it) and the error is returned. If fn panics, the transaction is
+// rolled back (unless fn already completed it) and the panic is re-raised.
+// If fn completes the transaction itself via tx.Commit or tx.Rollback and
+// returns nil, TxWithOptions reports success without committing again.
 func (db *DB) TxWithOptions(ctx context.Context, opts *sql.TxOptions, fn func(tx *Tx) error) error {
 	rawTx, err := db.rawDB.BeginTx(ctx, opts)
 	if err != nil {
@@ -117,16 +123,24 @@ func (db *DB) TxWithOptions(ctx context.Context, opts *sql.TxOptions, fn func(tx
 
 	defer func() {
 		if p := recover(); p != nil {
-			_ = tx.Rollback()
+			if !tx.done {
+				_ = tx.Rollback()
+			}
 			panic(p)
 		}
 	}()
 
 	if err := fn(tx); err != nil {
-		_ = tx.Rollback()
+		if !tx.done {
+			_ = tx.Rollback()
+		}
 		return err
 	}
 
+	if tx.done {
+		// fn already committed or rolled back the transaction itself.
+		return nil
+	}
 	return tx.Commit()
 }
 

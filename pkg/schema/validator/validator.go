@@ -873,8 +873,7 @@ func (v *validator) validateIndexExpressions(a ast.Attribute, fieldCount int, la
 
 func (v *validator) validateIndexExpressionArg(arg ast.AttributeArg, fieldCount int, label string) {
 	values := indexOptionExprs(arg.Value)
-	_, isArray := arg.Value.(ast.ArrayLiteral)
-	if len(values) != fieldCount && (fieldCount > 1 || isArray) {
+	if len(values) != 1 && len(values) != fieldCount {
 		v.addError(arg.Span.Start, fmt.Sprintf("%s %s option has %d value(s), expected 1 or %d", label, arg.Name, len(values), fieldCount))
 		return
 	}

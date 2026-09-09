@@ -604,3 +604,184 @@ func TestCreateMigrationsTable(t *testing.T) {
 		}
 	}
 }
+
+func TestRunDevCreatesMigration(t *testing.T) {
+	schemaDir := writeTestSchema(t, testSchemaGCO)
+	migDir := filepath.Join(t.TempDir(), "migrations")
+
+	if err := Run([]string{"dev", "--name", "init", "--dir", migDir, "--schema", schemaDir}); err != nil {
+		t.Fatalf("Run(dev) error: %v", err)
+	}
+
+	entries, err := os.ReadDir(migDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected 1 migration dir, got err=%v entries=%d", err, len(entries))
+	}
+}
+
+func TestRunDeployThroughRun(t *testing.T) {
+	migDir := filepath.Join(t.TempDir(), "migrations")
+	if err := Run([]string{"deploy", "--dir", migDir}); err != nil {
+		t.Fatalf("Run(deploy) error: %v", err)
+	}
+}
+
+func TestRunDiffRejectsInvalidName(t *testing.T) {
+	schemaDir := writeTestSchema(t, testSchemaGCO)
+	migDir := filepath.Join(t.TempDir(), "migrations")
+
+	err := runDiff([]string{"--name", "bad/name", "--dir", migDir, "--schema", schemaDir})
+	if err == nil {
+		t.Fatal("runDiff() should reject invalid migration name")
+	}
+}
+
+func TestRunDiffMissingSchema(t *testing.T) {
+	migDir := filepath.Join(t.TempDir(), "migrations")
+	missing := filepath.Join(t.TempDir(), "no-such-schema")
+
+	if err := runDiff([]string{"--name", "init", "--dir", migDir, "--schema", missing}); err == nil {
+		t.Fatal("runDiff() should fail for a missing schema path")
+	}
+}
+
+func TestRunInitSQLMissingSchema(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-such-schema")
+	if err := runInitSQL([]string{"--schema", missing}); err == nil {
+		t.Fatal("runInitSQL() should fail for a missing schema path")
+	}
+}
+
+func TestLoadPreviousSchemaCorruptManifest(t *testing.T) {
+	migDir := filepath.Join(t.TempDir(), "migrations")
+	migPath := filepath.Join(migDir, "20260101_120000_init")
+	if err := os.MkdirAll(migPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(migPath, "manifest.json"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadPreviousSchema(migDir)
+	if err == nil || !strings.Contains(err.Error(), "parse migration manifest") {
+		t.Fatalf("loadPreviousSchema() error = %v, want parse error", err)
+	}
+}
+
+func TestCredentialFreeSchemaSnapshotNil(t *testing.T) {
+	snapshot, err := credentialFreeSchemaSnapshot(nil)
+	if err != nil || snapshot != nil {
+		t.Fatalf("credentialFreeSchemaSnapshot(nil) = %v, %v, want nil, nil", snapshot, err)
+	}
+}
+
+func TestRunInitSQLThroughRun(t *testing.T) {
+	schemaDir := writeTestSchema(t, testSchemaGCO)
+	outPath := filepath.Join(t.TempDir(), "init.sql")
+
+	if err := Run([]string{"init-sql", "--schema", schemaDir, "--output", outPath}); err != nil {
+		t.Fatalf("Run(init-sql) error: %v", err)
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "CREATE TABLE") {
+		t.Fatalf("init.sql missing CREATE TABLE:\n%s", data)
+	}
+}
+
+func TestRunResolveThroughRun(t *testing.T) {
+	migDir := filepath.Join(t.TempDir(), "migrations")
+	migName := "20240101_000000_test"
+	if err := os.MkdirAll(filepath.Join(migDir, migName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run([]string{"resolve", "--rolled-back", migName, "--dir", migDir}); err != nil {
+		t.Fatalf("Run(resolve) error: %v", err)
+	}
+}
+
+// TestRunDiffResolvesMigrationDirRelativeToConfig verifies that a relative
+// migrationDir from the configuration file is resolved against the directory
+// containing that file, not the process working directory.
+func TestRunDiffResolvesMigrationDirRelativeToConfig(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "proj")
+	if err := os.Mkdir(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	schemaDir := writeTestSchema(t, testSchemaGCO)
+
+	cfgPath := filepath.Join(projDir, "gco.config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("migrationDir: dbmigs\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runDiff([]string{"--name", "init", "--schema", schemaDir, "--config", cfgPath})
+	if err != nil {
+		t.Fatalf("runDiff() error: %v", err)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(projDir, "dbmigs"))
+	if err != nil {
+		t.Fatalf("migration directory not created next to config file: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 migration dir, got %d", len(entries))
+	}
+
+	// The default cwd-relative directory must not have been created.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "dbmigs")); !os.IsNotExist(err) {
+		t.Errorf("migration directory should not be created relative to cwd")
+	}
+}
+
+// TestRunDiffExplicitDirIgnoresConfig ensures an explicit --dir flag takes
+// precedence over migrationDir from the configuration file.
+func TestRunDiffExplicitDirIgnoresConfig(t *testing.T) {
+	schemaDir := writeTestSchema(t, testSchemaGCO)
+	migDir := filepath.Join(t.TempDir(), "migrations")
+
+	cfgPath := filepath.Join(t.TempDir(), "gco.config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("migrationDir: dbmigs\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runDiff([]string{"--name", "init", "--dir", migDir, "--schema", schemaDir, "--config", cfgPath})
+	if err != nil {
+		t.Fatalf("runDiff() error: %v", err)
+	}
+
+	entries, err := os.ReadDir(migDir)
+	if err != nil {
+		t.Fatalf("read migrations dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 migration dir, got %d", len(entries))
+	}
+}
+
+func TestRunDiffExplicitDefaultDirIgnoresConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	schemaDir := writeTestSchema(t, testSchemaGCO)
+	cfgPath := filepath.Join(t.TempDir(), "gco.config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("migrationDir: dbmigs\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDiff([]string{"--schema", schemaDir, "--config", cfgPath, "--dir", "migrations"}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "migrations"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("explicit migrations directory: entries=%v, error=%v", entries, err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(cfgPath), "dbmigs")); !os.IsNotExist(err) {
+		t.Fatalf("config directory must not be used: %v", err)
+	}
+}

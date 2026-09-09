@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/arsfy/gcorm/pkg/schema/ast"
@@ -710,5 +711,168 @@ func TestParseNegativeNumberDefaults(t *testing.T) {
 		if number.Value != want[i].value || number.IsFloat != want[i].isFloat {
 			t.Errorf("field %q default = %#v, want value %q isFloat=%v", field.Name, number, want[i].value, want[i].isFloat)
 		}
+	}
+}
+
+func TestParseMultiSkipsFailedFiles(t *testing.T) {
+	files := map[string][]byte{
+		// Lexer error (unterminated string): Parse returns a nil document.
+		"a_bad.gcorm": []byte(`model Broken {
+  name String @default("oops
+}`),
+		// Parser error: Parse returns a partial document and an error.
+		"b_bad.gcorm": []byte(`model {`),
+		"c_good.gcorm": []byte(`model User {
+  id String
+}`),
+	}
+	ds, err := ParseMulti(files)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if len(ds.Documents) != 1 {
+		t.Fatalf("documents = %d, want 1 (failed files must be skipped)", len(ds.Documents))
+	}
+	if len(ds.Files) != 1 {
+		t.Fatalf("files = %d, want 1", len(ds.Files))
+	}
+	if ds.Files[0] != "c_good.gcorm" {
+		t.Errorf("file[0] = %q, want %q", ds.Files[0], "c_good.gcorm")
+	}
+	for i, doc := range ds.Documents {
+		if doc == nil {
+			t.Errorf("doc[%d] is nil; nil documents must not be added to the set", i)
+		}
+	}
+	if len(ds.Documents[0].Models) != 1 {
+		t.Errorf("doc[0] models = %d, want 1", len(ds.Documents[0].Models))
+	}
+}
+
+func TestParseCRLFComments(t *testing.T) {
+	src := "// Model doc\r\n/// Model doc comment\r\nmodel User {\r\n  // Primary key\r\n  id String\r\n}\r\n"
+	doc, err := Parse("test.gcorm", []byte(src))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(doc.Models) != 1 {
+		t.Fatalf("models = %d, want 1", len(doc.Models))
+	}
+
+	m := doc.Models[0]
+	if len(m.Comments) < 2 {
+		t.Fatalf("model comments = %d, want at least 2", len(m.Comments))
+	}
+	if m.Comments[0].Text != "Model doc" {
+		t.Errorf("comment[0].Text = %q, want %q (trailing \\r must be stripped)", m.Comments[0].Text, "Model doc")
+	}
+	if m.Comments[1].Text != "Model doc comment" {
+		t.Errorf("comment[1].Text = %q, want %q (trailing \\r must be stripped)", m.Comments[1].Text, "Model doc comment")
+	}
+
+	if len(m.Fields) != 1 {
+		t.Fatalf("fields = %d, want 1", len(m.Fields))
+	}
+	if len(m.Fields[0].Comments) != 1 {
+		t.Fatalf("field comments = %d, want 1", len(m.Fields[0].Comments))
+	}
+	if m.Fields[0].Comments[0].Text != "Primary key" {
+		t.Errorf("field comment = %q, want %q (trailing \\r must be stripped)", m.Fields[0].Comments[0].Text, "Primary key")
+	}
+}
+
+func TestParseDoubleDotErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+	}{
+		{"field attribute", "model User {\n  name String @db..VarChar(10)\n}"},
+		{"model attribute", "model User {\n  id String\n  @@index..foo([id])\n}"},
+		{"trailing dot in attribute", "model User {\n  name String @db.(10)\n}"},
+		{"config expression", "datasource db {\n  url = db..url\n}"},
+		{"default function call", "model User {\n  id String @default(db..uuid())\n}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse("test.gcorm", []byte(tt.src))
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			pe, ok := err.(*ParseError)
+			if !ok {
+				t.Fatalf("error type = %T, want *ParseError", err)
+			}
+			if !strings.Contains(pe.Message, "expected identifier after '.'") {
+				t.Errorf("error message = %q, want it to mention %q", pe.Message, "expected identifier after '.'")
+			}
+		})
+	}
+}
+
+func TestParseStringLiteralSpanWithEscapes(t *testing.T) {
+	// The string literal on line 2 spans columns 25-33 (8 source bytes:
+	// quote, a, \n escape, b, \t escape, quote) but decodes to 4 bytes.
+	src := "model Message {\n  draft String @default(\"a\\nb\\t\")\n}"
+	doc, err := Parse("test.gcorm", []byte(src))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	attr := doc.Models[0].Fields[0].Attributes[0]
+	sl, ok := attr.Args[0].Value.(ast.StringLiteral)
+	if !ok {
+		t.Fatalf("default value = %T, want ast.StringLiteral", attr.Args[0].Value)
+	}
+	if sl.Value != "a\nb\t" {
+		t.Errorf("value = %q, want %q", sl.Value, "a\nb\t")
+	}
+
+	if sl.Span.Start.Line != 2 || sl.Span.Start.Column != 25 {
+		t.Errorf("span start = %d:%d, want 2:25", sl.Span.Start.Line, sl.Span.Start.Column)
+	}
+	// End must cover the raw token (8 bytes), not the decoded value (4 bytes).
+	if sl.Span.End.Line != 2 || sl.Span.End.Column != 33 {
+		t.Errorf("span end = %d:%d, want 2:33", sl.Span.End.Line, sl.Span.End.Column)
+	}
+	if sl.Span.Start.Offset != 40 {
+		t.Errorf("span start offset = %d, want 40", sl.Span.Start.Offset)
+	}
+	if sl.Span.End.Offset != 48 {
+		t.Errorf("span end offset = %d, want 48", sl.Span.End.Offset)
+	}
+
+	// The attribute span ends right after the closing paren at column 33.
+	if attr.Span.End.Line != 2 || attr.Span.End.Column != 34 {
+		t.Errorf("attr span end = %d:%d, want 2:34", attr.Span.End.Line, attr.Span.End.Column)
+	}
+}
+
+func TestParseErrorPositionAfterEscapedString(t *testing.T) {
+	// The error token follows a string literal containing escapes; its
+	// reported position must be the real source location.
+	src := "generator client {\n  provider = \"a\\tb\"\n  @\n}"
+	_, err := Parse("test.gcorm", []byte(src))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	pe, ok := err.(*ParseError)
+	if !ok {
+		t.Fatalf("error type = %T, want *ParseError", err)
+	}
+	if pe.Pos.Line != 3 || pe.Pos.Column != 3 {
+		t.Errorf("error position = %d:%d, want 3:3 (error: %v)", pe.Pos.Line, pe.Pos.Column, err)
+	}
+}
+
+func TestParseUnicodeStringLiteralSpan(t *testing.T) {
+	src := "model Message {\n  draft String @default(\"\u4e2d\\n\u6587\")\n}"
+	doc, err := Parse("test.gcorm", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attr := doc.Models[0].Fields[0].Attributes[0]
+	span := attr.Args[0].Value.ExprSpan()
+	if span.End.Column != 31 || span.End.Offset != 50 || attr.Span.End.Column != 32 {
+		t.Fatalf("span=%+v, attribute=%+v; want end column 31, byte offset 50, attribute end column 32", span, attr.Span)
 	}
 }

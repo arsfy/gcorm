@@ -83,6 +83,12 @@ type Token struct {
 	Type  TokenType
 	Value string
 	Pos   ast.Position
+	// RawLen is the token's length in source bytes. It differs from
+	// len(Value) for string literals, where Value holds the decoded text
+	// without quotes or escape sequences. Zero means len(Value) applies.
+	RawLen int
+	// RawColumns counts source runes for tokens whose Value is decoded.
+	RawColumns int
 }
 
 func (t Token) String() string {

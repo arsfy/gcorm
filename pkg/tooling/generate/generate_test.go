@@ -2,6 +2,7 @@ package generate
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -78,6 +79,15 @@ func chdir(t *testing.T, dir string) {
 	t.Cleanup(func() { os.Chdir(old) })
 }
 
+// writeGoMod writes a minimal go.mod into dir so that generated import paths
+// can be derived from the module path.
+func writeGoMod(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/gentest\n\ngo 1.26.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // collectFiles walks root and returns relative-path → content entries.
 func collectFiles(t *testing.T, root string) map[string]string {
 	t.Helper()
@@ -106,6 +116,7 @@ func collectFiles(t *testing.T, root string) map[string]string {
 
 func TestRunGenerateFromSchemaFiles(t *testing.T) {
 	dir := t.TempDir()
+	writeGoMod(t, dir)
 	chdir(t, dir)
 	schemaDir := writeSchema(t, dir, validSchema)
 
@@ -178,6 +189,7 @@ func TestRunGenerateFromSchemaFiles(t *testing.T) {
 
 func TestRunOutputDirectoryCreation(t *testing.T) {
 	dir := t.TempDir()
+	writeGoMod(t, dir)
 	chdir(t, dir)
 	schemaDir := writeSchema(t, dir, validSchema)
 
@@ -201,6 +213,7 @@ func TestRunOutputDirectoryCreation(t *testing.T) {
 
 func TestRunRemovesStaleGeneratedFiles(t *testing.T) {
 	dir := t.TempDir()
+	writeGoMod(t, dir)
 	chdir(t, dir)
 	schemaDir := writeSchema(t, dir, schemaWithPost)
 
@@ -240,6 +253,7 @@ func TestRunRemovesStaleGeneratedFiles(t *testing.T) {
 
 func TestRunDeterministicOutput(t *testing.T) {
 	dir := t.TempDir()
+	writeGoMod(t, dir)
 	schemaDir := writeSchema(t, dir, validSchema)
 
 	oldWd, _ := os.Getwd()
@@ -250,6 +264,7 @@ func TestRunDeterministicOutput(t *testing.T) {
 	if err := os.Mkdir(runDir1, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	writeGoMod(t, runDir1)
 	if err := os.Chdir(runDir1); err != nil {
 		t.Fatal(err)
 	}
@@ -263,6 +278,7 @@ func TestRunDeterministicOutput(t *testing.T) {
 	if err := os.Mkdir(runDir2, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	writeGoMod(t, runDir2)
 	if err := os.Chdir(runDir2); err != nil {
 		t.Fatal(err)
 	}
@@ -317,5 +333,96 @@ func TestRunInvalidSchema(t *testing.T) {
 	err := Run([]string{"--schema", dir})
 	if err == nil {
 		t.Fatal("expected error for invalid schema")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 6. Flag parsing errors
+// ---------------------------------------------------------------------------
+
+func TestRunFlagParsingErrors(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{"missing schema value", []string{"--schema"}, "requires a value"},
+		{"missing config value", []string{"--config"}, "requires a value"},
+		{"schema value followed by flag", []string{"--schema", "--dry-run"}, "requires a value"},
+		{"empty schema value", []string{"--schema="}, "requires a non-empty value"},
+		{"empty separate schema value", []string{"--schema", ""}, "requires a non-empty value"},
+		{"empty separate config value", []string{"--config", ""}, "requires a non-empty value"},
+		{"unknown flag", []string{"--bogus"}, "unknown flag: --bogus"},
+		{"unknown single-dash flag", []string{"-bogus"}, "unknown flag: -bogus"},
+		{"dry-run takes no value", []string{"--dry-run=true"}, "does not take a value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := Run(tt.args)
+			if err == nil {
+				t.Fatalf("Run(%v) expected error", tt.args)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// The --flag=value form must keep working.
+func TestRunSchemaFlagEqualsForm(t *testing.T) {
+	dir := t.TempDir()
+	writeGoMod(t, dir)
+	chdir(t, dir)
+	schemaDir := writeSchema(t, dir, validSchema)
+
+	if err := Run([]string{"--schema=" + schemaDir}); err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "testout", "model", "models.go")); err != nil {
+		t.Errorf("expected generated models.go: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 7. Relative schemaRoots resolve against the config file directory
+// ---------------------------------------------------------------------------
+
+func TestRunConfigRelativeSchemaRoots(t *testing.T) {
+	dir := t.TempDir()
+	writeGoMod(t, dir)
+	projDir := filepath.Join(dir, "proj")
+	if err := os.Mkdir(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeSchema(t, projDir, validSchema)
+
+	cfgPath := filepath.Join(projDir, "gco.config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("schemaRoots:\n  - schema\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run from an unrelated working directory: the relative schemaRoots entry
+	// must resolve against projDir (where the config file lives).
+	workDir := filepath.Join(dir, "elsewhere")
+	if err := os.Mkdir(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	chdir(t, workDir)
+
+	if err := Run([]string{"--config", cfgPath}); err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "testout", "model", "models.go")); err != nil {
+		t.Errorf("expected generated models.go: %v", err)
+	}
+	cmd := exec.Command("go", "test", "./testout/...")
+	cmd.Dir = workDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("generated packages do not compile: %v\n%s", err, out)
 	}
 }

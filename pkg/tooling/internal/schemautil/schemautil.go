@@ -25,7 +25,7 @@ type LoadedSchema struct {
 
 // LoadFromConfig discovers, reads, parses, and compiles schema files from the OS filesystem.
 func LoadFromConfig(schemaPath, configPath string) (*LoadedSchema, error) {
-	cfg, _, err := config.Load(configPath)
+	cfg, cfgPath, err := config.Load(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
 	}
@@ -39,7 +39,7 @@ func LoadFromConfig(schemaPath, configPath string) (*LoadedSchema, error) {
 	if schemaPath != "" {
 		roots = []string{schemaPath}
 	} else {
-		roots, err = config.DiscoverSchemaRoots(cfg, cwd)
+		roots, err = config.DiscoverSchemaRoots(cfg, cwd, cfgPath)
 		if err != nil {
 			return nil, err
 		}

@@ -75,6 +75,7 @@ func Run(args []string) error {
 func runDiff(args []string) error {
 	name := "migration"
 	migrationDir := "migrations"
+	migrationDirSet := false
 	schemaPath := ""
 	configPath := ""
 
@@ -88,6 +89,7 @@ func runDiff(args []string) error {
 		case "--dir":
 			if i+1 < len(args) {
 				migrationDir = args[i+1]
+				migrationDirSet = true
 				i++
 			}
 		case "--schema":
@@ -107,12 +109,23 @@ func runDiff(args []string) error {
 	}
 
 	// Load config.
-	cfg, _, err := config.Load(configPath)
+	cfg, cfgPath, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if cfg.MigrationDir != "" && migrationDir == "migrations" {
+	if cfg.MigrationDir != "" && !migrationDirSet {
 		migrationDir = cfg.MigrationDir
+		if !filepath.IsAbs(migrationDir) {
+			// Relative migrationDir is resolved against the directory
+			// containing the configuration file.
+			dir, err := config.ConfigDir(cfgPath)
+			if err != nil {
+				return err
+			}
+			if dir != "" {
+				migrationDir = filepath.Join(dir, migrationDir)
+			}
+		}
 	}
 
 	loaded, err := schemautil.LoadFromConfig(schemaPath, configPath)

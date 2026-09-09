@@ -728,7 +728,16 @@ func stripPostgresTextLiteralCasts(s string) string {
 
 func postgresCastTypeEnd(s string, start int) int {
 	if hasCaseInsensitivePrefix(s[start:], "character varying") && isCastBoundary(s, start+len("character varying")) {
-		return start + len("character varying")
+		i := start + len("character varying")
+		if i < len(s) && s[i] == '(' {
+			if end := matchingParenIndex(s, i); end != -1 {
+				i = end + 1
+			}
+		}
+		if strings.HasPrefix(s[i:], "[]") {
+			i += 2
+		}
+		return i
 	}
 
 	i := start
@@ -786,6 +795,12 @@ func isPostgresTextLikeCast(castType string) bool {
 	castType = strings.TrimSpace(castType)
 	castType = strings.ReplaceAll(castType, `"`, "")
 	castType = strings.Join(strings.Fields(castType), " ")
+	// Ignore length/precision arguments: character varying(10) is still text-like.
+	if open := strings.IndexByte(castType, '('); open >= 0 {
+		if end := matchingParenIndex(castType, open); end == len(castType)-1 {
+			castType = strings.TrimSpace(castType[:open])
+		}
+	}
 	castType = strings.ToLower(castType)
 	castType = strings.TrimPrefix(castType, "pg_catalog.")
 	switch castType {

@@ -18,7 +18,6 @@ jobs:
           - {goos: linux,   goarch: arm64, runner: ubuntu-latest, ext: "",    archive: tar}
           - {goos: windows, goarch: amd64, runner: ubuntu-latest, ext: .exe,  archive: zip}
           - {goos: windows, goarch: arm64, runner: ubuntu-latest, ext: .exe,  archive: zip}
-          - {goos: darwin,  goarch: amd64, runner: macos-latest,  ext: "",    archive: tar}
           - {goos: darwin,  goarch: arm64, runner: macos-latest,  ext: "",    archive: tar}
 
     steps:

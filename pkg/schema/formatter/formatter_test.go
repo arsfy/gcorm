@@ -1,6 +1,7 @@
 package formatter
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/arsfy/gcorm/pkg/schema/ast"
@@ -458,6 +459,28 @@ model User {
 	got := Format(doc)
 	if got != want {
 		t.Errorf("complex schema mismatch.\nwant:\n%s\ngot:\n%s", want, got)
+	}
+}
+
+func TestFormatCRLFComments(t *testing.T) {
+	src := "// Model doc\r\nmodel User {\r\n  // Primary key\r\n  id String\r\n}\r\n"
+	doc, err := parser.Parse("input.gcorm", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse() error: %v", err)
+	}
+
+	want := `// Model doc
+model User {
+  // Primary key
+  id String
+}
+`
+	got := Format(doc)
+	if got != want {
+		t.Errorf("CRLF comments formatting mismatch.\nwant:\n%s\ngot:\n%s", want, got)
+	}
+	if strings.ContainsRune(got, '\r') {
+		t.Errorf("formatted output contains \\r: %q", got)
 	}
 }
 

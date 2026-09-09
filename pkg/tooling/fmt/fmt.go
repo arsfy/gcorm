@@ -73,6 +73,10 @@ func Run(args []string) error {
 				unformatted++
 			}
 		} else {
+			if string(data) == formatted {
+				fmt.Printf("Unchanged %s\n", f)
+				continue
+			}
 			if err := os.WriteFile(f, []byte(formatted), 0o644); err != nil {
 				return fmt.Errorf("write %s: %w", f, err)
 			}

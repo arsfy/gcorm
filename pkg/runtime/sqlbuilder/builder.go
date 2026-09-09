@@ -445,12 +445,30 @@ func tokenCanEndValue(s string, tok sqlToken) bool {
 	}
 }
 
+func isQuantifierKeyword(word string) bool {
+	switch word {
+	case "ALL", "ANY", "SOME":
+		return true
+	default:
+		return false
+	}
+}
+
 func tokenCanStartValue(s string, tok sqlToken) bool {
 	switch tok.kind {
 	case tokenValue, tokenLeftParen, tokenLeftBracket:
 		return true
 	case tokenWord:
-		return !isOperandPrefixKeyword(strings.ToUpper(s[tok.start:tok.end]))
+		word := strings.ToUpper(s[tok.start:tok.end])
+		if isQuantifierKeyword(word) {
+			// ALL/SOME/ANY directly after an operator form a quantified
+			// comparison such as `data ? ALL (ARRAY['a','b'])`, which is
+			// only valid when the quantifier is followed by a parenthesized
+			// subquery or array expression.
+			after, ok := nextSignificantToken(s, tok.end)
+			return ok && after.kind == tokenLeftParen
+		}
+		return !isOperandPrefixKeyword(word)
 	case tokenOperator:
 		return s[tok.start:tok.end] == "?"
 	default:

@@ -156,28 +156,33 @@ func (l *Lexer) readComment() Token {
 // readString consumes a double-quoted string literal with escape sequences.
 func (l *Lexer) readString() Token {
 	pos := l.pos()
+	start := l.offset
 	l.advance() // opening quote
+
+	token := func(value string) Token {
+		return Token{Type: TokenString, Value: value, Pos: pos, RawLen: l.offset - start, RawColumns: utf8.RuneCount(l.src[start:l.offset])}
+	}
 
 	var buf strings.Builder
 	for {
 		if l.offset >= len(l.src) {
 			l.addError(pos, "unterminated string literal")
-			return Token{Type: TokenString, Value: buf.String(), Pos: pos}
+			return token(buf.String())
 		}
 		r, _ := l.peek()
 		if r == '\n' {
 			l.addError(pos, "unterminated string literal")
-			return Token{Type: TokenString, Value: buf.String(), Pos: pos}
+			return token(buf.String())
 		}
 		if r == '"' {
 			l.advance() // closing quote
-			return Token{Type: TokenString, Value: buf.String(), Pos: pos}
+			return token(buf.String())
 		}
 		if r == '\\' {
 			l.advance() // backslash
 			if l.offset >= len(l.src) {
 				l.addError(pos, "unterminated string literal")
-				return Token{Type: TokenString, Value: buf.String(), Pos: pos}
+				return token(buf.String())
 			}
 			escaped := l.advance()
 			switch escaped {

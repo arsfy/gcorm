@@ -72,7 +72,7 @@ import (
 type {{$model.Name}} struct {
 {{- range $field := $model.Fields}}
 {{- if ne $field.Type 2}}
-	{{upper $field.Name}} {{goType $field}} ` + "`" + `db:"{{columnName $field}}" json:"{{lower $field.Name}}"` + "`" + `
+	{{upper $field.Name}} {{goType $field}} ` + "`" + `db:{{quoteTagValue (columnName $field)}} json:"{{lower $field.Name}}"` + "`" + `
 {{- end}}
 {{- end}}
 {{- range $field := $model.Fields}}
@@ -144,10 +144,10 @@ type {{.Model.Name}}Query struct {
 {{- end}}
 }
 
-const {{.Model.Name}}Table = "{{tableName .Model}}"
+const {{.Model.Name}}Table = {{quote (tableName .Model)}}
 {{- range $field := .Model.Fields}}
 {{- if ne $field.Type 2}}
-const {{$.Model.Name}}{{upper $field.Name}}Column = "{{columnName $field}}"
+const {{$.Model.Name}}{{upper $field.Name}}Column = {{quote (columnName $field)}}
 {{- end}}
 {{- end}}
 
@@ -254,12 +254,12 @@ type {{lower $.Model.Name}}{{upper $field.Name}}Field struct{}
 
 // Equals creates an equality condition.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Equals(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {
-	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: "=", Value: v}
+	return {{$.Model.Name}}WhereClause{Field: {{quote (columnName $field)}}, Operator: "=", Value: v}
 }
 
 // Not creates a not-equal condition.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Not(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {
-	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: "!=", Value: v}
+	return {{$.Model.Name}}WhereClause{Field: {{quote (columnName $field)}}, Operator: "!=", Value: v}
 }
 
 // In creates an IN condition.
@@ -268,7 +268,7 @@ func ({{lower $.Model.Name}}{{upper $field.Name}}Field) In(vals ...{{queryGoType
 	for i, v := range vals {
 		iVals[i] = v
 	}
-	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: "IN", Value: iVals}
+	return {{$.Model.Name}}WhereClause{Field: {{quote (columnName $field)}}, Operator: "IN", Value: iVals}
 }
 
 // NotIn creates a NOT IN condition.
@@ -277,29 +277,29 @@ func ({{lower $.Model.Name}}{{upper $field.Name}}Field) NotIn(vals ...{{queryGoT
 	for i, v := range vals {
 		iVals[i] = v
 	}
-	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: "NOT IN", Value: iVals}
+	return {{$.Model.Name}}WhereClause{Field: {{quote (columnName $field)}}, Operator: "NOT IN", Value: iVals}
 }
 
 {{- if or (eq $field.ScalarType "Int") (eq $field.ScalarType "SmallInt") (eq $field.ScalarType "BigInt") (eq $field.ScalarType "Float") (eq $field.ScalarType "Decimal") (eq $field.ScalarType "DateTime")}}
 
 // Lt creates a less-than condition.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Lt(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {
-	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: "<", Value: v}
+	return {{$.Model.Name}}WhereClause{Field: {{quote (columnName $field)}}, Operator: "<", Value: v}
 }
 
 // Lte creates a less-than-or-equal condition.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Lte(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {
-	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: "<=", Value: v}
+	return {{$.Model.Name}}WhereClause{Field: {{quote (columnName $field)}}, Operator: "<=", Value: v}
 }
 
 // Gt creates a greater-than condition.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Gt(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {
-	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: ">", Value: v}
+	return {{$.Model.Name}}WhereClause{Field: {{quote (columnName $field)}}, Operator: ">", Value: v}
 }
 
 // Gte creates a greater-than-or-equal condition.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Gte(v {{queryGoType $field}}) {{$.Model.Name}}WhereClause {
-	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: ">=", Value: v}
+	return {{$.Model.Name}}WhereClause{Field: {{quote (columnName $field)}}, Operator: ">=", Value: v}
 }
 {{end}}
 
@@ -307,17 +307,17 @@ func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Gte(v {{queryGoType $fie
 
 // Contains creates a LIKE '%v%' condition.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Contains(v string) {{$.Model.Name}}WhereClause {
-	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: "CONTAINS", Value: v}
+	return {{$.Model.Name}}WhereClause{Field: {{quote (columnName $field)}}, Operator: "CONTAINS", Value: v}
 }
 
 // StartsWith creates a LIKE 'v%' condition.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) StartsWith(v string) {{$.Model.Name}}WhereClause {
-	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: "STARTS_WITH", Value: v}
+	return {{$.Model.Name}}WhereClause{Field: {{quote (columnName $field)}}, Operator: "STARTS_WITH", Value: v}
 }
 
 // EndsWith creates a LIKE '%v' condition.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) EndsWith(v string) {{$.Model.Name}}WhereClause {
-	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: "ENDS_WITH", Value: v}
+	return {{$.Model.Name}}WhereClause{Field: {{quote (columnName $field)}}, Operator: "ENDS_WITH", Value: v}
 }
 {{end}}
 
@@ -325,31 +325,31 @@ func ({{lower $.Model.Name}}{{upper $field.Name}}Field) EndsWith(v string) {{$.M
 
 // IsNull creates an IS NULL condition.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) IsNull() {{$.Model.Name}}WhereClause {
-	return {{$.Model.Name}}WhereClause{Field: "{{columnName $field}}", Operator: "IS NULL", Value: nil}
+	return {{$.Model.Name}}WhereClause{Field: {{quote (columnName $field)}}, Operator: "IS NULL", Value: nil}
 }
 {{end}}
 
 // Set creates a set operation for create/update.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Set(v {{if $field.IsOptional}}{{setGoType $field}}{{else}}{{queryGoType $field}}{{end}}) {{$.Model.Name}}SetClause {
-	return {{$.Model.Name}}SetClause{Field: "{{columnName $field}}", Value: v}
+	return {{$.Model.Name}}SetClause{Field: {{quote (columnName $field)}}, Value: v}
 }
 
 {{- if $field.IsOptional}}
 
 // SetNull sets the field to NULL.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) SetNull() {{$.Model.Name}}SetClause {
-	return {{$.Model.Name}}SetClause{Field: "{{columnName $field}}", Value: nil}
+	return {{$.Model.Name}}SetClause{Field: {{quote (columnName $field)}}, Value: nil}
 }
 {{end}}
 
 // Asc returns an ascending order clause for this field.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Asc() {{$.Model.Name}}OrderByClause {
-	return {{$.Model.Name}}OrderByClause{Field: "{{columnName $field}}", Direction: "ASC"}
+	return {{$.Model.Name}}OrderByClause{Field: {{quote (columnName $field)}}, Direction: "ASC"}
 }
 
 // Desc returns a descending order clause for this field.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Desc() {{$.Model.Name}}OrderByClause {
-	return {{$.Model.Name}}OrderByClause{Field: "{{columnName $field}}", Direction: "DESC"}
+	return {{$.Model.Name}}OrderByClause{Field: {{quote (columnName $field)}}, Direction: "DESC"}
 }
 {{end}}
 {{- if eq $field.Type 2}}
@@ -397,7 +397,7 @@ type {{.Model.Name}}GroupByResult struct {
 // {{.Model.Name}}CreateInput holds data for creating a {{.Model.Name}} record.
 type {{.Model.Name}}CreateInput struct {
 {{- range scalarCols .Model}}
-	{{upper .Name}} {{if .IsOptional}}*{{end}}{{queryGoType .}}
+	{{upper .Name}} {{queryGoType .}}
 {{- end}}
 {{- range .Model.Fields}}
 {{- if eq .Type 2}}
@@ -421,7 +421,7 @@ type {{.Model.Name}}CreateNestedInput struct {
 type {{.Model.Name}}WhereUniqueInput struct {
 {{- range scalarCols .Model}}
 {{- if or .IsID .IsUnique}}
-	{{upper .Name}} *{{queryGoType .}}
+	{{upper .Name}} *{{setGoType .}}
 {{- end}}
 {{- end}}
 }
@@ -468,7 +468,7 @@ type Client struct {
 
 // New creates a new Client from a database connection.
 func New(db *sql.DB{{if .Models}}, opts ...Option{{end}}) *Client {
-	c := &Client{db: db{{if .Models}}, executor: db, dialect: "postgresql"{{end}}}
+	c := &Client{db: db{{if .Models}}, executor: db, dialect: {{quote .Dialect}}{{end}}}
 {{- if .Models}}
 	for _, opt := range opts {
 		opt(c)
@@ -670,7 +670,7 @@ func (c *Client) Tx(ctx context.Context, fn func(tx *Client) error) error {
 }
 
 {{range $model := .Models}}
-func quoted{{$model.Name}}Table(c *Client) string { return c.quoteIdentifier("{{tableName $model}}") }
+func quoted{{$model.Name}}Table(c *Client) string { return c.quoteIdentifier({{quote (tableName $model)}}) }
 func quoted{{$model.Name}}Columns(c *Client) string {
 	cols := []string{ {{scalarColNamesCSV $model}} }
 	for i := range cols { cols[i] = c.quoteIdentifier(cols[i]) }
@@ -680,7 +680,7 @@ func quoted{{$model.Name}}Columns(c *Client) string {
 func quote{{$model.Name}}Field(c *Client, field string) (string, error) {
 	switch field {
 {{- range $field := $model.Fields}}{{if ne $field.Type 2}}
-	case "{{columnName $field}}":
+	case {{quote (columnName $field)}}:
 		return c.quoteIdentifier(field), nil
 {{- end}}{{end}}
 	default:
@@ -1510,7 +1510,7 @@ func (a {{$model.Name}}Actions) Aggregate(ctx context.Context, opts ...query.{{$
 	for i, opt := range opts {
 		if aggVals[i].Valid {
 			v := aggVals[i].Float64
-			switch opt.Fn {
+			switch strings.ToLower(opt.Fn) {
 			case "avg":
 				result.Avg[opt.Field] = &v
 			case "sum":
@@ -1573,7 +1573,7 @@ func (a {{$model.Name}}Actions) GroupBy(ctx context.Context, fields []string, op
 		for i, opt := range opts {
 			if aggVals[i].Valid {
 				v := aggVals[i].Float64
-				switch opt.Fn {
+				switch strings.ToLower(opt.Fn) {
 				case "avg":
 					r.Avg[opt.Field] = &v
 				case "sum":

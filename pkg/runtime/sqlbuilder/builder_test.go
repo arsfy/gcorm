@@ -347,6 +347,86 @@ func TestPostgresPlaceholderRewritePreservesJSONOperators(t *testing.T) {
 	}
 }
 
+func TestPostgresPlaceholderRewritePreservesQuantifiedOperators(t *testing.T) {
+	tests := []struct {
+		name      string
+		condition string
+		args      []any
+		want      string
+	}{
+		{
+			name:      "question operator with ALL array",
+			condition: "data ? ALL(ARRAY['a','b']) AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE data ? ALL(ARRAY['a','b']) AND id = $1",
+		},
+		{
+			name:      "question operator with SOME subquery",
+			condition: "data ? SOME (SELECT v FROM vals) AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE data ? SOME (SELECT v FROM vals) AND id = $1",
+		},
+		{
+			name:      "question operator with ANY array",
+			condition: "data ? ANY(ARRAY['a','b']) AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE data ? ANY(ARRAY['a','b']) AND id = $1",
+		},
+		{
+			name:      "question operator with lowercase quantifier",
+			condition: "data ? all (array['a']) AND id = ?",
+			args:      []any{7},
+			want:      "SELECT * FROM t WHERE data ? all (array['a']) AND id = $1",
+		},
+		{
+			name:      "quantified operator mixed with inner parameter",
+			condition: "data ? ANY(ARRAY[?]) AND id = ?",
+			args:      []any{"a", 7},
+			want:      "SELECT * FROM t WHERE data ? ANY(ARRAY[$1]) AND id = $2",
+		},
+		{
+			name:      "quantified operators mixed with existence operator",
+			condition: "attrs ? 'key' AND data ? ALL(ARRAY[?]) AND id = ?",
+			args:      []any{"a", 7},
+			want:      "SELECT * FROM t WHERE attrs ? 'key' AND data ? ALL(ARRAY[$1]) AND id = $2",
+		},
+		{
+			name:      "parameter as left operand of ANY comparison",
+			condition: "? = ANY(tags) AND id = ?",
+			args:      []any{"a", 7},
+			want:      "SELECT * FROM t WHERE $1 = ANY(tags) AND id = $2",
+		},
+		{
+			name:      "parameter inside ANY array expression",
+			condition: "id = ANY(?) AND other_id = ?",
+			args:      []any{7, 9},
+			want:      "SELECT * FROM t WHERE id = ANY($1) AND other_id = $2",
+		},
+		{
+			name:      "quantifier word without parens stays parameter",
+			condition: "data = ? AND all = ?",
+			args:      []any{1, 2},
+			want:      "SELECT * FROM t WHERE data = $1 AND all = $2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, gotArgs := New("postgresql").
+				Select("*").
+				From("t").
+				Where(tt.condition, tt.args...).
+				Build()
+			if got != tt.want {
+				t.Fatalf("SQL = %q, want %q", got, tt.want)
+			}
+			if !reflect.DeepEqual(gotArgs, tt.args) {
+				t.Fatalf("args = %#v, want %#v", gotArgs, tt.args)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // MySQL placeholders (?)
 // ---------------------------------------------------------------------------
