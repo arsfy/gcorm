@@ -1,3 +1,53 @@
+## v0.1.13
+
+### Changed
+
+- CLI flags now accept `--flag=value` syntax, and `gco validate` rejects unknown
+  flags and flags with missing or empty values.
+- Relative `schemaRoots` entries in the configuration file are now resolved
+  against the directory containing the config file instead of the current
+  working directory, and symlinked schema roots are followed during discovery.
+- The base import path for generated code is now derived from the `go.mod`
+  nearest to the output directory, and code generation fails with a clear error
+  when no module path can be determined.
+- Code generation now rejects schemas whose model or field names would collide
+  as generated Go identifiers or query file names.
+- Generated enum fields use `[]model.T` and `*model.T` types for list and
+  optional enums.
+- `gco fmt` now reports already-formatted files as `Unchanged`.
+- Removed the macOS amd64 target from the release build matrix.
+
+### Fixed
+
+- Transaction helpers (`Tx`, `TxWithOptions`) no longer roll back or commit
+  transactions that the callback already completed itself; panic-time rollback
+  behavior is preserved.
+- SQL placeholder rewriting recognizes `ALL`/`ANY`/`SOME` quantified comparisons
+  such as `data ? ALL (ARRAY['a'])`.
+- Fixed schema source spans for string literals containing escape sequences,
+  trailing carriage returns from comments in CRLF files, and error reporting for
+  malformed dotted attribute names.
+- Index expression options in `@@index`/`@@unique` accept either one shared
+  value or exactly one value per indexed field.
+- Generated PostgreSQL SQL quotes identifiers with standard double quotes, and
+  generated struct tags escape backticks in mapped column names.
+- Statement splitting in db-push is dialect-aware: MySQL backslash escapes and
+  PostgreSQL `E'...'` strings no longer break statement boundaries.
+- PostgreSQL introspection maps `timestamp(p) with/without time zone` and other
+  parameterized type modifiers correctly, and quoted default literals such as
+  `'uuid-v1'` are no longer misread as function defaults.
+- SQLite expression indexes are rejected with a clear error during introspection
+  instead of producing unsafe schema plans.
+- PostgreSQL enum creation uses a guarded `DO` block that tolerates existing
+  types, and enum drops use mapped (`@@map`) database names.
+- MySQL enum changes no longer accumulate duplicate unique indexes when
+  refreshing enum columns.
+- Table-recreate migrations reuse the canonical create-table definition and
+  create indexes after the table.
+- Expression index diffing normalizes PostgreSQL `CASE` expressions and enum
+  literal casts such as `'active'::status`, preventing spurious drop/recreate
+  migrations for introspected indexes.
+
 ## v0.1.12
 
 ### Added
