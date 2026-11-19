@@ -27,15 +27,9 @@ The project is designed around generated Go code: define your data model in
 
 For full documentation, examples, and guides, visit the [GCORM Wiki](https://github.com/arsfy/gcorm/wiki).
 
-## Status
-
-GCORM is early-stage software. The public APIs and schema language may still
-change. Review generated migrations before applying them to production
-databases.
-
 ## Requirements
 
-- Go 1.26 or newer, matching this repository's `go.mod`
+- Go 1.27 or newer, matching this repository's `go.mod`
 - A SQL driver for your database in your application, for example `pgx`,
   `go-sql-driver/mysql`, or `modernc.org/sqlite`
 
