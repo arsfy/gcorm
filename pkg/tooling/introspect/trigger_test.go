@@ -59,3 +59,57 @@ model Item {
 		t.Fatalf("introspection exported an external trigger:\n%s", raw)
 	}
 }
+
+func TestIntrospectTriggerUpdateOfColumnsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	const source = `datasource db {
+  provider = "sqlite"
+  url = "unused"
+}
+model Item {
+  id         Int    @id
+  priceCents Int    @map("price_cents")
+  status     String
+  @@map("items")
+  @@trigger(name: "price_audit", timing: After, event: Update, columns: [priceCents, status], body: "SELECT NEW.id;")
+}`
+	if _, err := dbpush.Push(t.Context(), db, dbpush.Options{
+		SchemaFS:    fstest.MapFS{"schema.gcorm": {Data: []byte(source)}},
+		DatabaseURL: path,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	output := t.TempDir()
+	if err := Run([]string{"--provider", "sqlite", "--url", path, "--output", output}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(output, "schema.gcorm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled := compiler.CompileFile("schema.gcorm", raw)
+	if compiled.HasErrors() {
+		t.Fatalf("%v\n%s", compiled.Errors, raw)
+	}
+	if triggers := compiled.Schema.Models[0].Triggers; len(triggers) != 1 || len(triggers[0].Columns) != 2 {
+		t.Fatalf("UPDATE OF columns not introspected:\n%s", raw)
+	}
+
+	// Pushing the introspected schema back is a no-op.
+	result, err := dbpush.Push(t.Context(), db, dbpush.Options{
+		SchemaFS:    fstest.MapFS{"schema.gcorm": {Data: raw}},
+		DatabaseURL: path,
+		DryRun:      true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Noop {
+		t.Fatalf("introspected schema does not round-trip: %v\n%s", result.Statements, raw)
+	}
+}

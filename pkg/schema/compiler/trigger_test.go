@@ -101,3 +101,59 @@ func TestTriggerNamesAcrossSchemaFiles(t *testing.T) {
 		})
 	}
 }
+
+func TestCompileTriggerUpdateOfColumns(t *testing.T) {
+	src := `datasource db {
+  provider = "postgresql"
+  url      = "local"
+}
+model Item {
+  id         Int  @id
+  priceCents Int  @map("price_cents")
+  status     String
+  @@trigger(name: "price_audit", timing: After, event: Update, columns: [priceCents, status], body: "BEGIN RETURN NEW; END;")
+}`
+	doc, err := parser.Parse("columns.gcorm", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range []string{src, formatter.Format(doc)} {
+		compiled := CompileFile("columns.gcorm", []byte(source))
+		if compiled.HasErrors() {
+			t.Fatal(compiled.Errors)
+		}
+		trigger := compiled.Schema.Models[0].Triggers[0]
+		if strings.Join(trigger.Columns, ",") != "priceCents,status" {
+			t.Fatalf("trigger columns = %v", trigger.Columns)
+		}
+	}
+}
+
+func TestCompileRejectsInvalidTriggerColumns(t *testing.T) {
+	const fields = "model Item {\n  id Int @id\n  note String?\n  owner User @relation(fields: [ownerId], references: [id])\n  ownerId Int\n"
+	const user = "model User {\n  id Int @id\n  items Item[]\n}\n"
+	for _, tt := range []struct {
+		name, provider, args, want string
+	}{
+		{"insert event", "postgresql", `event: Insert, columns: [note]`, "columns requires event: Update"},
+		{"mysql", "mysql", `event: Update, columns: [note]`, "not supported by MySQL"},
+		{"unknown field", "sqlite", `event: Update, columns: [missing]`, `unknown field "missing"`},
+		{"relation field", "sqlite", `event: Update, columns: [owner]`, `relation field "owner"`},
+		{"duplicate", "sqlite", `event: Update, columns: [note, note]`, `repeats field "note"`},
+		{"empty", "postgresql", `event: Update, columns: []`, "non-empty array"},
+		{"not array", "postgresql", `event: Update, columns: note`, "non-empty array"},
+		{"string element", "postgresql", `event: Update, columns: ["note"]`, "must be field names"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			src := "datasource db {\n  provider = \"" + tt.provider + "\"\n  url = \"local\"\n}\n" + user + fields +
+				`  @@trigger(name: "audit", timing: After, ` + tt.args + `, body: "SELECT 1;")` + "\n}\n"
+			result := CompileFile("invalid.gcorm", []byte(src))
+			for _, err := range result.Errors {
+				if strings.Contains(err.Error(), tt.want) {
+					return
+				}
+			}
+			t.Fatalf("errors = %v, want %q", result.Errors, tt.want)
+		})
+	}
+}

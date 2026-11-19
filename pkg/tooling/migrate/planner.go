@@ -173,7 +173,7 @@ func compareTriggers(cs *Changeset, oldModel, newModel *ir.Model) {
 	newTriggers := indexTriggers(newModel)
 	for _, name := range mergedSortedKeys(oldTriggers, newTriggers) {
 		old, new := oldTriggers[name], newTriggers[name]
-		if old != nil && new != nil && *old == *new {
+		if old != nil && new != nil && triggersEqual(old, new) {
 			continue
 		}
 		if old != nil {
@@ -189,7 +189,7 @@ func indexTriggers(model *ir.Model) map[string]*ir.Trigger {
 	triggers := make(map[string]*ir.Trigger)
 	if model != nil {
 		for _, trigger := range model.Triggers {
-			triggers[trigger.Name] = trigger
+			triggers[trigger.Name] = normalizedTrigger(model, trigger)
 		}
 	}
 	return triggers

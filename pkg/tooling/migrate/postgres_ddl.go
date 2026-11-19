@@ -247,7 +247,7 @@ func (g DDLGenerator) setTableSchemaStep(table, fromSchema, toSchema string, fro
 	if fromModel != nil && toModel != nil {
 		kept := indexTriggers(toModel)
 		for _, trigger := range fromModel.Triggers {
-			if other := kept[trigger.Name]; other != nil && *other == *trigger {
+			if other := kept[trigger.Name]; other != nil && triggersEqual(other, normalizedTrigger(fromModel, trigger)) {
 				functions = append(functions, triggerddl.PostgresFunctionName(table, trigger.Name))
 			}
 		}

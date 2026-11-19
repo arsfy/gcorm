@@ -382,8 +382,13 @@ func GenerateSchemaForDatasource(provider, dbSchema string, tables []TableInfo, 
 			fmt.Fprintf(&b, "\n  @@%s(%s)\n", kind, strings.Join(args, ", "))
 		}
 		for _, trigger := range t.Triggers {
-			fmt.Fprintf(&b, "\n  @@trigger(name: %s, timing: %s, event: %s, body: %s)\n",
-				formatter.FormatExpression(ast.StringLiteral{Value: trigger.Name}), trigger.Timing, trigger.Event,
+			columns := ""
+			if len(trigger.Columns) > 0 {
+				// UPDATE OF columns are written as the schema's field names.
+				columns = ", columns: [" + strings.Join(mappedNames(names.fields[t.Name], trigger.Columns), ", ") + "]"
+			}
+			fmt.Fprintf(&b, "\n  @@trigger(name: %s, timing: %s, event: %s%s, body: %s)\n",
+				formatter.FormatExpression(ast.StringLiteral{Value: trigger.Name}), trigger.Timing, trigger.Event, columns,
 				formatter.FormatExpression(ast.StringLiteral{Value: trigger.Body}))
 		}
 

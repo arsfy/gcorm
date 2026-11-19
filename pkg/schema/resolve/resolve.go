@@ -180,6 +180,8 @@ func (r *resolver) resolveModel(m *ast.ModelDecl) *ir.Model {
 					trigger.Timing = strings.ToUpper(exprToString(arg.Value))
 				case "event":
 					trigger.Event = strings.ToUpper(exprToString(arg.Value))
+				case "columns":
+					trigger.Columns = exprToStringSlice(arg.Value)
 				case "body":
 					trigger.Body = strings.TrimSpace(exprToString(arg.Value))
 				}

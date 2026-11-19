@@ -11,6 +11,12 @@ import (
 
 func (v *validator) validateTriggers(ds *ast.DocumentSet) {
 	provider := datasourceProvider(ds)
+	modelNames := make(map[string]bool)
+	for _, doc := range ds.Documents {
+		for _, model := range doc.Models {
+			modelNames[model.Name] = true
+		}
+	}
 	databaseNames := make(map[string]bool)
 	for _, doc := range ds.Documents {
 		for _, model := range doc.Models {
@@ -22,7 +28,7 @@ func (v *validator) validateTriggers(ds *ast.DocumentSet) {
 				if attr.Name != "trigger" {
 					continue
 				}
-				name := v.validateTrigger(attr, provider)
+				name := v.validateTrigger(attr, provider, model, modelNames)
 				if name == "" {
 					continue
 				}
@@ -44,9 +50,10 @@ func (v *validator) validateTriggers(ds *ast.DocumentSet) {
 	}
 }
 
-func (v *validator) validateTrigger(attr ast.Attribute, provider string) string {
+func (v *validator) validateTrigger(attr ast.Attribute, provider string, model ast.ModelDecl, modelNames map[string]bool) string {
 	seen := make(map[string]bool)
-	var name string
+	var name, event string
+	var columnsPos ast.Position
 	for _, arg := range attr.Args {
 		pos := arg.Span.Start
 		if seen[arg.Name] {
@@ -71,7 +78,12 @@ func (v *validator) validateTrigger(attr ast.Attribute, provider string) string 
 			id, ok := arg.Value.(ast.Identifier)
 			if !ok || !keywordMatches(id.Name, "INSERT", "UPDATE", "DELETE") {
 				v.addError(pos, "@@trigger event must be Insert, Update, or Delete")
+			} else {
+				event = strings.ToUpper(id.Name)
 			}
+		case "columns":
+			columnsPos = pos
+			v.validateTriggerColumns(arg, model, modelNames)
 		case "body":
 			literal, ok := arg.Value.(ast.StringLiteral)
 			if !ok || strings.TrimSpace(literal.Value) == "" || strings.ContainsRune(literal.Value, 0) {
@@ -90,7 +102,47 @@ func (v *validator) validateTrigger(attr ast.Attribute, provider string) string 
 			v.addError(attr.Span.Start, fmt.Sprintf("@@trigger requires the %q argument", required))
 		}
 	}
+	if seen["columns"] {
+		if event != "" && event != "UPDATE" {
+			v.addError(columnsPos, "@@trigger columns requires event: Update")
+		}
+		if provider == "mysql" {
+			v.addError(columnsPos, "@@trigger columns (UPDATE OF) is not supported by MySQL")
+		}
+	}
 	return name
+}
+
+// validateTriggerColumns checks the UPDATE OF column list: a non-empty array
+// of distinct scalar fields of the trigger's model.
+func (v *validator) validateTriggerColumns(arg ast.AttributeArg, model ast.ModelDecl, modelNames map[string]bool) {
+	arr, ok := arg.Value.(ast.ArrayLiteral)
+	if !ok || len(arr.Elements) == 0 {
+		v.addError(arg.Span.Start, "@@trigger columns must be a non-empty array of fields")
+		return
+	}
+	fields := make(map[string]ast.FieldDecl, len(model.Fields))
+	for _, field := range model.Fields {
+		fields[field.Name] = field
+	}
+	seen := make(map[string]bool, len(arr.Elements))
+	for _, elem := range arr.Elements {
+		id, ok := elem.(ast.Identifier)
+		if !ok {
+			v.addError(elem.ExprSpan().Start, "@@trigger columns must be field names")
+			continue
+		}
+		field, ok := fields[id.Name]
+		switch {
+		case !ok:
+			v.addError(id.Span.Start, fmt.Sprintf("@@trigger columns references unknown field %q in model %q", id.Name, model.Name))
+		case modelNames[field.Type.Name]:
+			v.addError(id.Span.Start, fmt.Sprintf("@@trigger columns cannot reference relation field %q", id.Name))
+		case seen[id.Name]:
+			v.addError(id.Span.Start, fmt.Sprintf("@@trigger columns repeats field %q", id.Name))
+		}
+		seen[id.Name] = true
+	}
 }
 
 func validTriggerName(name, provider string) bool {

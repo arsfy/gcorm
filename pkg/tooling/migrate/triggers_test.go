@@ -150,3 +150,37 @@ func TestTriggerMigrationDialectSQL(t *testing.T) {
 		})
 	}
 }
+
+func TestTriggerUpdateOfColumnsDDLAndDiff(t *testing.T) {
+	price := testField("priceCents", "Int")
+	price.DBName = "price_cents"
+	model := func(columns ...string) *ir.Model {
+		m := testModel("items", testField("id", "Int"), price, testField("status", "String"))
+		m.Triggers = []*ir.Trigger{{Name: "price_audit", Timing: "AFTER", Event: "UPDATE", Columns: columns, Body: "SELECT 1;"}}
+		return m
+	}
+
+	for dialect, want := range map[string]string{
+		"postgresql": `CREATE TRIGGER "price_audit" AFTER UPDATE OF "price_cents", "status" ON "items" FOR EACH ROW EXECUTE FUNCTION`,
+		"sqlite":     `CREATE TRIGGER "price_audit" AFTER UPDATE OF "price_cents", "status" ON "items" FOR EACH ROW`,
+	} {
+		newSchema := testSchema(model("priceCents", "status"))
+		cs := Diff(testSchema(testModel("items", testField("id", "Int"), price, testField("status", "String"))), newSchema)
+		if up := (DDLGenerator{Dialect: dialect, Schema: newSchema}).GenerateUp(cs); !strings.Contains(up, want) {
+			t.Errorf("%s up SQL missing %q:\n%s", dialect, want, up)
+		}
+	}
+
+	// Field names in the schema match column names from introspection, and
+	// the order of the list does not matter.
+	if cs := Diff(testSchema(model("status", "price_cents")), testSchema(model("priceCents", "status"))); len(cs.Changes) != 0 {
+		t.Fatalf("equivalent column lists produced changes: %+v", cs.Changes)
+	}
+	cs := Diff(testSchema(model("priceCents")), testSchema(model("priceCents", "status")))
+	if len(cs.Changes) != 2 || cs.Changes[0].Type != DropTrigger || cs.Changes[1].Type != AddTrigger {
+		t.Fatalf("column set change = %+v, want drop and add", cs.Changes)
+	}
+	if cs := Diff(testSchema(model("priceCents")), testSchema(model())); len(cs.Changes) != 2 {
+		t.Fatalf("removing the column list = %+v, want drop and add", cs.Changes)
+	}
+}

@@ -51,11 +51,15 @@ type Model struct {
 
 // Trigger is a GCORM-managed, row-level database trigger.
 type Trigger struct {
-	Name             string
-	Timing           string // BEFORE or AFTER.
-	Event            string // INSERT, UPDATE, or DELETE.
-	Body             string // Provider-specific SQL.
-	NeedsReplacement bool   `json:"-"` // Live catalog behavior differs from the declaration.
+	Name   string
+	Timing string // BEFORE or AFTER.
+	Event  string // INSERT, UPDATE, or DELETE.
+	// Columns restricts an UPDATE trigger to updates of these columns
+	// (UPDATE OF ...). Schemas hold field names; introspection holds column
+	// names. Empty means any column.
+	Columns          []string `json:",omitempty"`
+	Body             string   // Provider-specific SQL.
+	NeedsReplacement bool     `json:"-"` // Live catalog behavior differs from the declaration.
 }
 
 // DatabaseTrigger is a live SQLite trigger defined outside GCORM.

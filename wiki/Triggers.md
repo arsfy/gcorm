@@ -57,6 +57,40 @@ changes the trigger made to `NEW`. Return `OLD` from a `Before` delete to let th
 operation proceed. PostgreSQL ignores the return value of `After` triggers.
 [PostgreSQL trigger functions](https://www.postgresql.org/docs/current/plpgsql-trigger.html)
 
+## Limiting Update Triggers to Columns
+
+Add `columns` to an `Update` trigger to fire it only when an `UPDATE`
+statement sets one of the listed fields. GCORM renders it as
+`UPDATE OF "col1", "col2"` on PostgreSQL and SQLite. List schema field names;
+`@map` column names are applied automatically.
+
+```gcorm
+model Product {
+  id         Int    @id
+  priceCents Int    @map("price_cents")
+  status     String
+
+  @@trigger(
+    name: "product_price_audit",
+    timing: After,
+    event: Update,
+    columns: [priceCents, status],
+    body: "INSERT INTO price_audit (product_id) VALUES (NEW.id);"
+  )
+}
+```
+
+- `columns` is valid only with `event: Update` and must list distinct scalar
+  fields of the same model.
+- MySQL has no `UPDATE OF` clause, so `columns` fails validation there. Compare
+  `OLD` and `NEW` values in the trigger body instead.
+- The trigger fires when a listed column appears in the `UPDATE`'s `SET`
+  list, even if its value does not change. Compare `OLD` and `NEW` in the body
+  when only real changes matter.
+- The order of the list does not matter: `db push` and `migrate diff` treat
+  `[a, b]` and `[b, a]` as the same trigger. Adding or removing a column
+  replaces the trigger.
+
 ## Naming and SQL
 
 - `name` is the database trigger name. It must be unique within the table on

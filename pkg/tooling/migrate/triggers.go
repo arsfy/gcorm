@@ -2,6 +2,7 @@ package migrate
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -15,8 +16,12 @@ func (g DDLGenerator) createTriggerSteps(schemaName, table string, trigger *ir.T
 	if trigger == nil {
 		return nil
 	}
+	event := trigger.Event
+	if len(trigger.Columns) > 0 {
+		event += " OF " + strings.Join(g.quoteIDs(trigger.Columns), ", ")
+	}
 	header := fmt.Sprintf("CREATE TRIGGER %s %s %s ON %s FOR EACH ROW",
-		g.quoteID(trigger.Name), trigger.Timing, trigger.Event, g.tableRef(schemaName, table))
+		g.quoteID(trigger.Name), trigger.Timing, event, g.tableRef(schemaName, table))
 	switch g.Dialect {
 	case "postgresql":
 		name := g.qualifiedName(schemaName, triggerddl.PostgresFunctionName(table, trigger.Name)) + "()"
@@ -80,7 +85,7 @@ func (g DDLGenerator) sqliteRebuildTriggers(cs *Changeset, tables map[string]boo
 		}
 		for _, trigger := range model.Triggers {
 			if !dropping[trigger.Name] {
-				restore = append(restore, g.createTriggerSteps("", model.TableName(), trigger)...)
+				restore = append(restore, g.createTriggerSteps("", model.TableName(), normalizedTrigger(model, trigger))...)
 			}
 		}
 	}
@@ -91,4 +96,27 @@ func (g DDLGenerator) sqliteRebuildTriggers(cs *Changeset, tables map[string]boo
 		}
 	}
 	return restore
+}
+
+// normalizedTrigger returns trigger with its UPDATE OF columns resolved from
+// field names to column names of model, ready for comparison and DDL.
+func normalizedTrigger(model *ir.Model, trigger *ir.Trigger) *ir.Trigger {
+	if trigger == nil || len(trigger.Columns) == 0 {
+		return trigger
+	}
+	clone := *trigger
+	clone.Columns = normalizeFieldNames(model, trigger.Columns)
+	return &clone
+}
+
+// triggersEqual compares normalized triggers. The UPDATE OF column list is a
+// set: its order does not change when the trigger fires.
+func triggersEqual(a, b *ir.Trigger) bool {
+	if a.Name != b.Name || a.Timing != b.Timing || a.Event != b.Event || a.Body != b.Body || a.NeedsReplacement != b.NeedsReplacement {
+		return false
+	}
+	ac, bc := slices.Clone(a.Columns), slices.Clone(b.Columns)
+	slices.Sort(ac)
+	slices.Sort(bc)
+	return slices.Equal(ac, bc)
 }

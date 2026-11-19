@@ -761,7 +761,13 @@ ORDER BY ns.nspname, src.relname, con.conname, keys.ord`, postgresTextArray(sche
 func loadPostgresTriggers(ctx context.Context, db sqlRunner, schemas []string, catalog *postgresCatalog) error {
 	rows, err := db.QueryContext(ctx, `
 SELECT n.nspname, c.relname, t.tgname, t.tgtype, p.proname, p.prosrc,
-       t.tgenabled <> 'O' OR t.tgqual IS NOT NULL OR t.tgnargs <> 0 OR t.tgattr <> ''::int2vector
+       t.tgenabled <> 'O' OR t.tgqual IS NOT NULL OR t.tgnargs <> 0,
+       ARRAY(
+         SELECT a.attname::text
+         FROM unnest(t.tgattr::int2[]) WITH ORDINALITY AS u(attnum, ord)
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = t.tgrelid AND a.attnum = u.attnum
+         ORDER BY u.ord
+       )::text
 FROM pg_catalog.pg_trigger t
 JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -773,12 +779,14 @@ ORDER BY n.nspname, c.relname, t.tgname`, postgresTextArray(schemas))
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var schemaName, table, function string
+		var schemaName, table, function, columns string
 		var flags int
 		trigger := &ir.Trigger{}
-		if err := rows.Scan(&schemaName, &table, &trigger.Name, &flags, &function, &trigger.Body, &trigger.NeedsReplacement); err != nil {
+		if err := rows.Scan(&schemaName, &table, &trigger.Name, &flags, &function, &trigger.Body, &trigger.NeedsReplacement, &columns); err != nil {
 			return err
 		}
+		// tgattr lists the columns of an UPDATE OF trigger in declared order.
+		trigger.Columns = parsePostgresTextArray(columns)
 		model := catalog.model(schemaName, table)
 		if model == nil || function != triggerddl.PostgresFunctionName(table, trigger.Name) || flags&1 == 0 {
 			continue
