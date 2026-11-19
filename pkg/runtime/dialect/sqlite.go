@@ -128,8 +128,14 @@ func (SQLite) DefaultValueExpression(funcName string, args []string) string {
 		return "(datetime('now'))"
 	case "autoincrement":
 		return "AUTOINCREMENT"
+	case "cuid":
+		// cuid() values are generated client-side; the column has no
+		// database default.
+		return ""
+	case "dbgenerated":
+		return dbGeneratedDefaultExpression(args)
 	default:
-		return funcName + "()"
+		return functionCallExpression(funcName, args)
 	}
 }
 

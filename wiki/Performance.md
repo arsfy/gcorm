@@ -33,6 +33,11 @@ count, err := c.Event.BulkCreate(events).
 Batch size should be tuned for your database, row width, network latency, and
 driver limits. Common starting points are 500 to 1000 rows per batch.
 
+Each statement stays within the bind-parameter limit (65535 parameters on
+PostgreSQL/MySQL, 32766 on SQLite). Without `BatchSize` the client sends the
+largest batches that fit, and an explicit `BatchSize` larger than the limit
+allows is clamped, so very large inputs never fail with "too many parameters".
+
 ## Pagination
 
 Offset pagination is easy:

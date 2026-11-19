@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	runtimepkg "github.com/arsfy/gcorm/pkg/runtime"
@@ -21,8 +22,14 @@ type DDLGenerator struct {
 // GenerateUp produces the up migration SQL.
 func (g DDLGenerator) GenerateUp(cs *Changeset) string {
 	steps := g.UpSteps(cs)
-	script := make([]string, 0, len(steps))
-	for _, step := range steps {
+	script := make([]string, 0, len(steps)+2)
+	for i, step := range steps {
+		if step.RequiresCommit && (i == 0 || !steps[i-1].RequiresCommit) {
+			script = append(script, requiresCommitStartComment)
+		}
+		if !step.RequiresCommit && i > 0 && steps[i-1].RequiresCommit {
+			script = append(script, requiresCommitEndComment)
+		}
 		script = append(script, g.scriptSQL(step))
 	}
 	sql := strings.TrimRight(strings.Join(script, "\n\n"), "\n")
@@ -34,10 +41,23 @@ func (g DDLGenerator) GenerateUp(cs *Changeset) string {
 
 // DDLStep is a SQL fragment in migration order. SingleStatement marks a
 // complete statement whose internal semicolons must be sent to the server.
+//
+// RequiresCommit marks PostgreSQL enum changes (ALTER TYPE ... ADD VALUE and
+// the renames it depends on) that must be committed before later statements
+// use the new labels (SQLSTATE 55P04). UpSteps emits all such steps first and
+// they depend only on each other, so a caller that applies a migration in a
+// transaction runs them in their own committed transaction before the rest.
 type DDLStep struct {
 	SQL             string
 	SingleStatement bool
+	RequiresCommit  bool
 }
+
+const (
+	requiresCommitStartComment = "-- The following enum changes must be committed before later statements use them.\n" +
+		"-- Run them outside the transaction that applies the rest of this migration."
+	requiresCommitEndComment = "-- End of enum changes that require a separate transaction."
+)
 
 // UpSteps returns the SQL for database drivers applying an up migration.
 // Callers applying a SQLite rebuild must manage its transaction and PRAGMAs.
@@ -47,14 +67,12 @@ func (g DDLGenerator) UpSteps(cs *Changeset) []DDLStep {
 	}
 	var steps []DDLStep
 	if g.Dialect == "postgresql" {
-		if sql := g.postgresEnumChanges(cs); sql != "" {
-			steps = append(steps, DDLStep{SQL: sql})
-		}
+		steps = append(steps, g.postgresPreludeSteps(cs)...)
 	}
 	createdTables := make(map[string]bool)
 	for _, c := range cs.Changes {
 		if c.Type == CreateTable {
-			createdTables[c.Model] = true
+			createdTables[tableKey(c.Schema, c.Model)] = true
 		}
 	}
 	var rebuildTables map[string]bool
@@ -67,11 +85,16 @@ func (g DDLGenerator) UpSteps(cs *Changeset) []DDLStep {
 	for _, c := range g.orderedChanges(cs) {
 		switch c.Type {
 		case AddTrigger:
-			steps = append(steps, g.createTriggerSteps(c.Model, c.Trigger)...)
+			steps = append(steps, g.createTriggerSteps(c.Schema, c.Model, c.Trigger)...)
 			continue
 		case DropTrigger:
-			steps = append(steps, DDLStep{SQL: g.dropTriggerSQL(c.Model, c.Field)})
+			steps = append(steps, DDLStep{SQL: g.dropTriggerSQL(c.Schema, c.Model, c.Field)})
 			continue
+		case SetTableSchema:
+			if g.Dialect == "postgresql" {
+				steps = append(steps, g.setTableSchemaStep(c.Model, c.OldValue, c.NewValue, cs.Old, cs.New))
+				continue
+			}
 		}
 		if rebuildTables[c.Model] {
 			if !rebuilt[c.Model] {
@@ -80,7 +103,7 @@ func (g DDLGenerator) UpSteps(cs *Changeset) []DDLStep {
 			}
 			continue
 		}
-		if g.Dialect == "sqlite" && c.Type == AddFK && createdTables[c.Model] {
+		if g.Dialect == "sqlite" && c.Type == AddFK && createdTables[tableKey(c.Schema, c.Model)] {
 			continue
 		}
 		if sql := g.changeToUp(c, cs); sql != "" {
@@ -90,72 +113,13 @@ func (g DDLGenerator) UpSteps(cs *Changeset) []DDLStep {
 	return append(steps, restore...)
 }
 
-func (g DDLGenerator) postgresEnumChanges(cs *Changeset) string {
-	oldEnums := map[string]*ir.Enum{}
-	if cs.Old != nil {
-		for _, e := range cs.Old.Enums {
-			oldEnums[e.Name] = e
-		}
-	}
-	var statements []string
-	if cs.New == nil {
-		return ""
-	}
-	for _, e := range cs.New.Enums {
-		name := enumDBName(cs.New, e.Name)
-		old := oldEnums[e.Name]
-		if old == nil {
-			statements = append(statements, g.postgresCreateEnumSQL(e))
-			continue
-		}
-		seen := map[string]bool{}
-		for _, v := range old.Values {
-			seen[v.Name] = true
-		}
-		for _, v := range e.Values {
-			if !seen[v.Name] {
-				value := v.Name
-				if v.DBName != "" {
-					value = v.DBName
-				}
-				statements = append(statements, "ALTER TYPE "+g.quoteID(name)+" ADD VALUE IF NOT EXISTS "+quoteSQLString(value)+";")
-			}
-		}
-	}
-	return strings.Join(statements, "\n")
-}
-
 // enumDBName returns the database name of an enum type, honoring @@map.
 // It falls back to the given name when the enum is not in the schema.
 func enumDBName(schema *ir.Schema, name string) string {
-	if e := findEnum(schema, name); e != nil && e.DBName != "" {
-		return e.DBName
+	if e := findEnum(schema, name); e != nil {
+		return enumTypeName(e)
 	}
 	return name
-}
-
-// postgresCreateEnumSQL renders a guarded CREATE TYPE for an enum.
-// PostgreSQL has no CREATE TYPE IF NOT EXISTS, so a DO block swallows
-// duplicate_object errors to tolerate schema drift.
-func (g DDLGenerator) postgresCreateEnumSQL(e *ir.Enum) string {
-	values := make([]string, len(e.Values))
-	for i, v := range e.Values {
-		value := v.Name
-		if v.DBName != "" {
-			value = v.DBName
-		}
-		values[i] = quoteSQLString(value)
-	}
-	name := e.Name
-	if e.DBName != "" {
-		name = e.DBName
-	}
-	stmt := "CREATE TYPE " + g.quoteID(name) + " AS ENUM (" + strings.Join(values, ", ") + ");"
-	delimiter := "$$"
-	for strings.Contains(stmt, delimiter) {
-		delimiter = "$gco" + delimiter[1:]
-	}
-	return "DO " + delimiter + " BEGIN\n" + stmt + "\nEXCEPTION WHEN duplicate_object THEN NULL;\nEND " + delimiter + ";"
 }
 
 // RebuildsSQLiteTables reports whether the changes need SQLite's copy-and-swap
@@ -199,7 +163,7 @@ func (g DDLGenerator) sqliteRebuildTableSQL(table string, cs *Changeset) string 
 		return "-- SQLite table rebuild unavailable for " + table
 	}
 	temp := "__gco_new_" + table
-	create := g.createTableDefinitionSQL(newModel, temp, cs.New)
+	create := g.createTableDefinitionSQL(newModel, "", temp, cs.New)
 	oldModel := findModel(cs.Old, table)
 	oldCols := map[string]bool{}
 	if oldModel != nil {
@@ -210,7 +174,7 @@ func (g DDLGenerator) sqliteRebuildTableSQL(table string, cs *Changeset) string 
 	var cols []string
 	for _, f := range newModel.ScalarFields() {
 		col := columnName(f)
-		if oldCols[col] {
+		if oldCols[col] && !f.IsGenerated {
 			cols = append(cols, col)
 		}
 	}
@@ -225,9 +189,12 @@ func (g DDLGenerator) sqliteRebuildTableSQL(table string, cs *Changeset) string 
 		// Required fields without defaults cause the copy to fail.
 		var defaults []string
 		for _, f := range newModel.ScalarFields() {
+			if f.IsGenerated {
+				continue
+			}
 			cols = append(cols, columnName(f))
 			value := "NULL"
-			if f.Default != nil && !g.isAutoIncrementField(f) {
+			if g.hasDatabaseDefault(f) {
 				value = g.defaultExprForField(f)
 			}
 			defaults = append(defaults, value)
@@ -242,13 +209,13 @@ func (g DDLGenerator) sqliteRebuildTableSQL(table string, cs *Changeset) string 
 	}
 	fmt.Fprintf(&b, "DROP TABLE %s;\nALTER TABLE %s RENAME TO %s;", g.quoteID(table), g.quoteID(temp), g.quoteID(table))
 	for _, idx := range newModel.Indexes {
-		name := effectiveIndexName(newModel, idx)
+		name := effectiveIndexName(g.Dialect, newModel, idx)
 		unique := ""
 		if idx.IsUnique {
 			unique = "UNIQUE "
 		}
 		b.WriteString("\n")
-		b.WriteString(g.createIndexSQL(name, table, unique, g.indexColumnsSQL(newModel, idx), idx.Where, indexHasExpressions(idx)))
+		b.WriteString(g.createIndexSQL(name, "", table, unique, g.indexColumnsSQL(newModel, idx), idx.Where, indexHasExpressions(idx)))
 	}
 	return b.String()
 }
@@ -303,16 +270,21 @@ func (g DDLGenerator) changeToUp(c Change, cs *Changeset) string {
 	case CreateTable:
 		return g.createTableSQL(c, cs)
 	case DropTable:
-		return fmt.Sprintf("DROP TABLE %s;", g.quoteID(c.Model))
+		return fmt.Sprintf("DROP TABLE %s;", g.tableRef(c.Schema, c.Model))
+	case SetTableSchema:
+		return fmt.Sprintf("-- %s: schemas are not supported; cannot move table %s", strings.ToUpper(g.Dialect), c.Model)
 	case AddColumn:
 		return g.addColumnSQL(c, cs)
 	case DropColumn:
-		return fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", g.quoteID(c.Model), g.quoteID(c.Field))
+		return fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", g.tableRef(c.Schema, c.Model), g.quoteID(c.Field))
 	case AlterType:
 		return g.alterTypeSQL(c)
 	case AlterNull:
 		return g.alterNullSQL(c)
 	case AlterDefault:
+		if g.Dialect == "postgresql" && postgresAlterTypeSetsDefault(cs, c) {
+			return ""
+		}
 		return g.alterDefaultSQL(c)
 	case AddIndex:
 		return g.addIndexSQL(c)
@@ -328,13 +300,13 @@ func (g DDLGenerator) changeToUp(c Change, cs *Changeset) string {
 		return g.addFKSQL(c)
 	case DropFK:
 		return g.dropFKSQL(c)
-	case CreateEnum:
-		return "" // PostgreSQL enum creation is emitted before table changes.
+	case CreateEnum, RenameEnum:
+		return "" // PostgreSQL enum types are created and renamed before table changes.
 	case AlterEnum:
 		if g.Dialect == "mysql" {
 			return g.mysqlRefreshEnumColumns(c.Model)
 		}
-		return "" // PostgreSQL additions are emitted in postgresEnumChanges; SQLite stores enum values as text.
+		return "" // PostgreSQL enum changes are emitted in postgresPreludeSteps; SQLite stores enum values as text.
 	case DropEnum:
 		if g.Dialect == "postgresql" {
 			return "DROP TYPE " + g.quoteID(enumDBName(cs.Old, c.Model)) + ";"
@@ -361,10 +333,11 @@ func (g DDLGenerator) mysqlRefreshEnumColumnsFrom(schema *ir.Schema, enumName st
 	if enum := findEnum(schema, enumName); enum != nil {
 		values := make([]string, len(enum.Values))
 		for i, value := range enum.Values {
-			values[i] = quoteSQLString(value.Name)
+			values[i] = quoteSQLString(enumValueLabel(value))
 		}
 		enumType = "ENUM(" + strings.Join(values, ", ") + ")"
 	}
+	g.Schema = schema
 	var statements []string
 	for _, m := range schema.Models {
 		for _, f := range m.ScalarFields() {
@@ -375,7 +348,7 @@ func (g DDLGenerator) mysqlRefreshEnumColumnsFrom(schema *ir.Schema, enumName st
 			if !f.IsOptional {
 				parts = append(parts, "NOT NULL")
 			}
-			if f.Default != nil {
+			if g.hasDatabaseDefault(f) {
 				parts = append(parts, "DEFAULT "+g.defaultExprForField(f))
 			}
 			statements = append(statements, fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s;", g.quoteID(m.TableName()), strings.Join(parts, " ")))
@@ -385,28 +358,28 @@ func (g DDLGenerator) mysqlRefreshEnumColumnsFrom(schema *ir.Schema, enumName st
 }
 
 func (g DDLGenerator) createTableSQL(c Change, cs *Changeset) string {
-	model := findModel(cs.New, c.Model)
+	model := findTableModel(cs.New, c.Schema, c.Model)
 	if model == nil {
 		return fmt.Sprintf("-- CreateTable %s: model not found in target schema", c.Model)
 	}
 
 	var b strings.Builder
-	b.WriteString(g.createTableDefinitionSQL(model, model.TableName(), cs.New))
+	b.WriteString(g.createTableDefinitionSQL(model, model.Schema, model.TableName(), cs.New))
 	for _, idx := range model.Indexes {
-		name := effectiveIndexName(model, idx)
+		name := effectiveIndexName(g.Dialect, model, idx)
 		unique := ""
 		if idx.IsUnique {
 			unique = "UNIQUE "
 		}
 		b.WriteString("\n")
-		b.WriteString(g.createIndexSQL(name, model.TableName(), unique, g.indexColumnsSQL(model, idx), idx.Where, indexHasExpressions(idx)))
+		b.WriteString(g.createIndexSQL(name, model.Schema, model.TableName(), unique, g.indexColumnsSQL(model, idx), idx.Where, indexHasExpressions(idx)))
 	}
 	return b.String()
 }
 
-func (g DDLGenerator) createTableDefinitionSQL(model *ir.Model, tableName string, schema *ir.Schema) string {
+func (g DDLGenerator) createTableDefinitionSQL(model *ir.Model, schemaName, tableName string, schema *ir.Schema) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "CREATE TABLE %s (\n", g.quoteID(tableName))
+	fmt.Fprintf(&b, "CREATE TABLE %s (\n", g.tableRef(schemaName, tableName))
 
 	var cols []string
 	for _, f := range model.ScalarFields() {
@@ -421,7 +394,7 @@ func (g DDLGenerator) createTableDefinitionSQL(model *ir.Model, tableName string
 
 	for _, uc := range modelUniqueConstraints(model) {
 		fields := g.quoteIDs(normalizeFieldNames(model, uc.Fields))
-		name := effectiveUniqueName(model.TableName(), uc.Name, normalizeFieldNames(model, uc.Fields))
+		name := g.effectiveUniqueName(model.TableName(), uc.Name, normalizeFieldNames(model, uc.Fields))
 		cols = append(cols, fmt.Sprintf("  CONSTRAINT %s UNIQUE (%s)", g.quoteID(name), strings.Join(fields, ", ")))
 	}
 
@@ -454,18 +427,20 @@ func (g DDLGenerator) createTableDefinitionSQL(model *ir.Model, tableName string
 	return b.String()
 }
 
+// addColumnSQL never inlines UNIQUE: the planner emits an AddUnique change
+// for a new unique column, and an inline clause would add a second constraint.
 func (g DDLGenerator) addColumnSQL(c Change, cs *Changeset) string {
-	f := findField(cs.New, c.Model, c.Field)
+	f := findTableField(cs.New, c.Schema, c.Model, c.Field)
 	if f == nil {
 		return fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s;",
-			g.quoteID(c.Model), g.quoteID(c.Field), g.sqlType(c.NewValue))
+			g.tableRef(c.Schema, c.Model), g.quoteID(c.Field), g.sqlType(c.NewValue))
 	}
 	return fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s;",
-		g.quoteID(c.Model), g.columnDef(f))
+		g.tableRef(c.Schema, c.Model), g.columnDefInternal(nil, f, false))
 }
 
 func (g DDLGenerator) alterTypeSQL(c Change) string {
-	tbl := g.quoteID(c.Model)
+	tbl := g.tableRef(c.Schema, c.Model)
 	col := g.quoteID(c.Field)
 	newType := g.sqlTypeSignature(c.NewValue)
 	if c.NewField != nil {
@@ -474,7 +449,7 @@ func (g DDLGenerator) alterTypeSQL(c Change) string {
 
 	switch g.Dialect {
 	case "postgresql":
-		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s;", tbl, col, newType)
+		return g.postgresAlterTypeSQL(tbl, col, newType, c)
 	case "mysql":
 		if c.NewField != nil {
 			return fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s;", tbl, g.columnDefForModify(c.NewField))
@@ -485,8 +460,136 @@ func (g DDLGenerator) alterTypeSQL(c Change) string {
 	}
 }
 
+// postgresAlterTypeSQL converts a column with an explicit USING cast. A
+// column default may not cast to the new type, so the source default is
+// dropped first and the target default set afterwards. Identity columns are
+// left to AlterDefault (see postgresAlterTypeSetsDefault).
+func (g DDLGenerator) postgresAlterTypeSQL(tbl, col, newType string, c Change) string {
+	var statements []string
+	if g.hasDatabaseDefault(c.OldField) {
+		statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;", tbl, col))
+	}
+	statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s;",
+		tbl, col, newType, postgresUsingCast(col, newType, columnTypeOf(c.OldField, c.OldValue), columnTypeOf(c.NewField, c.NewValue))))
+	if !g.isAutoIncrementField(c.OldField) && g.hasDatabaseDefault(c.NewField) {
+		statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;", tbl, col, g.defaultExprForField(c.NewField)))
+	}
+	return strings.Join(statements, "\n")
+}
+
+// postgresAlterTypeSetsDefault reports whether an AlterDefault change is
+// applied by an AlterType change of the same column, which must set the
+// default after converting the column in both migration directions. Identity
+// transitions stay separate AlterDefault statements.
+func postgresAlterTypeSetsDefault(cs *Changeset, c Change) bool {
+	if cs == nil || isAutoIncrementDefault(c.OldValue) || isAutoIncrementDefault(c.NewValue) {
+		return false
+	}
+	for _, other := range cs.Changes {
+		if other.Type == AlterType && other.Schema == c.Schema && other.Model == c.Model && other.Field == c.Field {
+			return true
+		}
+	}
+	return false
+}
+
+// columnType classifies a column type for choosing a PostgreSQL USING cast.
+type columnType struct {
+	category string // text, numeric, integer, bool, enum, or the scalar name
+	isList   bool
+}
+
+func columnTypeOf(f *ir.Field, signature string) columnType {
+	if f != nil {
+		t := columnType{isList: f.IsList}
+		switch {
+		case f.Type == ir.FieldKindEnum:
+			t.category = "enum"
+		case f.NativeType != nil:
+			t.category = nativeTypeCategory(f.NativeType.Name, f.ScalarType)
+		default:
+			t.category = scalarTypeCategory(f.ScalarType)
+		}
+		return t
+	}
+	signature = strings.TrimSpace(signature)
+	if signature == "" {
+		return columnType{}
+	}
+	t := columnType{isList: strings.HasSuffix(signature, "[]")}
+	signature = strings.TrimSuffix(signature, "[]")
+	if base, native, ok := strings.Cut(signature, "@db."); ok {
+		native, _, _ = strings.Cut(native, "(")
+		t.category = nativeTypeCategory(native, base)
+		return t
+	}
+	t.category = scalarTypeCategory(signature)
+	return t
+}
+
+func scalarTypeCategory(scalar string) string {
+	switch scalar {
+	case "String":
+		return "text"
+	case "Int", "SmallInt", "BigInt":
+		return "integer"
+	case "Float", "Decimal":
+		return "numeric"
+	case "Boolean":
+		return "bool"
+	case "":
+		return ""
+	default:
+		return scalar
+	}
+}
+
+func nativeTypeCategory(native, scalar string) string {
+	switch strings.ToLower(native) {
+	case "text", "varchar", "char", "character", "bpchar", "citext", "name":
+		return "text"
+	case "int", "integer", "smallint", "bigint", "int2", "int4", "int8":
+		return "integer"
+	case "decimal", "numeric", "real", "doubleprecision", "double", "float4", "float8", "money":
+		return "numeric"
+	case "boolean", "bool":
+		return "bool"
+	}
+	return scalarTypeCategory(scalar)
+}
+
+// postgresUsingCast returns the USING expression converting col to newType.
+// Text converts to and from every type, numeric types convert among
+// themselves, and integers convert to and from booleans. Other conversions,
+// including every enum conversion, go through text, which always parses and
+// converts values by their text representation. A scalar becomes a
+// one-element array.
+func postgresUsingCast(col, newType string, from, to columnType) string {
+	if from.category != "" && !from.isList && to.isList && strings.HasSuffix(newType, "[]") {
+		element := columnType{category: to.category}
+		return "ARRAY[" + postgresUsingCast(col, strings.TrimSuffix(newType, "[]"), from, element) + "]"
+	}
+	direct := from.category != "enum" && to.category != "enum" && from.isList == to.isList
+	if direct {
+		numeric := func(c string) bool { return c == "integer" || c == "numeric" }
+		switch {
+		case from.category == "" || to.category == "":
+		case from.category == to.category:
+		case from.category == "text" || to.category == "text":
+		case numeric(from.category) && numeric(to.category):
+		case from.category == "bool" && to.category == "integer", from.category == "integer" && to.category == "bool":
+		default:
+			direct = false
+		}
+	}
+	if direct {
+		return col + "::" + newType
+	}
+	return col + "::text::" + newType
+}
+
 func (g DDLGenerator) alterNullSQL(c Change) string {
-	tbl := g.quoteID(c.Model)
+	tbl := g.tableRef(c.Schema, c.Model)
 	col := g.quoteID(c.Field)
 
 	nullable := c.NewValue == "optional"
@@ -508,13 +611,14 @@ func (g DDLGenerator) alterNullSQL(c Change) string {
 }
 
 func (g DDLGenerator) alterDefaultSQL(c Change) string {
-	tbl := g.quoteID(c.Model)
+	if g.Dialect == "postgresql" {
+		return g.postgresAlterDefaultSQL(c)
+	}
+	tbl := g.tableRef(c.Schema, c.Model)
 	col := g.quoteID(c.Field)
 
 	if c.NewValue == "" {
 		switch g.Dialect {
-		case "postgresql":
-			return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;", tbl, col)
 		case "mysql":
 			return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;", tbl, col)
 		default:
@@ -524,8 +628,6 @@ func (g DDLGenerator) alterDefaultSQL(c Change) string {
 
 	if isAutoIncrementDefault(c.NewValue) {
 		switch g.Dialect {
-		case "postgresql":
-			return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s ADD GENERATED BY DEFAULT AS IDENTITY;", tbl, col)
 		case "mysql":
 			return fmt.Sprintf("-- MySQL: adding AUTO_INCREMENT requires MODIFY COLUMN with the full column definition for %s.%s", c.Model, c.Field)
 		default:
@@ -534,8 +636,6 @@ func (g DDLGenerator) alterDefaultSQL(c Change) string {
 	}
 
 	switch g.Dialect {
-	case "postgresql":
-		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;", tbl, col, g.defaultExprForChange(c))
 	case "mysql":
 		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;", tbl, col, g.defaultExprForChange(c))
 	default:
@@ -543,19 +643,61 @@ func (g DDLGenerator) alterDefaultSQL(c Change) string {
 	}
 }
 
+// postgresAlterDefaultSQL changes a column default. autoincrement() maps to
+// an identity column, which has no DEFAULT expression: it is removed with
+// DROP IDENTITY, and an added identity starts after the column's current
+// maximum value.
+func (g DDLGenerator) postgresAlterDefaultSQL(c Change) string {
+	tbl := g.tableRef(c.Schema, c.Model)
+	col := g.quoteID(c.Field)
+	oldIdentity := isAutoIncrementDefault(c.OldValue)
+	newIdentity := isAutoIncrementDefault(c.NewValue)
+
+	var statements []string
+	switch {
+	case oldIdentity && newIdentity:
+		return ""
+	case oldIdentity:
+		statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP IDENTITY IF EXISTS;", tbl, col))
+		if c.NewValue != "" {
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;", tbl, col, g.defaultExprForChange(c)))
+		} else {
+			// serial columns (introspected as autoincrement) use a nextval()
+			// default rather than identity; after DROP IDENTITY this is a
+			// harmless no-op for identity columns.
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;", tbl, col))
+		}
+	case newIdentity:
+		if c.OldValue != "" {
+			statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;", tbl, col))
+		}
+		statements = append(statements,
+			fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s ADD GENERATED BY DEFAULT AS IDENTITY;", tbl, col),
+			fmt.Sprintf("SELECT setval(pg_get_serial_sequence(%s, %s), GREATEST(COALESCE(MAX(%s), 0), 0) + 1, false) FROM %s;",
+				quoteSQLString(tbl), quoteSQLString(c.Field), col, tbl))
+	case c.NewValue == "":
+		statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;", tbl, col))
+	default:
+		statements = append(statements, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;", tbl, col, g.defaultExprForChange(c)))
+	}
+	return strings.Join(statements, "\n")
+}
+
 func (g DDLGenerator) addIndexSQL(c Change) string {
 	name := c.NewValue
 	if name == "" {
-		name = fmt.Sprintf("idx_%s_%s", c.Model, c.Details["fields"])
+		name = DefaultIndexNameFor(g.Dialect, c.Model, splitDetailList(c.Details["fields"]), c.Details["unique"] == "true")
 	}
 	unique := ""
 	if c.Details["unique"] == "true" {
 		unique = "UNIQUE "
 	}
-	return g.createIndexSQL(name, c.Model, unique, g.indexColumnsFromDetails(c.Details), c.Details["where"], detailsHaveExpressions(c.Details))
+	return g.createIndexSQL(name, c.Schema, c.Model, unique, g.indexColumnsFromDetails(c.Details), c.Details["where"], detailsHaveExpressions(c.Details))
 }
 
-func (g DDLGenerator) createIndexSQL(name, tableName, unique, columns, where string, hasExpression bool) string {
+// createIndexSQL creates an index on a table. PostgreSQL places the index in
+// the table's schema, so the index name itself is never qualified.
+func (g DDLGenerator) createIndexSQL(name, schemaName, tableName, unique, columns, where string, hasExpression bool) string {
 	if hasExpression && g.Dialect != "postgresql" {
 		return fmt.Sprintf("-- %s: PostgreSQL expression index %s is not supported", strings.ToUpper(g.Dialect), name)
 	}
@@ -563,7 +705,7 @@ func (g DDLGenerator) createIndexSQL(name, tableName, unique, columns, where str
 		return fmt.Sprintf("-- MySQL: partial indexes are not supported for index %s", name)
 	}
 	sql := fmt.Sprintf("CREATE %sINDEX %s ON %s (%s)",
-		unique, g.quoteID(name), g.quoteID(tableName), columns)
+		unique, g.quoteID(name), g.tableRef(schemaName, tableName), columns)
 	if strings.TrimSpace(where) != "" {
 		sql += " WHERE " + strings.TrimSpace(where)
 	}
@@ -703,14 +845,29 @@ func detailAt(values []string, idx int) string {
 	return ""
 }
 
+// dropIndexSQL drops an index. For a generated name that was shortened by
+// LimitIdentifier it also drops the full name, which PostgreSQL truncated
+// when older versions created the index.
 func (g DDLGenerator) dropIndexSQL(c Change) string {
+	fields := splitDetailList(c.Details["fields"])
+	unique := c.Details["unique"] == "true"
 	name := c.OldValue
 	if name == "" {
-		name = fmt.Sprintf("idx_%s_%s", c.Model, c.Details["fields"])
+		name = DefaultIndexNameFor(g.Dialect, c.Model, fields, unique)
 	}
 	switch g.Dialect {
 	case "mysql":
 		return fmt.Sprintf("DROP INDEX %s ON %s;", g.quoteID(name), g.quoteID(c.Model))
+	case "postgresql":
+		sql := fmt.Sprintf("DROP INDEX IF EXISTS %s;", g.qualifiedName(c.Schema, name))
+		prefix := "idx_"
+		if unique {
+			prefix = "uq_"
+		}
+		if legacy := prefix + c.Model + "_" + strings.Join(fields, "_"); legacy != name && LimitIdentifier(legacy) == name {
+			sql += fmt.Sprintf("\nDROP INDEX IF EXISTS %s;", g.qualifiedName(c.Schema, legacy))
+		}
+		return sql
 	default:
 		return fmt.Sprintf("DROP INDEX IF EXISTS %s;", g.quoteID(name))
 	}
@@ -719,45 +876,51 @@ func (g DDLGenerator) dropIndexSQL(c Change) string {
 func (g DDLGenerator) addUniqueSQL(c Change) string {
 	fields := g.quoteIDs(strings.Split(c.Details["fields"], ","))
 	name := c.NewValue
-	name = effectiveUniqueName(c.Model, name, strings.Split(c.Details["fields"], ","))
+	name = g.effectiveUniqueName(c.Model, name, strings.Split(c.Details["fields"], ","))
 	if g.Dialect == "postgresql" {
 		return fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s UNIQUE (%s);",
-			g.quoteID(c.Model), g.quoteID(name), strings.Join(fields, ", "))
+			g.tableRef(c.Schema, c.Model), g.quoteID(name), strings.Join(fields, ", "))
 	}
 	return fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s (%s);",
 		g.quoteID(name), g.quoteID(c.Model), strings.Join(fields, ", "))
 }
 
+// dropUniqueSQL drops a unique constraint. An unnamed PostgreSQL constraint
+// may carry the generated name, the full generated name truncated by older
+// versions, or the name PostgreSQL assigned, so each is dropped if present.
 func (g DDLGenerator) dropUniqueSQL(c Change) string {
 	name := c.OldValue
 	fields := strings.Split(c.Details["fields"], ",")
 	switch g.Dialect {
 	case "postgresql":
+		tbl := g.tableRef(c.Schema, c.Model)
 		if name == "" {
-			canonical := effectiveUniqueName(c.Model, "", fields)
-			legacy := postgresDefaultUniqueName(c.Model, fields)
-			return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;\nALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;",
-				g.quoteID(c.Model), g.quoteID(canonical), g.quoteID(c.Model), g.quoteID(legacy))
+			names := []string{g.effectiveUniqueName(c.Model, "", fields)}
+			if full := "uq_" + c.Model + "_" + strings.Join(fields, "_"); full != names[0] {
+				names = append(names, full)
+			}
+			names = append(names, PostgresUniqueKeyName(c.Model, fields))
+			statements := make([]string, len(names))
+			for i, n := range names {
+				statements[i] = fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;", tbl, g.quoteID(n))
+			}
+			return strings.Join(statements, "\n")
 		}
-		return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;", g.quoteID(c.Model), g.quoteID(name))
+		return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;", tbl, g.quoteID(name))
 	case "mysql":
-		name = effectiveUniqueName(c.Model, name, fields)
+		name = g.effectiveUniqueName(c.Model, name, fields)
 		return fmt.Sprintf("DROP INDEX %s ON %s;", g.quoteID(name), g.quoteID(c.Model))
 	default:
-		name = effectiveUniqueName(c.Model, name, fields)
+		name = g.effectiveUniqueName(c.Model, name, fields)
 		return fmt.Sprintf("DROP INDEX IF EXISTS %s;", g.quoteID(name))
 	}
 }
 
-func effectiveUniqueName(table, name string, fields []string) string {
+func (g DDLGenerator) effectiveUniqueName(table, name string, fields []string) string {
 	if name != "" {
 		return name
 	}
-	return "uq_" + table + "_" + strings.Join(fields, "_")
-}
-
-func postgresDefaultUniqueName(table string, fields []string) string {
-	return table + "_" + strings.Join(fields, "_") + "_key"
+	return DefaultUniqueNameFor(g.Dialect, table, fields)
 }
 
 func modelUniqueConstraints(model *ir.Model) []*ir.UniqueConstraint {
@@ -789,7 +952,7 @@ func modelUniqueConstraints(model *ir.Model) []*ir.UniqueConstraint {
 }
 
 func (g DDLGenerator) changePKSQL(c Change) string {
-	tbl := g.quoteID(c.Model)
+	tbl := g.tableRef(c.Schema, c.Model)
 	var parts []string
 
 	if c.OldValue != "" {
@@ -798,7 +961,7 @@ func (g DDLGenerator) changePKSQL(c Change) string {
 			parts = append(parts, fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY;", tbl))
 		default:
 			parts = append(parts, fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;",
-				tbl, g.quoteID(c.Model+"_pkey")))
+				tbl, g.quoteID(PostgresPrimaryKeyName(c.Model))))
 		}
 	}
 
@@ -815,13 +978,13 @@ func (g DDLGenerator) addFKSQL(c Change) string {
 	if g.Dialect == "sqlite" {
 		return fmt.Sprintf("-- SQLite: adding foreign key constraints requires table rebuild for %s", c.Model)
 	}
-	tbl := g.quoteID(c.Model)
+	tbl := g.tableRef(c.Schema, c.Model)
 	localFields := g.quoteIDs(strings.Split(c.Details["fields"], ","))
 	refFields := g.quoteIDs(strings.Split(c.Details["references"], ","))
-	refTable := g.quoteID(c.Details["toModel"])
+	refTable := g.tableRef(c.Details["toSchema"], c.Details["toModel"])
 	name := c.Details["name"]
 	if name == "" {
-		name = fmt.Sprintf("fk_%s_%s", c.Model, c.Details["fields"])
+		name = DefaultForeignKeyNameFor(g.Dialect, c.Model, splitDetailList(c.Details["fields"]))
 	}
 	constraintName := g.quoteID(name)
 
@@ -849,12 +1012,23 @@ func (g DDLGenerator) orderedChanges(cs *Changeset) []Change {
 	createTables := make([]Change, 0)
 	addFKs := make([]Change, 0)
 	dropTables := make([]Change, 0)
-	var dropTriggers, addTriggers []Change
+	var dropTriggers, addTriggers, schemaMoves []Change
 
 	for _, c := range cs.Changes {
 		switch c.Type {
+		case SetTableSchema:
+			schemaMoves = append(schemaMoves, c)
 		case CreateEnum:
 			createEnums = append(createEnums, c)
+		case RenameEnum, AlterEnum:
+			// PostgreSQL changes enum types before any table change, so their
+			// reversal runs after table changes are reverted. MySQL rewrites the
+			// enum columns, which must exist by then.
+			if g.Dialect == "postgresql" {
+				createEnums = append(createEnums, c)
+			} else {
+				others = append(others, c)
+			}
 		case DropEnum:
 			dropEnums = append(dropEnums, c)
 		case DropFK:
@@ -875,7 +1049,10 @@ func (g DDLGenerator) orderedChanges(cs *Changeset) []Change {
 	}
 
 	ordered := make([]Change, 0, len(cs.Changes))
+	// Triggers are dropped from their source tables before tables move;
+	// every later change addresses a moved table in its target schema.
 	ordered = append(ordered, dropTriggers...)
+	ordered = append(ordered, schemaMoves...)
 	ordered = append(ordered, createEnums...)
 	ordered = append(ordered, dropFKs...)
 	ordered = append(ordered, orderOtherChanges(others)...)
@@ -914,8 +1091,9 @@ func (g DDLGenerator) sortTableChanges(changes []Change, schema *ir.Schema, reve
 	changeByTable := make(map[string]Change, len(changes))
 	tables := make([]string, 0, len(changes))
 	for _, c := range changes {
-		changeByTable[c.Model] = c
-		tables = append(tables, c.Model)
+		key := tableKey(c.Schema, c.Model)
+		changeByTable[key] = c
+		tables = append(tables, key)
 	}
 
 	orderedTables := topoSortTables(schema, tables)
@@ -932,6 +1110,8 @@ func (g DDLGenerator) sortTableChanges(changes []Change, schema *ir.Schema, reve
 	return ordered
 }
 
+// topoSortTables orders table keys (see tableKey) so that referenced tables
+// come before the tables whose foreign keys reference them.
 func topoSortTables(schema *ir.Schema, tables []string) []string {
 	if len(tables) == 0 {
 		return nil
@@ -950,7 +1130,7 @@ func topoSortTables(schema *ir.Schema, tables []string) []string {
 
 	if schema != nil {
 		for _, model := range schema.Models {
-			fromTable := model.TableName()
+			fromTable := modelKey(model)
 			if _, ok := tableSet[fromTable]; !ok {
 				continue
 			}
@@ -962,7 +1142,7 @@ func topoSortTables(schema *ir.Schema, tables []string) []string {
 				if targetModel == nil {
 					continue
 				}
-				toTable := targetModel.TableName()
+				toTable := modelKey(targetModel)
 				if toTable == fromTable {
 					continue
 				}
@@ -1018,19 +1198,34 @@ func topoSortTables(schema *ir.Schema, tables []string) []string {
 	return append(ordered, remaining...)
 }
 
+// dropFKSQL drops a foreign key. Without an explicit name, PostgreSQL and
+// SQLite also drop the names older versions generated: comma-joined fields
+// and full names longer than the identifier limit.
 func (g DDLGenerator) dropFKSQL(c Change) string {
-	tbl := g.quoteID(c.Model)
+	tbl := g.tableRef(c.Schema, c.Model)
+	fields := splitDetailList(c.Details["fields"])
 	name := c.Details["name"]
 	if name == "" {
-		name = fmt.Sprintf("fk_%s_%s", c.Model, c.Details["fields"])
+		name = DefaultForeignKeyNameFor(g.Dialect, c.Model, fields)
 	}
-	constraintName := g.quoteID(name)
 
 	switch g.Dialect {
 	case "mysql":
-		return fmt.Sprintf("ALTER TABLE %s DROP FOREIGN KEY %s;", tbl, constraintName)
+		return fmt.Sprintf("ALTER TABLE %s DROP FOREIGN KEY %s;", tbl, g.quoteID(name))
 	default:
-		return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;", tbl, constraintName)
+		names := []string{name}
+		if c.Details["name"] == "" {
+			for _, legacy := range []string{"fk_" + c.Model + "_" + strings.Join(fields, "_"), legacyForeignKeyName(c.Model, fields)} {
+				if legacy != names[len(names)-1] && legacy != name {
+					names = append(names, legacy)
+				}
+			}
+		}
+		statements := make([]string, len(names))
+		for i, n := range names {
+			statements[i] = fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;", tbl, g.quoteID(n))
+		}
+		return strings.Join(statements, "\n")
 	}
 }
 
@@ -1039,28 +1234,36 @@ func (g DDLGenerator) dropFKSQL(c Change) string {
 // ---------------------------------------------------------------------------
 
 func (g DDLGenerator) changeToDown(c Change, cs *Changeset) string {
-	if cs != nil && cs.Old != nil {
+	if cs == nil {
+		cs = &Changeset{}
+	}
+	if cs.Old != nil {
 		g.Schema = cs.Old
 	}
 	switch c.Type {
 	case AddTrigger:
-		return g.dropTriggerSQL(c.Model, c.Field)
+		return g.dropTriggerSQL(c.Schema, c.Model, c.Field)
 	case DropTrigger:
-		if cs != nil && findModel(cs.Old, c.Model) != nil && findModel(cs.New, c.Model) == nil {
+		if cs != nil && findTableModel(cs.Old, c.Schema, c.Model) != nil && findTableModel(cs.New, c.Schema, c.Model) == nil {
 			return fmt.Sprintf("-- WARNING: restore table %s before recreating its trigger %s", g.quoteID(c.Model), g.quoteID(c.Field))
 		}
-		steps := g.createTriggerSteps(c.Model, c.Trigger)
+		steps := g.createTriggerSteps(c.Schema, c.Model, c.Trigger)
 		statements := make([]string, 0, len(steps))
 		for _, step := range steps {
 			statements = append(statements, g.scriptSQL(step))
 		}
 		return strings.Join(statements, "\n\n")
 	case CreateTable:
-		return fmt.Sprintf("DROP TABLE %s;", g.quoteID(c.Model))
+		return fmt.Sprintf("DROP TABLE %s;", g.tableRef(c.Schema, c.Model))
 	case DropTable:
 		return fmt.Sprintf("-- WARNING: destructive — cannot recreate %s without original schema", c.Model)
+	case SetTableSchema:
+		if g.Dialect != "postgresql" {
+			return ""
+		}
+		return g.scriptSQL(g.setTableSchemaStep(c.Model, c.NewValue, c.OldValue, cs.New, cs.Old))
 	case AddColumn:
-		return fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", g.quoteID(c.Model), g.quoteID(c.Field))
+		return fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s;", g.tableRef(c.Schema, c.Model), g.quoteID(c.Field))
 	case DropColumn:
 		return fmt.Sprintf("-- WARNING: destructive — cannot restore column %s.%s without original definition", c.Model, c.Field)
 	case AlterType:
@@ -1074,6 +1277,9 @@ func (g DDLGenerator) changeToDown(c Change, cs *Changeset) string {
 		rev.OldField, rev.NewField = c.NewField, c.OldField
 		return "-- REVIEW REQUIRED: reverting nullability change\n" + g.alterNullSQL(rev)
 	case AlterDefault:
+		if g.Dialect == "postgresql" && postgresAlterTypeSetsDefault(cs, c) {
+			return ""
+		}
 		rev := c
 		rev.OldValue, rev.NewValue = c.NewValue, c.OldValue
 		rev.OldField, rev.NewField = c.NewField, c.OldField
@@ -1104,6 +1310,7 @@ func (g DDLGenerator) changeToDown(c Change, cs *Changeset) string {
 		return g.dropFKSQL(rev)
 	case DropFK:
 		rev := c
+		rev.Details = movedForeignKeyTarget(cs, c.Details)
 		return g.addFKSQL(rev)
 	case CreateEnum:
 		if g.Dialect == "postgresql" {
@@ -1118,12 +1325,15 @@ func (g DDLGenerator) changeToDown(c Change, cs *Changeset) string {
 			return "-- WARNING: destructive — cannot recreate enum " + c.Model + " without original schema"
 		}
 		return "" // MySQL and SQLite enums are inline column types; nothing to recreate.
+	case RenameEnum:
+		if g.Dialect == "postgresql" {
+			return g.postgresRenameEnumSQL(c.NewValue, c.OldValue)
+		}
+		return ""
 	case AlterEnum:
 		switch g.Dialect {
 		case "postgresql":
-			// PostgreSQL enum values cannot be removed; a true revert requires
-			// recreating the type and rewriting dependent columns.
-			return "-- REVIEW REQUIRED: cannot revert enum change for " + c.Model + "; PostgreSQL enum values cannot be removed"
+			return g.postgresRevertEnumSQL(c, cs)
 		case "mysql":
 			if sql := g.mysqlRefreshEnumColumnsFrom(cs.Old, c.Model); sql != "" {
 				return sql
@@ -1147,6 +1357,21 @@ func (g DDLGenerator) quoteID(name string) string {
 	default: // postgresql, sqlite
 		return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 	}
+}
+
+// tableRef renders a table reference. On PostgreSQL a table with a schema
+// (@@schema) is qualified; otherwise the name resolves through search_path.
+func (g DDLGenerator) tableRef(schemaName, table string) string {
+	return g.qualifiedName(schemaName, table)
+}
+
+// qualifiedName renders a schema-qualified object name on PostgreSQL. Other
+// dialects have no schemas, so the schema is ignored.
+func (g DDLGenerator) qualifiedName(schemaName, name string) string {
+	if g.Dialect == "postgresql" && schemaName != "" {
+		return g.quoteID(schemaName) + "." + g.quoteID(name)
+	}
+	return g.quoteID(name)
 }
 
 func (g DDLGenerator) quoteIDs(names []string) []string {
@@ -1243,10 +1468,6 @@ func (g DDLGenerator) sqlTypeSignature(typeName string) string {
 // Column definition builder
 // ---------------------------------------------------------------------------
 
-func (g DDLGenerator) columnDef(f *ir.Field) string {
-	return g.columnDefInternal(nil, f, true)
-}
-
 // columnDefForModify renders a column definition for ALTER TABLE ... MODIFY
 // COLUMN. Inline UNIQUE is omitted: each MODIFY would otherwise create a new
 // duplicate unique index on MySQL.
@@ -1280,11 +1501,28 @@ func (g DDLGenerator) columnDefInternal(model *ir.Model, f *ir.Field, allowInlin
 		parts = append(parts, "UNIQUE")
 	}
 
-	if f.Default != nil && !g.isAutoIncrementField(f) {
+	if expr, ok := generatedColumnExpr(f); ok {
+		parts = append(parts, "GENERATED ALWAYS AS ("+expr+") STORED")
+	} else if g.hasDatabaseDefault(f) {
 		parts = append(parts, "DEFAULT "+g.defaultExprForField(f))
 	}
 
 	return strings.Join(parts, " ")
+}
+
+// hasDatabaseDefault reports whether the column carries a DEFAULT clause.
+// Identity columns, client-generated cuid() values, and generated columns
+// have none.
+func (g DDLGenerator) hasDatabaseDefault(f *ir.Field) bool {
+	return f != nil && f.Default != nil && !f.IsGenerated && !g.isAutoIncrementField(f) && !isCUIDDefault(f.Default)
+}
+
+// generatedColumnExpr returns the expression of a generated column.
+func generatedColumnExpr(f *ir.Field) (string, bool) {
+	if f == nil || !f.IsGenerated || f.Default == nil || !f.Default.IsFunction || f.Default.FuncName != "dbgenerated" || len(f.Default.FuncArgs) == 0 {
+		return "", false
+	}
+	return dbGeneratedExpr(f.Default.FuncArgs[0]), true
 }
 
 func (g DDLGenerator) sqliteInlineAutoIncrementPrimaryKeyColumn(model *ir.Model) string {
@@ -1328,17 +1566,23 @@ func (g DDLGenerator) columnSQLType(f *ir.Field) string {
 		return g.sqlType("")
 	}
 	if f.NativeType != nil {
+		if f.IsList && g.Dialect == "postgresql" {
+			return g.nativeTypeSQL(f.NativeType) + "[]"
+		}
 		return g.nativeTypeSQL(f.NativeType)
 	}
 	if f.Type == ir.FieldKindEnum {
 		if g.Dialect == "postgresql" {
+			if f.IsList {
+				return g.quoteID(enumDBName(g.Schema, f.EnumType)) + "[]"
+			}
 			return g.quoteID(enumDBName(g.Schema, f.EnumType))
 		}
 		if g.Dialect == "mysql" {
 			if enum := findEnum(g.Schema, f.EnumType); enum != nil {
 				values := make([]string, len(enum.Values))
 				for i, value := range enum.Values {
-					values[i] = quoteSQLString(value.Name)
+					values[i] = quoteSQLString(enumValueLabel(value))
 				}
 				return "ENUM(" + strings.Join(values, ", ") + ")"
 			}
@@ -1362,6 +1606,15 @@ func (g DDLGenerator) nativeTypeSQL(nt *ir.NativeType) string {
 	for _, r := range name {
 		if !(r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
 			return "TEXT"
+		}
+	}
+	if g.Dialect == "mysql" && len(nt.Args) == 0 {
+		// MySQL spells unsigned integers as a modifier, not a type name.
+		switch name {
+		case "UnsignedInt":
+			return "INT UNSIGNED"
+		case "UnsignedBigInt":
+			return "BIGINT UNSIGNED"
 		}
 	}
 	if len(nt.Args) == 0 {
@@ -1392,17 +1645,35 @@ func findEnum(schema *ir.Schema, name string) *ir.Enum {
 	return nil
 }
 
+// enumValueDBLabel maps an enum value name to its database label (@map). A
+// value that is not declared is returned unchanged.
+func enumValueDBLabel(schema *ir.Schema, enumName, value string) string {
+	if enum := findEnum(schema, enumName); enum != nil {
+		for _, v := range enum.Values {
+			if v.Name == value {
+				return enumValueLabel(v)
+			}
+		}
+	}
+	return value
+}
+
 func (g DDLGenerator) defaultExprForField(f *ir.Field) string {
 	if f == nil || f.Default == nil {
 		return "''"
 	}
-	if f.Default.IsArray {
-		return g.arrayDefaultExpr(f.Default)
+	d := f.Default
+	switch {
+	case d.IsArray:
+		return g.fieldArrayDefaultExpr(f)
+	case d.IsFunction:
+		return g.functionDefaultExpr(d.FuncName, d.FuncArgs)
+	case f.Type == ir.FieldKindEnum:
+		return quoteSQLString(enumValueDBLabel(g.Schema, f.EnumType, d.Value))
+	case d.IsString:
+		return quoteSQLString(d.Value)
 	}
-	if f.Default.IsString {
-		return quoteSQLString(f.Default.Value)
-	}
-	return g.defaultExpr(formatDefault(f.Default))
+	return g.defaultExpr(formatDefault(d))
 }
 
 func quoteSQLString(value string) string {
@@ -1413,10 +1684,47 @@ func (g DDLGenerator) defaultExprForChange(c Change) string {
 	if c.NewField != nil && c.NewField.Default != nil {
 		return g.defaultExprForField(c.NewField)
 	}
-	if f := findField(g.Schema, c.Model, c.Field); f != nil && f.Default != nil {
+	if f := findTableField(g.Schema, c.Schema, c.Model, c.Field); f != nil && f.Default != nil {
 		return g.defaultExprForField(f)
 	}
 	return g.defaultExpr(c.NewValue)
+}
+
+// fieldArrayDefaultExpr renders a list default with elements typed by the
+// field. PostgreSQL ARRAY[...] and '{}' literals do not assign to enum,
+// uuid, or timestamp arrays, so they are cast to the column type.
+func (g DDLGenerator) fieldArrayDefaultExpr(f *ir.Field) string {
+	values := make([]string, len(f.Default.ArrayValue))
+	for i, value := range f.Default.ArrayValue {
+		if f.Type == ir.FieldKindEnum {
+			value = enumValueDBLabel(g.Schema, f.EnumType, value)
+		}
+		values[i] = value
+	}
+	if g.Dialect != "postgresql" {
+		return g.arrayDefaultExpr(&ir.DefaultValue{IsArray: true, ArrayValue: values})
+	}
+	castType := g.columnSQLType(f)
+	if !strings.HasSuffix(castType, "[]") {
+		castType += "[]"
+	}
+	if len(values) == 0 {
+		return "'{}'::" + castType
+	}
+	quoted := f.Type == ir.FieldKindEnum
+	switch f.ScalarType {
+	case "String", "UUID", "DateTime", "Json", "Bytes":
+		quoted = true
+	}
+	parts := make([]string, len(values))
+	for i, value := range values {
+		if quoted {
+			parts[i] = quoteSQLString(value)
+		} else {
+			parts[i] = g.defaultExpr(value)
+		}
+	}
+	return "ARRAY[" + strings.Join(parts, ", ") + "]::" + castType
 }
 
 func (g DDLGenerator) arrayDefaultExpr(d *ir.DefaultValue) string {
@@ -1453,8 +1761,8 @@ func (g DDLGenerator) defaultExpr(val string) string {
 	if val == "" {
 		return "''"
 	}
-	if expr, ok := g.mappedDefaultFunction(val); ok {
-		return expr
+	if funcName, args, ok := parseDefaultFunction(val); ok {
+		return g.functionDefaultExpr(funcName, args)
 	}
 	// Function-style defaults without a dialect-specific rewrite pass through.
 	if isFunctionDefault(val) {
@@ -1472,15 +1780,32 @@ func (g DDLGenerator) defaultExpr(val string) string {
 	return val
 }
 
-func (g DDLGenerator) mappedDefaultFunction(val string) (string, bool) {
-	funcName, args, ok := parseDefaultFunction(val)
-	if !ok {
-		return "", false
+// functionDefaultExpr renders a default function call. dbgenerated() emits
+// its expression verbatim; other functions map through the dialect.
+func (g DDLGenerator) functionDefaultExpr(funcName string, args []string) string {
+	if funcName == "dbgenerated" {
+		if len(args) == 0 {
+			return "NULL"
+		}
+		return dbGeneratedExpr(args[0])
 	}
 	if d := g.sqlDialect(); d != nil {
-		return d.DefaultValueExpression(funcName, args), true
+		return d.DefaultValueExpression(funcName, args)
 	}
-	return val, true
+	return formatDefault(&ir.DefaultValue{IsFunction: true, FuncName: funcName, FuncArgs: args})
+}
+
+// dbGeneratedExpr returns the SQL expression of a dbgenerated() argument. The
+// schema parser already unquotes string arguments; a double-quoted string
+// literal that reaches this point is unquoted as well.
+func dbGeneratedExpr(arg string) string {
+	arg = strings.TrimSpace(arg)
+	if strings.HasPrefix(arg, `"`) {
+		if unquoted, err := strconv.Unquote(arg); err == nil {
+			return strings.TrimSpace(unquoted)
+		}
+	}
+	return arg
 }
 
 func (g DDLGenerator) sqlDialect() runtimepkg.Dialect {
@@ -1496,6 +1821,9 @@ func (g DDLGenerator) sqlDialect() runtimepkg.Dialect {
 	}
 }
 
+// parseDefaultFunction parses a formatted function default such as
+// uuid() or dbgenerated(expr). dbgenerated takes a single SQL expression, so
+// its argument is never split; other arguments split on top-level commas.
 func parseDefaultFunction(val string) (string, []string, bool) {
 	trimmed := strings.TrimSpace(val)
 	if !isFunctionDefault(trimmed) {
@@ -1516,13 +1844,36 @@ func parseDefaultFunction(val string) (string, []string, bool) {
 	if argsText == "" {
 		return funcName, nil, true
 	}
-
-	rawArgs := strings.Split(argsText, ",")
-	args := make([]string, 0, len(rawArgs))
-	for _, arg := range rawArgs {
-		args = append(args, strings.TrimSpace(arg))
+	if funcName == "dbgenerated" {
+		return funcName, []string{argsText}, true
 	}
-	return funcName, args, true
+	return funcName, splitTopLevelArgs(argsText), true
+}
+
+// splitTopLevelArgs splits on commas outside parentheses and quotes.
+func splitTopLevelArgs(text string) []string {
+	var args []string
+	depth, start := 0, 0
+	var quote byte
+	for i := 0; i < len(text); i++ {
+		ch := text[i]
+		switch {
+		case quote != 0:
+			if ch == quote {
+				quote = 0
+			}
+		case ch == '\'' || ch == '"':
+			quote = ch
+		case ch == '(':
+			depth++
+		case ch == ')':
+			depth--
+		case ch == ',' && depth == 0:
+			args = append(args, strings.TrimSpace(text[start:i]))
+			start = i + 1
+		}
+	}
+	return append(args, strings.TrimSpace(text[start:]))
 }
 
 func isFunctionDefault(val string) bool {

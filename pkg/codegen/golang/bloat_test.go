@@ -16,10 +16,12 @@ import (
 // count (excluding gen/internal). The current codegen has not yet applied the
 // planned compression strategies (generics, shared scalar filters), so we use
 // a higher regression ceiling for now and track progress toward the 8× goal.
+// The ceiling includes the fixed-size client helpers emitted once per client
+// (scalar-list codec, cuid generator, bind-limited bulk batching, savepoints).
 func TestCodegenBloatThreshold(t *testing.T) {
 	const (
 		targetRatio     = 8.0   // §6.6 aspirational goal
-		regressionLimit = 100.0 // ceiling after real query execution codegen
+		regressionLimit = 110.0 // ceiling after real query execution codegen and PostgreSQL client fixes
 	)
 
 	schemaSource, err := os.ReadFile("../../../testdata/full_schema.gcorm")

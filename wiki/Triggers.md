@@ -38,8 +38,10 @@ quote, and `\\` for a backslash inside the schema string.
 
 Use the same models with a PostgreSQL datasource and provide a complete
 PL/pgSQL function body. GCORM creates the associated trigger function in the
-active schema and captures the migration session's `search_path` for that
-function.
+table's schema: the `@@schema` of the model, or the active schema when the
+model has none. The function captures the migration session's `search_path`,
+so qualify references to tables in other schemas inside the body. When a
+model's `@@schema` changes, the function moves with the table.
 
 ```gcorm
 @@trigger(

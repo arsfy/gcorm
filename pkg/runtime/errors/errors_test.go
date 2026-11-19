@@ -29,6 +29,9 @@ func TestErrorCode_String(t *testing.T) {
 		{CodeCheckViolation, "CheckViolation"},
 		{CodeNotNullViolation, "NotNullViolation"},
 		{CodeDataTruncation, "DataTruncation"},
+		{CodeExclusionViolation, "ExclusionViolation"},
+		{CodeNumericOutOfRange, "NumericOutOfRange"},
+		{CodeInvalidTextRepresentation, "InvalidTextRepresentation"},
 	}
 	for _, tc := range cases {
 		if got := tc.code.String(); got != tc.want {

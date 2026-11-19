@@ -23,23 +23,31 @@ const (
 	CodeCheckViolation
 	CodeNotNullViolation
 	CodeDataTruncation
+	CodeExclusionViolation
+	CodeNumericOutOfRange
+	// CodeInvalidTextRepresentation covers input values the database could
+	// not parse for the target type (PostgreSQL SQLSTATE 22P02).
+	CodeInvalidTextRepresentation
 )
 
 var codeNames = map[ErrorCode]string{
-	CodeUnknown:              "Unknown",
-	CodeUniqueViolation:      "UniqueViolation",
-	CodeForeignKeyViolation:  "ForeignKeyViolation",
-	CodeNotFound:             "NotFound",
-	CodeSerializationFailure: "SerializationFailure",
-	CodeDeadlock:             "Deadlock",
-	CodeConnectionError:      "ConnectionError",
-	CodeTimeout:              "Timeout",
-	CodeMigrationDrift:       "MigrationDrift",
-	CodeInvalidSchema:        "InvalidSchema",
-	CodeUnsupportedFeature:   "UnsupportedFeature",
-	CodeCheckViolation:       "CheckViolation",
-	CodeNotNullViolation:     "NotNullViolation",
-	CodeDataTruncation:       "DataTruncation",
+	CodeUnknown:                   "Unknown",
+	CodeUniqueViolation:           "UniqueViolation",
+	CodeForeignKeyViolation:       "ForeignKeyViolation",
+	CodeNotFound:                  "NotFound",
+	CodeSerializationFailure:      "SerializationFailure",
+	CodeDeadlock:                  "Deadlock",
+	CodeConnectionError:           "ConnectionError",
+	CodeTimeout:                   "Timeout",
+	CodeMigrationDrift:            "MigrationDrift",
+	CodeInvalidSchema:             "InvalidSchema",
+	CodeUnsupportedFeature:        "UnsupportedFeature",
+	CodeCheckViolation:            "CheckViolation",
+	CodeNotNullViolation:          "NotNullViolation",
+	CodeDataTruncation:            "DataTruncation",
+	CodeExclusionViolation:        "ExclusionViolation",
+	CodeNumericOutOfRange:         "NumericOutOfRange",
+	CodeInvalidTextRepresentation: "InvalidTextRepresentation",
 }
 
 // String returns the human-readable name of the error code.

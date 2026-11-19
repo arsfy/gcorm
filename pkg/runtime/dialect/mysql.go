@@ -134,8 +134,14 @@ func (MySQL) DefaultValueExpression(funcName string, args []string) string {
 		return "NOW(3)"
 	case "autoincrement":
 		return "AUTO_INCREMENT"
+	case "cuid":
+		// cuid() values are generated client-side; the column has no
+		// database default.
+		return ""
+	case "dbgenerated":
+		return dbGeneratedDefaultExpression(args)
 	default:
-		return funcName + "()"
+		return functionCallExpression(funcName, args)
 	}
 }
 

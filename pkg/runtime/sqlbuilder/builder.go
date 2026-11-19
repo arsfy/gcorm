@@ -1,6 +1,7 @@
 package sqlbuilder
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -13,7 +14,30 @@ type Builder struct {
 	dialect    string // "postgresql", "mysql", "sqlite"
 	limit      *int
 	offset     *int
+	err        error
 }
+
+// Err reports the first placeholder/argument mismatch recorded while
+// building, e.g. Where("a = ? AND b = ?", 1). Placeholder numbering always
+// stays aligned with the collected args, so later clauses are numbered
+// correctly even after a mismatch; callers must still check Err before
+// executing the statement.
+func (b *Builder) Err() error {
+	return b.err
+}
+
+func (b *Builder) recordPlaceholderMismatch(condition string, placeholders, nArgs int) {
+	// A negative count means the condition uses numbered or named parameters
+	// (?1, :name, @name, $name) whose arguments cannot be counted reliably.
+	if b.err != nil || placeholders < 0 || placeholders == nArgs {
+		return
+	}
+	b.err = fmt.Errorf("%w: %q has %d placeholder(s) but %d argument(s)", ErrPlaceholderMismatch, condition, placeholders, nArgs)
+}
+
+// ErrPlaceholderMismatch is wrapped by Builder.Err when a condition's "?"
+// placeholders do not match the number of supplied arguments.
+var ErrPlaceholderMismatch = errors.New("sqlbuilder: placeholder/argument count mismatch")
 
 // New creates a Builder for the given dialect.
 func New(dialect string) *Builder {
@@ -191,16 +215,23 @@ func (b *Builder) Build() (string, []any) {
 // rewrite replaces parameter "?" tokens with dialect-specific placeholders.
 // PostgreSQL overloads "?" as an operator character, so its path first skips
 // quoted/commented text and only preserves a question mark as an operator when
-// the surrounding significant tokens form an infix expression.
+// the surrounding significant tokens form an infix expression. A mismatch
+// between detected placeholders and nArgs is recorded for Err; the parameter
+// counter always advances by nArgs so numbering stays aligned with args.
 func (b *Builder) rewrite(s string, nArgs int) string {
-	if b.dialect != "postgresql" || nArgs == 0 {
+	if b.dialect != "postgresql" {
 		// For mysql/sqlite "?" is already correct; just bump the counter.
+		b.recordPlaceholderMismatch(s, countQuestionPlaceholders(s, b.dialect), nArgs)
 		b.paramCount += nArgs
 		return s
 	}
+	// Even without arguments the condition is scanned: a "?" that is not a
+	// PostgreSQL operator is a placeholder with no argument (a mismatch); the
+	// text itself is returned unchanged in that case.
 	var out strings.Builder
 	out.Grow(len(s))
-	replaced := 0
+	base := b.paramCount
+	found := 0
 	for i := 0; i < len(s); {
 		switch {
 		case s[i] == '\'':
@@ -219,6 +250,12 @@ func (b *Builder) rewrite(s string, nArgs int) string {
 			n := blockCommentLen(s[i:])
 			out.WriteString(s[i : i+n])
 			i += n
+		case isIdentByte(s[i]):
+			// Identifiers may contain "$" after their first character
+			// (a$b$), which must not open a dollar-quoted string.
+			n := identifierLen(s[i:])
+			out.WriteString(s[i : i+n])
+			i += n
 		case s[i] == '$':
 			if tag := dollarQuoteTag(s[i:]); tag != "" {
 				n := dollarQuotedTokenLen(s[i:], tag)
@@ -228,17 +265,78 @@ func (b *Builder) rewrite(s string, nArgs int) string {
 			}
 			out.WriteByte(s[i])
 			i++
-		case s[i] == '?' && replaced < nArgs && !isPostgresQuestionOperator(s, i):
-			b.paramCount++
-			replaced++
-			out.WriteString(fmt.Sprintf("$%d", b.paramCount))
+		case s[i] == '?' && !isPostgresQuestionOperator(s, i):
+			found++
+			if found <= nArgs {
+				out.WriteString(fmt.Sprintf("$%d", base+found))
+			} else {
+				out.WriteByte('?')
+			}
 			i++
 		default:
 			out.WriteByte(s[i])
 			i++
 		}
 	}
+	b.recordPlaceholderMismatch(s, found, nArgs)
+	b.paramCount = base + nArgs
 	return out.String()
+}
+
+// countQuestionPlaceholders counts "?" outside string literals, quoted
+// identifiers and comments for MySQL/SQLite.
+func countQuestionPlaceholders(s, dialect string) int {
+	count := 0
+	mysql := dialect == "mysql"
+	for i := 0; i < len(s); {
+		switch {
+		case s[i] == '\'' || s[i] == '"':
+			i += quotedTokenLen(s[i:], s[i], mysql)
+		case s[i] == '`':
+			i += quotedTokenLen(s[i:], '`', false)
+		case !mysql && s[i] == '[':
+			if end := strings.IndexByte(s[i:], ']'); end >= 0 {
+				i += end + 1
+			} else {
+				i = len(s)
+			}
+		case strings.HasPrefix(s[i:], "--"), mysql && s[i] == '#':
+			i += lineCommentLen(s[i:])
+		case strings.HasPrefix(s[i:], "/*"):
+			if end := strings.Index(s[i+2:], "*/"); end >= 0 {
+				i += end + 4
+			} else {
+				i = len(s)
+			}
+		case s[i] == '?':
+			if i+1 < len(s) && s[i+1] >= '0' && s[i+1] <= '9' {
+				return -1 // numbered parameter (?NNN) may be reused
+			}
+			count++
+			i++
+		case !mysql && (s[i] == ':' || s[i] == '@' || s[i] == '$') && i+1 < len(s) && isNamedParamStart(s[i+1]):
+			return -1 // SQLite named parameter
+		default:
+			i++
+		}
+	}
+	return count
+}
+
+// isNamedParamStart reports whether ch can start a SQLite named parameter
+// name (after ':', '@' or '$').
+func isNamedParamStart(ch byte) bool {
+	return ch == '_' || ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z'
+}
+
+// identifierLen returns the length of the identifier or keyword at the start
+// of s, including "$" characters after the first byte.
+func identifierLen(s string) int {
+	n := 1
+	for n < len(s) && (isIdentByte(s[n]) || s[n] == '$') {
+		n++
+	}
+	return n
 }
 
 func quotedTokenLen(s string, quote byte, backslashEscapes bool) int {
@@ -291,8 +389,14 @@ func blockCommentLen(s string) int {
 	return len(s)
 }
 
+// dollarQuoteTag returns the opening $tag$ (or $$) at the start of s. A tag
+// follows identifier rules without "$" and cannot start with a digit, so
+// positional parameters such as $1 never open a dollar quote.
 func dollarQuoteTag(s string) string {
 	if len(s) < 2 || s[0] != '$' {
+		return ""
+	}
+	if s[1] >= '0' && s[1] <= '9' {
 		return ""
 	}
 	for i := 1; i < len(s); i++ {
@@ -330,7 +434,7 @@ func isPostgresQuestionOperator(s string, i int) bool {
 	}
 
 	prev, ok := previousSignificantToken(s, start)
-	if !ok || !tokenCanEndValue(s, prev) {
+	if !ok || !tokenCanEndValue(s, prev, 0) {
 		return false
 	}
 	next, ok := nextSignificantToken(s, end)
@@ -399,6 +503,12 @@ token:
 			from += dollarQuotedTokenLen(s[from:], tag)
 			return sqlToken{kind: tokenValue, start: start, end: from}, true
 		}
+		if from+1 < len(s) && s[from+1] >= '0' && s[from+1] <= '9' {
+			// Positional parameter such as $1.
+			for from++; from < len(s) && s[from] >= '0' && s[from] <= '9'; from++ {
+			}
+			return sqlToken{kind: tokenValue, start: start, end: from}, true
+		}
 	case '(':
 		return sqlToken{kind: tokenLeftParen, start: start, end: from + 1}, true
 	case ')':
@@ -410,8 +520,7 @@ token:
 	}
 
 	if isIdentByte(s[from]) {
-		for from++; from < len(s) && isIdentByte(s[from]); from++ {
-		}
+		from += identifierLen(s[from:])
 		return sqlToken{kind: tokenWord, start: start, end: from}, true
 	}
 	if isPostgresOperatorByte(s[from]) {
@@ -425,21 +534,61 @@ token:
 	return sqlToken{kind: tokenOther, start: start, end: from + 1}, true
 }
 
+// isOperandPrefixKeyword reports reserved (or column-name) keywords that are
+// always followed by an operand. Non-reserved keywords that are valid column
+// names (ROWS, RANGE, FIRST, NEXT, ZONE, PARTITION...) are not listed here;
+// see isContextualOperandPrefixKeyword.
 func isOperandPrefixKeyword(word string) bool {
 	switch word {
-	case "ALL", "AND", "AS", "BETWEEN", "BY", "CASE", "DEFAULT", "DISTINCT", "ELSE", "EXISTS", "FETCH", "FIRST", "FROM", "GROUP", "HAVING", "ILIKE", "IN", "IS", "LIKE", "LIMIT", "NEXT", "NOT", "OFFSET", "ON", "OR", "ORDER", "PARTITION", "RANGE", "RETURNING", "ROWS", "SELECT", "SET", "SOME", "THEN", "USING", "VALUES", "WHEN", "WHERE", "ZONE":
+	case "ALL", "AND", "AS", "BETWEEN", "BY", "CASE", "DEFAULT", "DISTINCT", "ELSE", "EXISTS", "FETCH", "FROM", "GROUP", "HAVING", "ILIKE", "IN", "IS", "LIKE", "LIMIT", "NOT", "OFFSET", "ON", "OR", "ORDER", "RETURNING", "SELECT", "SET", "SOME", "THEN", "USING", "VALUES", "WHEN", "WHERE":
 		return true
 	default:
 		return false
 	}
 }
 
-func tokenCanEndValue(s string, tok sqlToken) bool {
+// isContextualOperandPrefixKeyword reports whether a non-reserved keyword at
+// tok acts as a keyword that precedes an operand, judged by the token before
+// it: FETCH FIRST|NEXT ?, AT TIME ZONE ?, and window frames such as
+// "ORDER BY x ROWS ? PRECEDING" or "OVER (RANGE ? PRECEDING)". Otherwise the
+// word is an ordinary column name, e.g. `rows ? 'k'`.
+func isContextualOperandPrefixKeyword(s string, tok sqlToken, word string, depth int) bool {
+	switch word {
+	case "FIRST", "NEXT", "ZONE", "ROWS", "RANGE", "GROUPS":
+	default:
+		return false
+	}
+	prev, ok := previousSignificantToken(s, tok.start)
+	if !ok {
+		return false
+	}
+	prevWord := ""
+	if prev.kind == tokenWord {
+		prevWord = strings.ToUpper(s[prev.start:prev.end])
+	}
+	switch word {
+	case "FIRST", "NEXT":
+		return prevWord == "FETCH"
+	case "ZONE":
+		return prevWord == "TIME"
+	default: // ROWS, RANGE, GROUPS
+		if prev.kind == tokenLeftParen {
+			before, ok := previousSignificantToken(s, prev.start)
+			return ok && before.kind == tokenWord && strings.EqualFold(s[before.start:before.end], "OVER")
+		}
+		// A frame clause directly follows a value (ORDER BY expression or
+		// window name); a column name never does.
+		return depth < 4 && tokenCanEndValue(s, prev, depth+1)
+	}
+}
+
+func tokenCanEndValue(s string, tok sqlToken, depth int) bool {
 	switch tok.kind {
 	case tokenValue, tokenRightParen, tokenRightBracket:
 		return true
 	case tokenWord:
-		return !isOperandPrefixKeyword(strings.ToUpper(s[tok.start:tok.end]))
+		word := strings.ToUpper(s[tok.start:tok.end])
+		return !isOperandPrefixKeyword(word) && !isContextualOperandPrefixKeyword(s, tok, word, depth)
 	default:
 		return false
 	}

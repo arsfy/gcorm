@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -280,6 +281,10 @@ func TestMapDefault(t *testing.T) {
 		{"false", `false`},
 		{"'draft'::text", `"draft"`},
 		{"'uuid'::text", `"uuid"`},
+		{"uuid_generate_v4()", "uuid()"},
+		{"autoincrement()", "autoincrement()"},
+		{"uuid-v1", `"uuid-v1"`},
+		{"my_uuid_column_default", `"my_uuid_column_default"`},
 	}
 	for _, tt := range tests {
 		got := mapDefault(tt.input)
@@ -541,6 +546,60 @@ func TestGenerateSchemaWithRelations(t *testing.T) {
 	}
 	if strings.Contains(schema, "orphan_id]") || strings.Contains(schema, "MissingTable @relation") {
 		t.Fatalf("unmappable relations should have been omitted:\n%s", schema)
+	}
+}
+
+func TestGenerateSchemaNullableForeignKeyMakesRelationOptional(t *testing.T) {
+	tables := []TableInfo{
+		{Name: "users", Columns: []ColumnInfo{{Name: "id", DataType: "INT", IsPrimaryKey: true}}},
+		{
+			Name: "posts",
+			Columns: []ColumnInfo{
+				{Name: "id", DataType: "INT", IsPrimaryKey: true},
+				{Name: "author_id", DataType: "INT"},
+				{Name: "editor_id", DataType: "INT", IsNullable: true},
+			},
+			FKs: []ForeignKeyInfo{
+				{Columns: []string{"author_id"}, RefTable: "users", RefColumns: []string{"id"}},
+				{Columns: []string{"editor_id"}, RefTable: "users", RefColumns: []string{"id"}},
+			},
+		},
+	}
+	schema := GenerateSchema("postgresql", tables)
+	if !regexp.MustCompile(`(?m)^\s+author\s+Users @relation`).MatchString(schema) {
+		t.Fatalf("required FK should produce a required relation:\n%s", schema)
+	}
+	if !regexp.MustCompile(`(?m)^\s+editor\s+Users\? @relation`).MatchString(schema) {
+		t.Fatalf("nullable FK should produce an optional relation:\n%s", schema)
+	}
+	if result := compiler.CompileFile("schema.gcorm", []byte(schema)); result.HasErrors() {
+		t.Fatalf("generated schema does not compile: %v\n%s", result.Errors, schema)
+	}
+}
+
+func TestGenerateSchemaWarnsAboutNullableArrays(t *testing.T) {
+	tables := []TableInfo{{Name: "posts", Columns: []ColumnInfo{
+		{Name: "id", IsPrimaryKey: true, Field: &ir.Field{Name: "id", ScalarType: "Int"}},
+		{Name: "tags", IsNullable: true, Field: &ir.Field{Name: "tags", ScalarType: "String", IsList: true, IsOptional: true}},
+	}}}
+	schema := GenerateSchema("postgresql", tables)
+	if !strings.Contains(schema, "// WARNING: tags is a nullable array column") {
+		t.Fatalf("missing nullable array warning:\n%s", schema)
+	}
+	if result := compiler.CompileFile("schema.gcorm", []byte(schema)); result.HasErrors() {
+		t.Fatalf("generated schema does not compile: %v\n%s", result.Errors, schema)
+	}
+}
+
+func TestGenerateSchemaForDatasourceRecordsNonDefaultPostgresSchema(t *testing.T) {
+	tables := []TableInfo{{Name: "users", Columns: []ColumnInfo{{Name: "id", DataType: "INT", IsPrimaryKey: true}}}}
+	if got := GenerateSchemaForDatasource("postgresql", "audit", tables, nil); !strings.Contains(got, `schema   = "audit"`) {
+		t.Fatalf("non-public schema should be recorded in the datasource:\n%s", got)
+	}
+	for _, tc := range []struct{ provider, schema string }{{"postgresql", "public"}, {"postgresql", ""}, {"mysql", "audit"}} {
+		if got := GenerateSchemaForDatasource(tc.provider, tc.schema, tables, nil); strings.Contains(got, "schema   =") {
+			t.Fatalf("%s/%q must not emit a datasource schema:\n%s", tc.provider, tc.schema, got)
+		}
 	}
 }
 

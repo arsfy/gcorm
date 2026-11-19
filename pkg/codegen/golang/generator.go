@@ -298,7 +298,7 @@ func (g *Generator) renderTemplate(name, tmplSrc string, data any) ([]byte, erro
 		"quote":             func(s string) string { return fmt.Sprintf("%q", s) },
 		"quoteTagValue":     func(s string) string { return strings.ReplaceAll(fmt.Sprintf("%q", s), "`", `\x60`) },
 		"tableName":         func(m *ir.Model) string { return m.TableName() },
-		"quotedTableName":   func(m *ir.Model) string { return quoteGeneratedIdentifier(g.schema.Datasource, m.TableName()) },
+		"quotedTableName":   func(m *ir.Model) string { return quotedGeneratedTable(g.schema.Datasource, m) },
 		"columnCSV":         columnCSV,
 		"quotedColumnCSV":   func(m *ir.Model) string { return quotedColumnCSV(g.schema.Datasource, m) },
 		"scanFields":        scanFieldsStr,
@@ -308,6 +308,19 @@ func (g *Generator) renderTemplate(name, tmplSrc string, data any) ([]byte, erro
 		"hasRelations":      hasRelationFields,
 		"createInputValues": createInputValues,
 		"scalarColNamesCSV": scalarColNamesCSV,
+		"writableFields":    writableFields,
+		"writableColNamesCSV": func(m *ir.Model) string {
+			return quotedGoStrings(fieldColumns(writableFields(m)))
+		},
+		"generatedFields":   generatedFields,
+		"listFields":        listFields,
+		"cuidFields":        cuidFields,
+		"isCUID":            isCUIDField,
+		"hasDBDefault":      hasDBDefault,
+		"createInputGoType": createInputGoType,
+		"scanDests":         scanDestsStr,
+		"pkColumnsLiteral":  pkColumnsLiteral,
+		"enumDBValue":       enumDBValue,
 	}
 
 	tmpl, err := template.New(name).Funcs(funcMap).Parse(tmplSrc)
@@ -337,6 +350,16 @@ func quoteGeneratedIdentifier(ds *ir.Datasource, name string) string {
 		return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 	}
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// quotedGeneratedTable returns the quoted table reference for a model. Only
+// PostgreSQL honours @@schema; other dialects use the bare table name.
+func quotedGeneratedTable(ds *ir.Datasource, m *ir.Model) string {
+	table := quoteGeneratedIdentifier(ds, m.TableName())
+	if m.Schema != "" && (ds == nil || ds.Provider == "" || ds.Provider == "postgresql") {
+		return quoteGeneratedIdentifier(ds, m.Schema) + "." + table
+	}
+	return table
 }
 
 func quotedColumnCSV(ds *ir.Datasource, m *ir.Model) string {
@@ -618,7 +641,7 @@ func hasRelationFields(m *ir.Model) bool {
 
 // createInputValues generates "d.Field1, d.Field2, ..." for CreateInput extraction.
 func createInputValues(m *ir.Model) string {
-	fields := m.ScalarFields()
+	fields := writableFields(m)
 	refs := make([]string, len(fields))
 	for i, f := range fields {
 		refs[i] = "d." + toUpperFirst(f.Name)
@@ -632,6 +655,135 @@ func scalarColNamesCSV(m *ir.Model) string {
 	quoted := make([]string, len(fields))
 	for i, f := range fields {
 		quoted[i] = fmt.Sprintf("%q", columnName(f))
+	}
+	return strings.Join(quoted, ", ")
+}
+
+// writableFields returns the scalar fields the generated client may write:
+// every scalar field except database-generated (computed) columns.
+func writableFields(m *ir.Model) []*ir.Field {
+	var out []*ir.Field
+	for _, f := range m.ScalarFields() {
+		if !f.IsGenerated {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// generatedFields returns the read-only, database-generated scalar fields.
+func generatedFields(m *ir.Model) []*ir.Field {
+	var out []*ir.Field
+	for _, f := range m.ScalarFields() {
+		if f.IsGenerated {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// listFields returns the scalar and enum list fields of a model.
+func listFields(m *ir.Model) []*ir.Field {
+	var out []*ir.Field
+	for _, f := range m.ScalarFields() {
+		if f.IsList {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// cuidFields returns the writable fields whose id is generated client-side by
+// @default(cuid()).
+func cuidFields(m *ir.Model) []*ir.Field {
+	var out []*ir.Field
+	for _, f := range writableFields(m) {
+		if isCUIDField(f) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// isCUIDField reports whether the field uses @default(cuid()). The database
+// has no default for such columns; the generated client fills the value.
+func isCUIDField(f *ir.Field) bool {
+	return f != nil && f.Default != nil && f.Default.IsFunction && f.Default.FuncName == "cuid"
+}
+
+// hasDBDefault reports whether the database fills the column when it is
+// omitted: any @default except cuid() (which is generated client-side).
+func hasDBDefault(f *ir.Field) bool {
+	return f != nil && f.Default != nil && !isCUIDField(f) && !f.IsGenerated
+}
+
+// createInputGoType returns the CreateInput field type. Fields with a database
+// default use a pointer so nil means "use the column DEFAULT".
+func createInputGoType(f *ir.Field) string {
+	t := queryGoTypeForField(f)
+	if hasDBDefault(f) && !strings.HasPrefix(t, "*") {
+		return "*" + t
+	}
+	return t
+}
+
+// scanDestsStr returns the Scan destinations for a model row in the client
+// package; list fields scan through the dialect-aware listScanner.
+func scanDestsStr(m *ir.Model) string {
+	fields := m.ScalarFields()
+	refs := make([]string, len(fields))
+	for i, f := range fields {
+		ref := "&item." + toUpperFirst(f.Name)
+		if f.IsList {
+			ref = "listScanner{dialect: c.dialect, dest: " + ref + "}"
+		}
+		refs[i] = ref
+	}
+	return strings.Join(refs, ", ")
+}
+
+// pkColumnsLiteral returns the primary key column names as a Go []string
+// literal, or "nil" when the model has no primary key.
+func pkColumnsLiteral(m *ir.Model) string {
+	if m.PrimaryKey == nil || len(m.PrimaryKey.Fields) == 0 {
+		return "nil"
+	}
+	byName := make(map[string]*ir.Field, len(m.Fields))
+	for _, f := range m.ScalarFields() {
+		byName[f.Name] = f
+	}
+	cols := make([]string, 0, len(m.PrimaryKey.Fields))
+	for _, name := range m.PrimaryKey.Fields {
+		if f, ok := byName[name]; ok {
+			cols = append(cols, columnName(f))
+		} else {
+			cols = append(cols, name)
+		}
+	}
+	return "[]string{" + quotedGoStrings(cols) + "}"
+}
+
+// enumDBValue returns the value stored in the database for an enum member:
+// its @map name when present, otherwise the member name.
+func enumDBValue(v *ir.EnumValue) string {
+	if v.DBName != "" {
+		return v.DBName
+	}
+	return v.Name
+}
+
+func fieldColumns(fields []*ir.Field) []string {
+	cols := make([]string, len(fields))
+	for i, f := range fields {
+		cols[i] = columnName(f)
+	}
+	return cols
+}
+
+func quotedGoStrings(values []string) string {
+	quoted := make([]string, len(values))
+	for i, v := range values {
+		quoted[i] = fmt.Sprintf("%q", v)
 	}
 	return strings.Join(quoted, ", ")
 }

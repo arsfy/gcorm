@@ -188,6 +188,9 @@ func openTriggerTestDatabase(t *testing.T, provider string) (*sql.DB, string, st
 		env = "GCORM_TEST_MYSQL_DSN"
 	}
 	dsn := os.Getenv(env)
+	if dsn == "" && provider == "postgresql" {
+		dsn = os.Getenv("GCO_TEST_POSTGRES_URL")
+	}
 	if dsn == "" {
 		t.Skipf("set %s to run this integration test", env)
 	}

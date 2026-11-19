@@ -268,12 +268,14 @@ deleted, err := c.User.Delete().
 	Do(ctx)
 ```
 
-Bulk insert:
+Bulk insert (fields with a database default are pointers; `nil` uses the
+column `DEFAULT`):
 
 ```go
+published := true
 count, err := c.Post.BulkCreate([]query.PostCreateInput{
-	{Id: "p1", Title: "First", Published: true, AuthorId: "u1"},
-	{Id: "p2", Title: "Second", Published: false, AuthorId: "u1"},
+	{Title: "First", Published: &published, AuthorId: "u1"},
+	{Title: "Second", AuthorId: "u1"},
 }).BatchSize(500).Do(ctx)
 ```
 

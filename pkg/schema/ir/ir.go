@@ -97,6 +97,12 @@ type Field struct {
 	IsID        bool // has @id
 	IsUnique    bool // has @unique
 	IsUpdatedAt bool // has @updatedAt
+	// IsGenerated marks a database-generated (computed) column discovered by
+	// introspection, e.g. PostgreSQL GENERATED ALWAYS AS (...) STORED. Its
+	// expression is carried in Default as dbgenerated("<expr>"). Generated
+	// columns are read-only: clients must never write them and migrations must
+	// not try to ALTER their default.
+	IsGenerated bool `json:",omitempty"`
 	Default     *DefaultValue
 	NativeType  *NativeType // from @db.*
 	Span        ast.Span

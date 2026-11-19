@@ -1281,25 +1281,29 @@ model User {
 	})
 }
 
-func TestPushRejectsMultiplePostgresSchemas(t *testing.T) {
-	db, _ := openTestSQLite(t)
-
-	schemaFS := fstest.MapFS{
-		"schema/main.gcorm": {Data: []byte(`datasource db {
-  provider = "postgresql"
-  url      = "postgresql://localhost/app"
-  schemas  = ["app", "billing"]
-}
-
-model User {
-  id String @id
-}
-`)},
+func TestPostgresIntrospectionSchemas(t *testing.T) {
+	schema := &ir.Schema{
+		Datasource: &ir.Datasource{Provider: "postgresql", Schemas: []string{"billing", "app"}},
+		Models:     []*ir.Model{{Name: "A"}, {Name: "B", Schema: "audit"}, {Name: "C", Schema: "app"}},
 	}
+	got := postgresIntrospectionSchemas(schema, "app")
+	if strings.Join(got, ",") != "app,audit,billing" {
+		t.Fatalf("postgresIntrospectionSchemas() = %v", got)
+	}
+	if got := postgresIntrospectionSchemas(nil, "public"); strings.Join(got, ",") != "public" {
+		t.Fatalf("postgresIntrospectionSchemas(nil) = %v", got)
+	}
+	if got := postgresTextArray([]string{"a", `b"c`, `d\e`}); got != `{"a","b\"c","d\\e"}` {
+		t.Fatalf("postgresTextArray() = %s", got)
+	}
+}
 
-	_, err := Push(context.Background(), db, Options{SchemaFS: schemaFS, SchemaRoot: "schema"})
-	if err == nil || !strings.Contains(err.Error(), "multiple postgresql datasource schemas") {
-		t.Fatalf("Push() error = %v, want multiple schemas rejection", err)
+func TestPostgresSearchPathSQL(t *testing.T) {
+	if got := postgresSearchPathSQL("public"); got != `SET LOCAL search_path TO "public"` {
+		t.Fatalf("postgresSearchPathSQL(public) = %q", got)
+	}
+	if got := postgresSearchPathSQL(`te"nant`); got != `SET LOCAL search_path TO "te""nant", public` {
+		t.Fatalf("postgresSearchPathSQL(tenant) = %q", got)
 	}
 }
 
@@ -1319,10 +1323,10 @@ model User {
 `)},
 	}
 
-	// A postgresql schema pushed through a sqlite connection fails when the
-	// transaction tries to set the postgresql search_path.
+	// A postgresql schema pushed through a sqlite connection fails in the
+	// postgresql-specific transaction setup (schema check / search_path).
 	_, err := Push(context.Background(), db, Options{SchemaFS: schemaFS, SchemaRoot: "schema"})
-	if err == nil || !strings.Contains(err.Error(), "set postgresql search_path") {
+	if err == nil || !strings.Contains(err.Error(), `check postgresql schema "app"`) {
 		t.Fatalf("Push() error = %v, want search_path failure", err)
 	}
 }
@@ -1701,6 +1705,10 @@ func TestPostgresSchemaFromURL(t *testing.T) {
 		{name: "schema query param", raw: "postgresql://h/db?schema=tenant", want: "tenant"},
 		{name: "quoted search_path", raw: `postgresql://h/db?search_path="tenant",public`, want: "tenant"},
 		{name: "no schema config", raw: "postgresql://h/db", want: ""},
+		{name: "user entry skipped", raw: `postgresql://h/db?search_path=%22%24user%22,%20public`, want: "public"},
+		{name: "bare user entry skipped", raw: `postgresql://h/db?search_path=$user,tenant`, want: "tenant"},
+		{name: "quoted name with comma", raw: `postgresql://h/db?search_path=%22a,b%22,public`, want: "a,b"},
+		{name: "only user entry", raw: `postgresql://h/db?search_path=$user`, want: ""},
 		{name: "invalid URL", raw: "postgresql://h%zz/db", want: ""},
 	}
 	for _, tt := range tests {
@@ -1962,24 +1970,22 @@ func TestIntrospectSQLiteSkipsInternalTables(t *testing.T) {
 	}
 }
 
-func TestFindPostgresTargetField(t *testing.T) {
-	schema := &ir.Schema{
-		Models: []*ir.Model{{
-			Name:   "User",
-			DBName: "users",
-			Fields: []*ir.Field{{Name: "email", DBName: "email_address"}},
-		}},
-	}
+func TestFindPostgresTargetModel(t *testing.T) {
+	users := &ir.Model{Name: "User", DBName: "users"}
+	audit := &ir.Model{Name: "AuditUser", DBName: "users", Schema: "audit"}
+	schema := &ir.Schema{Models: []*ir.Model{users, audit}}
 
-	if got := findPostgresTargetField(nil, "users", "email_address"); got != nil {
-		t.Fatalf("findPostgresTargetField(nil schema) = %#v, want nil", got)
+	if got := findPostgresTargetModel(nil, "public", "public", "users"); got != nil {
+		t.Fatalf("findPostgresTargetModel(nil schema) = %#v, want nil", got)
 	}
-	if got := findPostgresTargetField(schema, "unknown", "email_address"); got != nil {
-		t.Fatalf("findPostgresTargetField(unknown table) = %#v, want nil", got)
+	if got := findPostgresTargetModel(schema, "public", "public", "users"); got != users {
+		t.Fatalf("default schema table = %#v, want User", got)
 	}
-	got := findPostgresTargetField(schema, "users", "email_address")
-	if got == nil || got.Name != "email" {
-		t.Fatalf("findPostgresTargetField() = %#v, want email field", got)
+	if got := findPostgresTargetModel(schema, "public", "audit", "users"); got != audit {
+		t.Fatalf("audit table = %#v, want AuditUser", got)
+	}
+	if got := findPostgresTargetModel(schema, "public", "other", "users"); got != nil {
+		t.Fatalf("other schema table = %#v, want nil", got)
 	}
 }
 

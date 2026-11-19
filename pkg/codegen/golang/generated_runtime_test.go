@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/arsfy/gcorm/pkg/schema/ir"
@@ -15,6 +16,40 @@ func TestGeneratedClientBulkCreateAndRawRuntime(t *testing.T) {
 
 func testGeneratedClient(t *testing.T, schema *ir.Schema, testSource string) {
 	t.Helper()
+	testGeneratedClientFiles(t, schema, map[string]string{"client_runtime_test.go": testSource})
+}
+
+// writeGeneratedTestModule writes go.mod/go.sum for the generated test module.
+// It reuses the repository's requirements (pgx, modernc sqlite, ...) so the
+// generated tests can open real databases from the local module cache.
+func writeGeneratedTestModule(t *testing.T, dir string) {
+	t.Helper()
+	repoMod, err := os.ReadFile("../../../go.mod")
+	if err != nil {
+		t.Fatalf("read repository go.mod: %v", err)
+	}
+	lines := strings.Split(string(repoMod), "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "module ") {
+			lines[i] = "module example.com/gentest"
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	repoSum, err := os.ReadFile("../../../go.sum")
+	if err != nil {
+		t.Fatalf("read repository go.sum: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.sum"), repoSum, 0o644); err != nil {
+		t.Fatalf("write go.sum: %v", err)
+	}
+}
+
+// testGeneratedClientFiles generates the client for schema, writes the given
+// test files into gen/client, and runs `go test` on the generated packages.
+func testGeneratedClientFiles(t *testing.T, schema *ir.Schema, testFiles map[string]string) {
+	t.Helper()
 	dir := t.TempDir()
 
 	gen := NewGenerator(schema, WithModulePath("example.com/gentest/gen"))
@@ -23,9 +58,7 @@ func testGeneratedClient(t *testing.T, schema *ir.Schema, testSource string) {
 		t.Fatalf("Generate() error: %v", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/gentest\n\ngo 1.26.1\n"), 0o644); err != nil {
-		t.Fatalf("write go.mod: %v", err)
-	}
+	writeGeneratedTestModule(t, dir)
 	for _, file := range files {
 		path := filepath.Join(dir, "gen", file.Path)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -36,23 +69,28 @@ func testGeneratedClient(t *testing.T, schema *ir.Schema, testSource string) {
 		}
 	}
 
-	testPath := filepath.Join(dir, "gen", "client", "client_runtime_test.go")
-	if err := os.WriteFile(testPath, []byte(testSource), 0o644); err != nil {
-		t.Fatalf("write generated runtime test: %v", err)
+	for name, source := range testFiles {
+		if err := os.WriteFile(filepath.Join(dir, "gen", "client", name), []byte(source), 0o644); err != nil {
+			t.Fatalf("write generated runtime test %s: %v", name, err)
+		}
 	}
 
-	args := []string{"test", "./gen/..."}
+	args := []string{"test", "-count=1", "./gen/..."}
+	if testing.Verbose() {
+		args = []string{"test", "-count=1", "-v", "./gen/..."}
+	}
 	if os.Getenv("GCO_RUN_GENERATED_BENCH") == "1" {
 		args = []string{"test", "-run", "^$", "-bench", "BenchmarkGenerated", "-benchmem", "./gen/..."}
 	}
 	cmd := exec.Command("go", args...)
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod", "GOPROXY=off", "GOWORK=off")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("generated client tests failed: %v\n%s", err, out)
 	}
-	if os.Getenv("GCO_RUN_GENERATED_BENCH") == "1" {
-		t.Logf("generated client benchmarks:\n%s", out)
+	if os.Getenv("GCO_RUN_GENERATED_BENCH") == "1" || testing.Verbose() {
+		t.Logf("generated client output:\n%s", out)
 	}
 }
 

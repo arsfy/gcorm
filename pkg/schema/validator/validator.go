@@ -75,6 +75,7 @@ func Validate(doc *ast.Document) *ValidationResult {
 
 	v := newValidator()
 	v.collectTypes(doc)
+	v.collectDatasourceSettings(&ast.DocumentSet{Documents: []*ast.Document{doc}})
 	v.validateDatasourceCount(doc.Datasources)
 	for _, d := range doc.Datasources {
 		v.validateDatasource(d)
@@ -108,6 +109,7 @@ func ValidateDocumentSet(ds *ast.DocumentSet) *ValidationResult {
 	for _, doc := range ds.Documents {
 		v.collectTypes(doc)
 	}
+	v.collectDatasourceSettings(ds)
 
 	// Check duplicate model/enum names across all documents.
 	modelSeen := make(map[string]bool)
@@ -203,6 +205,11 @@ type validator struct {
 	modelNames map[string]ast.Position
 	enumNames  map[string]ast.Position
 	typeKinds  map[string]string
+	// provider is the datasource provider, or "" when the schema has no
+	// datasource (provider-specific checks are then skipped).
+	provider string
+	// datasourceSchemas lists the datasource `schemas` values, if set.
+	datasourceSchemas []string
 }
 
 func newValidator() *validator {
@@ -224,6 +231,32 @@ func (v *validator) addWarning(pos ast.Position, msg string) {
 	v.result.Warnings = append(v.result.Warnings, &ValidationError{
 		Message: msg, Pos: pos, Severity: SeverityWarning,
 	})
+}
+
+// collectDatasourceSettings records the provider and configured schemas of
+// the first datasource so model-level checks can depend on them.
+func (v *validator) collectDatasourceSettings(ds *ast.DocumentSet) {
+	for _, doc := range ds.Documents {
+		for _, datasource := range doc.Datasources {
+			for _, entry := range datasource.Entries {
+				switch entry.Key {
+				case "provider":
+					if value, ok := entry.Value.(ast.StringLiteral); ok {
+						v.provider = value.Value
+					}
+				case "schemas":
+					if arr, ok := entry.Value.(ast.ArrayLiteral); ok {
+						for _, elem := range arr.Elements {
+							if value, ok := elem.(ast.StringLiteral); ok {
+								v.datasourceSchemas = append(v.datasourceSchemas, value.Value)
+							}
+						}
+					}
+				}
+			}
+			return
+		}
+	}
 }
 
 func (v *validator) collectTypes(doc *ast.Document) {
@@ -444,7 +477,7 @@ func (v *validator) validateModel(m ast.ModelDecl) {
 
 func (v *validator) validateFieldAttribute(a ast.Attribute, f ast.FieldDecl, m ast.ModelDecl) {
 	if strings.HasPrefix(a.Name, "db.") {
-		v.validateNativeType(a)
+		v.validateNativeType(a, f)
 		return
 	}
 	switch a.Name {
@@ -478,10 +511,47 @@ func (v *validator) validateFieldAttribute(a ast.Attribute, f ast.FieldDecl, m a
 	}
 }
 
-func (v *validator) validateNativeType(a ast.Attribute) {
+// nativeTypeSpec describes a @db.* native type: the field scalar types it can
+// annotate, its maximum argument count, and the providers whose DDL accepts
+// the rendered type (pkg/tooling/migrate renders @db.Name(args) as
+// NAME(args)). SQLite accepts any declared type name.
+type nativeTypeSpec struct {
+	scalars   []string
+	maxArgs   int
+	providers []string
+}
+
+var (
+	integerScalars = []string{"Int", "SmallInt", "BigInt"}
+	allProviders   = []string{"postgresql", "mysql", "sqlite"}
+)
+
+var nativeTypeSpecs = map[string]nativeTypeSpec{
+	"VarChar":        {scalars: []string{"String"}, maxArgs: 1, providers: allProviders},
+	"Char":           {scalars: []string{"String"}, maxArgs: 1, providers: allProviders},
+	"Text":           {scalars: []string{"String"}, providers: allProviders},
+	"Decimal":        {scalars: []string{"Decimal"}, maxArgs: 2, providers: allProviders},
+	"Json":           {scalars: []string{"Json"}, providers: allProviders},
+	"JsonB":          {scalars: []string{"Json"}, providers: []string{"postgresql", "sqlite"}},
+	"Uuid":           {scalars: []string{"String", "UUID"}, providers: []string{"postgresql", "sqlite"}},
+	"Timestamp":      {scalars: []string{"DateTime"}, maxArgs: 1, providers: allProviders},
+	"Timestamptz":    {scalars: []string{"DateTime"}, maxArgs: 1, providers: []string{"postgresql", "sqlite"}},
+	"Date":           {scalars: []string{"DateTime"}, providers: allProviders},
+	"Time":           {scalars: []string{"DateTime"}, maxArgs: 1, providers: allProviders},
+	"Bytes":          {scalars: []string{"Bytes"}, providers: []string{"sqlite"}},
+	"Blob":           {scalars: []string{"Bytes"}, providers: []string{"mysql", "sqlite"}},
+	"TinyInt":        {scalars: append([]string{"Boolean"}, integerScalars...), maxArgs: 1, providers: []string{"mysql", "sqlite"}},
+	"SmallInt":       {scalars: integerScalars, providers: allProviders},
+	"Int":            {scalars: integerScalars, providers: allProviders},
+	"BigInt":         {scalars: integerScalars, providers: allProviders},
+	"UnsignedInt":    {scalars: integerScalars, providers: []string{"mysql", "sqlite"}},
+	"UnsignedBigInt": {scalars: []string{"BigInt"}, providers: []string{"mysql", "sqlite"}},
+}
+
+func (v *validator) validateNativeType(a ast.Attribute, f ast.FieldDecl) {
 	name := strings.TrimPrefix(a.Name, "db.")
-	known := map[string]bool{"VarChar": true, "Char": true, "Text": true, "Decimal": true, "Json": true, "JsonB": true, "Uuid": true, "Timestamp": true, "Timestamptz": true, "Date": true, "Time": true, "Bytes": true, "Blob": true, "TinyInt": true, "SmallInt": true, "Int": true, "BigInt": true, "UnsignedInt": true, "UnsignedBigInt": true}
-	if !known[name] {
+	spec, known := nativeTypeSpecs[name]
+	if !known {
 		v.addError(a.Span.Start, fmt.Sprintf("unknown native type @db.%s", name))
 		return
 	}
@@ -491,6 +561,27 @@ func (v *validator) validateNativeType(a ast.Attribute) {
 			v.addError(arg.Span.Start, "native type arguments must be integers")
 		}
 	}
+	if len(a.Args) > spec.maxArgs {
+		v.addError(a.Span.Start, fmt.Sprintf("@db.%s accepts at most %d argument(s), got %d", name, spec.maxArgs, len(a.Args)))
+	}
+	if v.provider == "mysql" && name == "VarChar" && len(a.Args) == 0 {
+		v.addError(a.Span.Start, "@db.VarChar requires a length argument on mysql")
+	}
+	if !containsString(spec.scalars, f.Type.Name) {
+		v.addError(a.Span.Start, fmt.Sprintf("@db.%s is not compatible with field type %s (allowed: %s)", name, f.Type.Name, strings.Join(spec.scalars, ", ")))
+	}
+	if validProviders[v.provider] && !containsString(spec.providers, v.provider) {
+		v.addError(a.Span.Start, fmt.Sprintf("@db.%s is not supported by provider %s", name, v.provider))
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (v *validator) validateDefaultArg(arg ast.AttributeArg, f ast.FieldDecl) {
@@ -551,8 +642,10 @@ func (v *validator) validateDefaultFunction(fc ast.FunctionCall, f ast.FieldDecl
 	case "dbgenerated":
 		requireArgs(1)
 		if len(fc.Args) == 1 {
-			if _, ok := fc.Args[0].(ast.StringLiteral); !ok {
+			if sl, ok := fc.Args[0].(ast.StringLiteral); !ok {
 				v.addError(fc.Args[0].ExprSpan().Start, "dbgenerated() argument must be a string")
+			} else if strings.TrimSpace(sl.Value) == "" {
+				v.addError(fc.Args[0].ExprSpan().Start, "dbgenerated() argument must be a non-empty SQL expression")
 			}
 		}
 	default:
@@ -729,6 +822,10 @@ func (v *validator) validateModelAttribute(a ast.Attribute, m ast.ModelDecl, fie
 			v.addError(a.Span.Start, "@@schema requires exactly one argument")
 		} else if sl, ok := a.Args[0].Value.(ast.StringLiteral); !ok || strings.TrimSpace(sl.Value) == "" {
 			v.addError(a.Span.Start, "@@schema argument must be a non-empty string")
+		} else if validProviders[v.provider] && v.provider != "postgresql" {
+			v.addError(a.Span.Start, fmt.Sprintf("@@schema is only supported by postgresql (provider is %s)", v.provider))
+		} else if len(v.datasourceSchemas) > 0 && !containsString(v.datasourceSchemas, sl.Value) {
+			v.addError(a.Span.Start, fmt.Sprintf("@@schema(%q) is not listed in datasource schemas [%s]", sl.Value, strings.Join(v.datasourceSchemas, ", ")))
 		}
 	default:
 		v.addError(a.Span.Start, fmt.Sprintf("unknown model attribute @@%s", a.Name))

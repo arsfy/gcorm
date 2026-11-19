@@ -180,8 +180,31 @@ gco introspect --url "$DATABASE_URL"
 gco introspect --url "$DATABASE_URL" --provider postgresql --output schema
 ```
 
-The command writes `schema.gcorm` to the output directory. It includes managed
-trigger declarations. See [Database Triggers](Triggers.md).
+The command writes `schema.gcorm` to the output directory and refuses to write
+it if the generated text does not compile. It includes managed trigger
+declarations. See [Database Triggers](Triggers.md).
+
+The generated schema keeps:
+
+- column types, including `Bytes`, `Json`, `UUID`, list columns (`String[]`)
+  and native types such as `@db.VarChar(20)`, `@db.Decimal(10, 2)` and
+  `@db.Timestamp(6)`;
+- database enum types as `enum` blocks, with `@map`/`@@map` when a database
+  name is not a valid schema identifier (`'in progress'` becomes
+  `in_progress @map("in progress")`);
+- defaults as functions (`autoincrement()`, `uuid()`, `now()`,
+  `dbgenerated("...")`) and string defaults as quoted literals, so
+  `DEFAULT 'now()'` stays `@default("now()")`;
+- generated columns as `@default(dbgenerated("expr"))` preceded by a comment
+  marking them read-only;
+- one relation field per foreign key plus back-relation fields on the
+  referenced model; several foreign keys to the same table are named after
+  their columns (`author_id` -> `author`, back-relation `posts_author`);
+- `@@index` sort, nulls, operator class and collation options. Unique indexes
+  cannot carry these options and get a warning comment instead.
+
+Nullable PostgreSQL array columns are emitted as non-null lists because a
+schema type cannot be both a list and optional.
 
 ## gco version
 

@@ -109,7 +109,38 @@ Use migrations instead when:
 
 PostgreSQL:
 
-- Supports schema namespaces.
+- Unqualified names resolve in the default schema: the datasource `schema`,
+  a single `schemas` entry, the first `search_path` entry of the URL other
+  than `$user`, or `public`. The push transaction creates the default schema
+  when it does not exist (otherwise PostgreSQL would silently fall through to
+  `public`) and sets `search_path` to the default schema followed by `public`,
+  so extensions installed in `public` stay available.
+- `db push` reads every datasource `schemas` entry and every model `@@schema`.
+  It reads the default schema too, except when a `schemas` list is configured
+  that does not include it and every model has `@@schema`: unrelated tables
+  there are then left alone instead of being planned as drops. Tables with the same name in different schemas are
+  kept apart, foreign keys are matched by schema and table, and schemas a
+  model needs are created. Enum types live in the default schema. See
+  [PostgreSQL migration notes](Migrations.md#postgresql-notes).
+- Adding enum values runs `ALTER TYPE ... ADD VALUE` and commits it in a
+  separate locked transaction before the rest of the push, which plans the
+  remaining changes again. A new value can therefore be used, for example as a
+  default, in the same push. If the rest fails, the added values stay.
+  `DryRun` lists all statements in order.
+- Partitioned tables are read as tables; their partitions are ignored.
+- Generated columns (`GENERATED ALWAYS AS ... STORED`) are read as
+  `dbgenerated("<expr>")` and are never altered. Identity columns
+  (`ALWAYS` or `BY DEFAULT`) match `@default(autoincrement())`.
+- A column default declared with `dbgenerated()` matches any existing default
+  of the column, because PostgreSQL normalizes the expression text. Change
+  such an expression with a migration.
+- A plain unique index matches a `@@unique` or `@unique` declaration on the
+  same columns, so an index created outside GCORM, for example one a foreign
+  key depends on, is kept.
+- Index names that PostgreSQL truncated to 63 bytes match the declared name.
+  `Decimal` without `@db` (`DECIMAL(65,30)`) and declared `@db` types such as
+  `@db.Int`, `@db.Time`, `@db.Char(10)`, or `String @db.Uuid` push without
+  repeated changes.
 - Uses `$1`, `$2`, ... placeholders in generated runtime queries.
 - Connection URLs often need `sslmode=disable` for local development.
 

@@ -10,24 +10,24 @@ files, and push schema changes directly to a database.
 
 ## Recommended Reading Order
 
-1. [Installation](Installation.md)
-2. [Quick Start](Quick-Start.md)
-3. [Schema Guide](Schema-Guide.md)
-4. [Generated Client](Generated-Client.md)
-5. [Querying](Querying.md)
-6. [DB Push](DB-Push.md)
-7. [Embedded DB Push](Embedded-DB-Push.md)
-8. [Migrations](Migrations.md)
-9. [Security](Security.md)
-10. [Performance](Performance.md)
-11. [Troubleshooting](Troubleshooting.md)
+1. [Installation](Installation)
+2. [Quick Start](Quick-Start)
+3. [Schema Guide](Schema-Guide)
+4. [Generated Client](Generated-Client)
+5. [Querying](Querying)
+6. [DB Push](DB-Push)
+7. [Embedded DB Push](Embedded-DB-Push)
+8. [Migrations](Migrations)
+9. [Security](Security)
+10. [Performance](Performance)
+11. [Troubleshooting](Troubleshooting)
 
 ## Reference Pages
 
-- [Configuration](Configuration.md)
-- [CLI Reference](CLI-Reference.md)
-- [Database Triggers](Triggers.md)
-- [Release and Upgrade](Release-and-Upgrade.md)
+- [Configuration](Configuration)
+- [CLI Reference](CLI-Reference)
+- [Database Triggers](Triggers)
+- [Release and Upgrade](Release-and-Upgrade)
 
 ## Project Status
 
@@ -56,4 +56,4 @@ Use `gco db push` for direct schema synchronization in development and controlle
 environments.
 
 For production binaries that embed `.gcorm` files and call `dbpush.Push`, see
-[Embedded DB Push](Embedded-DB-Push.md).
+[Embedded DB Push](Embedded-DB-Push).

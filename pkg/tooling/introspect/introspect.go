@@ -42,15 +42,34 @@ type ColumnInfo struct {
 	IsUnique     bool
 	Default      string
 	Comment      string
+	// Field is the introspected IR field when the column comes from
+	// dbpush.IntrospectDatabase. When set, GenerateSchema renders the type,
+	// list modifier, native type, default and generated-column marker from
+	// it instead of re-parsing DataType/Default.
+	Field *ir.Field
+	// EnumType is the database enum type name of an enum column (Field.Type
+	// == ir.FieldKindEnum); it keys into the EnumInfo list.
+	EnumType string
 }
 
-// IndexInfo describes a database index.
+// EnumInfo describes a database enum type by its database names.
+type EnumInfo struct {
+	Name   string   // database type name
+	Values []string // database labels in declaration order
+}
+
+// IndexInfo describes a database index. Sorts, Nulls, OpClasses and
+// Collations are per-column options aligned with Columns ("" = default).
 type IndexInfo struct {
 	Name        string
 	Columns     []string
 	Expressions []string
 	IsUnique    bool
 	Where       string
+	Sorts       []string
+	Nulls       []string
+	OpClasses   []string
+	Collations  []string
 }
 
 // ForeignKeyInfo describes a foreign key relationship.
@@ -114,7 +133,14 @@ func Run(args []string) error {
 	if err != nil {
 		return fmt.Errorf("introspect database: %w", err)
 	}
-	content := GenerateSchema(provider, tablesFromIR(schema))
+	// Record the PostgreSQL schema the tables were actually read from (the
+	// same resolution db push uses), so later pushes target it even when the
+	// URL does not carry it.
+	dbSchema := ""
+	if provider == "postgresql" && schema != nil && schema.Datasource != nil {
+		dbSchema = schema.Datasource.Schema
+	}
+	content := GenerateSchemaForDatasource(provider, dbSchema, tablesFromIR(schema), enumsFromIR(schema))
 	if compiled := compiler.CompileFile("schema.gcorm", []byte(content)); compiled.HasErrors() {
 		return fmt.Errorf("generated schema is invalid: %v", compiled.Errors[0])
 	}
@@ -153,7 +179,10 @@ func tablesFromIR(schema *ir.Schema) []TableInfo {
 			if name == "" {
 				name = f.Name
 			}
-			c := ColumnInfo{Name: name, DataType: f.ScalarType, IsNullable: f.IsOptional, IsPrimaryKey: pk[f.Name] || pk[name] || f.IsID, IsUnique: f.IsUnique}
+			c := ColumnInfo{Name: name, DataType: f.ScalarType, IsNullable: f.IsOptional, IsPrimaryKey: pk[f.Name] || pk[name] || f.IsID, IsUnique: f.IsUnique, Field: f}
+			if f.Type == ir.FieldKindEnum {
+				c.EnumType = enumDatabaseName(schema, f.EnumType)
+			}
 			if f.Default != nil {
 				if f.Default.IsFunction {
 					c.Default = f.Default.FuncName + "()"
@@ -166,11 +195,20 @@ func tablesFromIR(schema *ir.Schema) []TableInfo {
 		for _, idx := range model.Indexes {
 			info := IndexInfo{Name: idx.Name, Columns: append([]string(nil), idx.Fields...), IsUnique: idx.IsUnique, Where: idx.Where}
 			if len(idx.Columns) > 0 {
-				info.Columns = make([]string, len(idx.Columns))
-				info.Expressions = make([]string, len(idx.Columns))
+				n := len(idx.Columns)
+				info.Columns = make([]string, n)
+				info.Expressions = make([]string, n)
+				info.Sorts = make([]string, n)
+				info.Nulls = make([]string, n)
+				info.OpClasses = make([]string, n)
+				info.Collations = make([]string, n)
 				for i, col := range idx.Columns {
 					info.Columns[i] = col.Field
 					info.Expressions[i] = col.Expression
+					info.Sorts[i] = col.Sort
+					info.Nulls[i] = col.Nulls
+					info.OpClasses[i] = col.OpClass
+					info.Collations[i] = col.Collation
 				}
 			}
 			t.Indexes = append(t.Indexes, info)
@@ -206,25 +244,36 @@ func DetectProvider(dsn string) string {
 
 // GenerateSchema produces .gcorm schema text from introspected table info.
 func GenerateSchema(provider string, tables []TableInfo) string {
+	return GenerateSchemaWithEnums(provider, tables, nil)
+}
+
+// GenerateSchemaWithEnums produces .gcorm schema text from introspected
+// tables and database enum types.
+func GenerateSchemaWithEnums(provider string, tables []TableInfo, enums []EnumInfo) string {
+	return GenerateSchemaForDatasource(provider, "", tables, enums)
+}
+
+// GenerateSchemaForDatasource is GenerateSchemaWithEnums with the database
+// schema the tables were read from. A PostgreSQL schema other than public is
+// written to the datasource block so the generated schema keeps targeting it.
+func GenerateSchemaForDatasource(provider, dbSchema string, tables []TableInfo, enums []EnumInfo) string {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf("datasource db {\n  provider = %q\n  url      = env(\"DATABASE_URL\")\n}\n\n", provider))
+	b.WriteString(fmt.Sprintf("datasource db {\n  provider = %q\n  url      = env(\"DATABASE_URL\")\n", provider))
+	if provider == "postgresql" && dbSchema != "" && dbSchema != "public" {
+		b.WriteString(fmt.Sprintf("  schema   = %q\n", dbSchema))
+	}
+	b.WriteString("}\n\n")
 	b.WriteString("generator client {\n  provider = \"gco-go\"\n  output   = \"./gen\"\n}\n")
 
-	modelNames := make(map[string]string)
-	usedModels := make(map[string]bool)
-	fieldNames := make(map[string]map[string]string)
-	for _, t := range tables {
-		modelNames[t.Name] = uniqueName(sanitizeModelName(t.Name), usedModels)
-		used := make(map[string]bool)
-		fieldNames[t.Name] = make(map[string]string)
-		for _, col := range t.Columns {
-			fieldNames[t.Name][col.Name] = uniqueName(sanitizeFieldName(col.Name), used)
-		}
+	names := newSchemaNames(tables, enums)
+
+	for _, enum := range enums {
+		writeEnum(&b, enum, names.enums[enum.Name])
 	}
 
 	for _, t := range tables {
-		modelName := modelNames[t.Name]
+		modelName := names.models[t.Name]
 		b.WriteString(fmt.Sprintf("\nmodel %s {\n", modelName))
 		pkCount := 0
 		for _, col := range t.Columns {
@@ -233,8 +282,12 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 			}
 		}
 		for _, col := range t.Columns {
+			fieldName := names.fields[t.Name][col.Name]
+			if col.Field != nil {
+				writeIRColumn(&b, provider, col, fieldName, col.IsPrimaryKey && pkCount == 1, names)
+				continue
+			}
 			fieldType := mapSQLType(provider, col.DataType)
-			fieldName := fieldNames[t.Name][col.Name]
 			line := fmt.Sprintf("  %-20s %s", fieldName, fieldType)
 			if col.IsNullable {
 				line += "?"
@@ -254,18 +307,21 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 			b.WriteString(line)
 			b.WriteString("\n")
 		}
-		for i, fk := range t.FKs {
-			refModel := modelNames[fk.RefTable]
-			if refModel == "" {
-				refModel = sanitizeModelName(fk.RefTable)
+		nullable := make(map[string]bool, len(t.Columns))
+		for _, col := range t.Columns {
+			nullable[col.Name] = col.IsNullable || (col.Field != nil && col.Field.IsOptional)
+		}
+		for _, rel := range names.relations[t.Name] {
+			fk := rel.fk
+			refType := rel.refModel
+			for _, column := range fk.Columns {
+				if nullable[column] {
+					// A nullable foreign key makes the relation optional.
+					refType += "?"
+					break
+				}
 			}
-			name := uniqueName(sanitizeFieldName(fk.RefTable), mapUsedValues(fieldNames[t.Name]))
-			local := mappedNames(fieldNames[t.Name], fk.Columns)
-			refs := mappedNames(fieldNames[fk.RefTable], fk.RefColumns)
-			if len(local) == 0 || len(local) != len(refs) {
-				continue
-			}
-			line := fmt.Sprintf("  %-20s %s @relation(fields: [%s], references: [%s]", name, refModel, strings.Join(local, ", "), strings.Join(refs, ", "))
+			line := fmt.Sprintf("  %-20s %s @relation(fields: [%s], references: [%s]", rel.fieldName, refType, strings.Join(rel.local, ", "), strings.Join(rel.refs, ", "))
 			if fk.Name != "" {
 				line += fmt.Sprintf(", name: %q", fk.Name)
 			}
@@ -276,16 +332,17 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 				line += ", onUpdate: " + referentialAction(fk.OnUpdate)
 			}
 			line += ")"
-			if i >= 0 {
-				b.WriteString(line)
-				b.WriteString("\n")
-			}
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+		for _, back := range names.backRelations[t.Name] {
+			fmt.Fprintf(&b, "  %-20s %s\n", back.fieldName, back.typ)
 		}
 		if pkCount > 1 {
 			var cols []string
 			for _, col := range t.Columns {
 				if col.IsPrimaryKey {
-					cols = append(cols, fieldNames[t.Name][col.Name])
+					cols = append(cols, names.fields[t.Name][col.Name])
 				}
 			}
 			fmt.Fprintf(&b, "\n  @@id([%s])\n", strings.Join(cols, ", "))
@@ -297,7 +354,7 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 				fmt.Fprintf(&b, "\n  // WARNING: partial unique index %q requires custom SQL\n", idx.Name)
 				continue
 			}
-			cols := indexSchemaFields(t, idx, fieldNames[t.Name])
+			cols := indexSchemaFields(t, idx, names.fields[t.Name])
 			if len(cols) != len(idx.Columns) {
 				fmt.Fprintf(&b, "\n  // WARNING: index %q omitted because its columns could not be represented\n", idx.Name)
 				continue
@@ -312,6 +369,12 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 			}
 			if hasIndexExpressions(idx.Expressions) {
 				args = append(args, formatIndexExpressions(idx.Expressions))
+			}
+			if !idx.IsUnique {
+				args = append(args, formatIndexColumnOptions(idx, len(cols))...)
+			} else if indexHasColumnOptions(idx) {
+				// @@unique accepts only fields, name and expressions.
+				fmt.Fprintf(&b, "\n  // WARNING: sort/nulls/opclass/collation options of unique index %q are not representable\n", idx.Name)
 			}
 			if idx.Where != "" {
 				args = append(args, "where: "+formatter.FormatExpression(ast.StringLiteral{Value: idx.Where}))
@@ -466,13 +529,6 @@ func mappedNames(mapping map[string]string, names []string) []string {
 	}
 	return out
 }
-func mapUsedValues(mapping map[string]string) map[string]bool {
-	out := map[string]bool{}
-	for _, v := range mapping {
-		out[v] = true
-	}
-	return out
-}
 func referentialAction(value string) string {
 	switch strings.ToUpper(strings.ReplaceAll(value, " ", "")) {
 	case "CASCADE":
@@ -551,13 +607,16 @@ func mapDefaultForType(def, fieldType string) string {
 	lower := strings.ToLower(value)
 	quoted := isSQLStringLiteral(value)
 	switch {
-	case !quoted && strings.Contains(lower, "uuid"):
+	case !quoted && (strings.Contains(lower, "gen_random_uuid(") || strings.Contains(lower, "uuid_generate") ||
+		strings.Contains(lower, "uuid()")):
 		return "uuid()"
 	case !quoted && (strings.Contains(lower, "now()") || strings.HasPrefix(lower, "current_timestamp")):
 		return "now()"
-	case !quoted && (strings.Contains(lower, "nextval") || lower == "autoincrement" ||
+	case !quoted && (strings.Contains(lower, "nextval") || lower == "autoincrement" || lower == "autoincrement()" ||
 		strings.Contains(lower, "auto_increment")):
 		return "autoincrement()"
+	case !quoted && lower == "cuid()":
+		return "cuid()"
 	}
 
 	value = stripPostgresDefaultCast(value)

@@ -25,9 +25,10 @@ package model
 // {{$enum.Name}} represents the {{$enum.Name}} enum type.
 type {{$enum.Name}} string
 
+// {{$enum.Name}} constants hold the database value (@map name when present).
 const (
 {{- range $val := $enum.Values}}
-	{{$enum.Name}}{{$val.Name}} {{$enum.Name}} = "{{$val.Name}}"
+	{{$enum.Name}}{{$val.Name}} {{$enum.Name}} = {{quote (enumDBValue $val)}}
 {{- end}}
 )
 
@@ -329,6 +330,8 @@ func ({{lower $.Model.Name}}{{upper $field.Name}}Field) IsNull() {{$.Model.Name}
 }
 {{end}}
 
+{{- if not $field.IsGenerated}}
+
 // Set creates a set operation for create/update.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Set(v {{if $field.IsOptional}}{{setGoType $field}}{{else}}{{queryGoType $field}}{{end}}) {{$.Model.Name}}SetClause {
 	return {{$.Model.Name}}SetClause{Field: {{quote (columnName $field)}}, Value: v}
@@ -341,6 +344,7 @@ func ({{lower $.Model.Name}}{{upper $field.Name}}Field) SetNull() {{$.Model.Name
 	return {{$.Model.Name}}SetClause{Field: {{quote (columnName $field)}}, Value: nil}
 }
 {{end}}
+{{- end}}
 
 // Asc returns an ascending order clause for this field.
 func ({{lower $.Model.Name}}{{upper $field.Name}}Field) Asc() {{$.Model.Name}}OrderByClause {
@@ -395,9 +399,12 @@ type {{.Model.Name}}GroupByResult struct {
 }
 
 // {{.Model.Name}}CreateInput holds data for creating a {{.Model.Name}} record.
+// Fields with a database default are pointers: nil uses the column DEFAULT.
+// A cuid() field left empty gets a client-generated id. Generated (computed)
+// columns are read-only and therefore absent.
 type {{.Model.Name}}CreateInput struct {
-{{- range scalarCols .Model}}
-	{{upper .Name}} {{queryGoType .}}
+{{- range writableFields .Model}}
+	{{upper .Name}} {{createInputGoType .}}
 {{- end}}
 {{- range .Model.Fields}}
 {{- if eq .Type 2}}
@@ -406,7 +413,8 @@ type {{.Model.Name}}CreateInput struct {
 {{- end}}
 }
 
-// ScalarValues returns the scalar field values in column order.
+// ScalarValues returns the writable scalar field values in column order.
+// Defaulted fields are returned as their pointer (nil means DEFAULT).
 func (d {{.Model.Name}}CreateInput) ScalarValues() []any {
 	return []any{ {{createInputValues .Model}} }
 }
@@ -433,11 +441,25 @@ package client
 
 import (
 	"context"
+{{- if .Models}}
+	cryptorand "crypto/rand"
+{{- end}}
 	"database/sql"
 {{- if .Models}}
+	"database/sql/driver"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+{{- end}}
 	"fmt"
+{{- if .Models}}
+	"os"
 	"reflect"
+	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"{{.BaseImport}}/model"
 	"{{.BaseImport}}/query"
@@ -457,13 +479,22 @@ type querier interface {
 // Client is the main entry point for database operations.
 type Client struct {
 	db *sql.DB
+	tx *clientTx
 {{- if .Models}}
-	executor querier
-	dialect  string
+	executor     querier
+	dialect      string
+	errorHandler func(error) error
 {{- end}}
 {{- range .Models}}
 	{{.Name}} {{.Name}}Actions
 {{- end}}
+}
+
+// clientTx is the transaction shared by a Tx client and its nested
+// savepoint clients.
+type clientTx struct {
+	sqlTx      *sql.Tx
+	savepoints int
 }
 
 // New creates a new Client from a database connection.
@@ -488,6 +519,29 @@ type Option func(*Client)
 // WithDialect sets the SQL dialect ("postgresql", "mysql", "sqlite").
 func WithDialect(d string) Option {
 	return func(c *Client) { c.dialect = d }
+}
+
+// WithErrorHandler installs a hook applied to every database error the client
+// returns (query, exec, scan, and transaction errors). The hook may classify or
+// replace the error, for example with a dialect's ClassifyError; returning nil
+// keeps the original error. Client errors still wrap the result with %w.
+func WithErrorHandler(handler func(error) error) Option {
+	return func(c *Client) { c.errorHandler = handler }
+}
+
+// dbError applies the configured error handler to a database error.
+func (c *Client) dbError(err error) error {
+	if err == nil || c.errorHandler == nil {
+		return err
+	}
+	handled := c.errorHandler(err)
+	if handled == nil {
+		return err
+	}
+	if v := reflect.ValueOf(handled); v.Kind() == reflect.Pointer && v.IsNil() {
+		return err
+	}
+	return handled
 }
 {{- end}}
 
@@ -519,6 +573,590 @@ func (c *Client) quoteIdentifier(name string) string {
 	return "\"" + strings.ReplaceAll(name, "\"", "\"\"") + "\""
 }
 
+// maxBindParams is the bind-parameter limit of one statement.
+func (c *Client) maxBindParams() int {
+	if c.dialect == "sqlite" {
+		return 32766
+	}
+	return 65535
+}
+
+// bulkRowsPerStatement clamps a requested batch size so that rows of the given
+// width stay within the dialect's bind-parameter limit.
+func (c *Client) bulkRowsPerStatement(requested, width int) int {
+	limit := c.maxBindParams()
+	if width > 0 {
+		limit /= width
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if requested <= 0 || requested > limit {
+		return limit
+	}
+	return requested
+}
+
+// bulkStatement is one INSERT statement of a bulk create.
+type bulkStatement struct {
+	query string
+	args  []any
+}
+
+// buildBulkInsert splits rows into INSERT statements. provided[r][i] reports
+// whether column i of row r has a value; unprovided columns use the database
+// default: the DEFAULT keyword on postgresql/mysql, and on sqlite (which has no
+// DEFAULT in multi-row VALUES) consecutive rows with the same provided columns
+// share a statement that omits the unprovided columns, preserving row order.
+func (c *Client) buildBulkInsert(table string, columns []string, rows [][]any, provided [][]bool, batchSize int, conflictDoNothing bool, conflictColumns, returningColumns []string) []bulkStatement {
+	type rowGroup struct {
+		cols []int
+		rows []int
+	}
+	var groups []*rowGroup
+	if c.dialect == "sqlite" {
+		for r := range rows {
+			if r > 0 && slices.Equal(provided[r], provided[r-1]) {
+				last := groups[len(groups)-1]
+				last.rows = append(last.rows, r)
+				continue
+			}
+			var cols []int
+			for i := range columns {
+				if provided[r][i] {
+					cols = append(cols, i)
+				}
+			}
+			groups = append(groups, &rowGroup{cols: cols, rows: []int{r}})
+		}
+	} else {
+		all := &rowGroup{cols: make([]int, len(columns)), rows: make([]int, len(rows))}
+		for i := range columns {
+			all.cols[i] = i
+		}
+		for r := range rows {
+			all.rows[r] = r
+		}
+		groups = append(groups, all)
+	}
+
+	var stmts []bulkStatement
+	for _, g := range groups {
+		quotedCols := make([]string, len(g.cols))
+		for j, col := range g.cols {
+			quotedCols[j] = c.quoteIdentifier(columns[col])
+		}
+		suffix := c.bulkInsertSuffix(quotedCols, conflictDoNothing, conflictColumns, returningColumns)
+		if len(g.cols) == 0 {
+			insert := "INSERT INTO " + table + " DEFAULT VALUES"
+			if c.dialect == "mysql" {
+				insert = "INSERT INTO " + table + " () VALUES ()"
+			}
+			if c.dialect == "sqlite" && conflictDoNothing {
+				// SQLite rejects an upsert clause after DEFAULT VALUES.
+				insert = "INSERT OR IGNORE INTO " + table + " DEFAULT VALUES"
+				suffix = c.bulkInsertSuffix(quotedCols, false, nil, returningColumns)
+			}
+			for range g.rows {
+				stmts = append(stmts, bulkStatement{query: insert + suffix})
+			}
+			continue
+		}
+		perStatement := c.bulkRowsPerStatement(batchSize, len(g.cols))
+		for start := 0; start < len(g.rows); start += perStatement {
+			end := min(start+perStatement, len(g.rows))
+			argIdx := 0
+			var args []any
+			valueSets := make([]string, 0, end-start)
+			for _, r := range g.rows[start:end] {
+				phs := make([]string, len(g.cols))
+				for j, col := range g.cols {
+					if !provided[r][col] {
+						phs[j] = "DEFAULT"
+						continue
+					}
+					argIdx++
+					phs[j] = c.placeholder(argIdx)
+					args = append(args, rows[r][col])
+				}
+				valueSets = append(valueSets, "("+strings.Join(phs, ", ")+")")
+			}
+			q := "INSERT INTO " + table + " (" + strings.Join(quotedCols, ", ") + ") VALUES " + strings.Join(valueSets, ", ") + suffix
+			stmts = append(stmts, bulkStatement{query: q, args: args})
+		}
+	}
+	return stmts
+}
+
+func (c *Client) bulkInsertSuffix(quotedCols []string, conflictDoNothing bool, conflictColumns, returningColumns []string) string {
+	var q string
+	if conflictDoNothing {
+		switch c.dialect {
+		case "mysql":
+			if len(quotedCols) > 0 {
+				q += " ON DUPLICATE KEY UPDATE " + quotedCols[0] + " = " + quotedCols[0]
+			}
+		default:
+			q += " ON CONFLICT"
+			if len(conflictColumns) > 0 {
+				quoted := make([]string, len(conflictColumns))
+				for i, field := range conflictColumns {
+					quoted[i] = c.quoteIdentifier(field)
+				}
+				q += " (" + strings.Join(quoted, ", ") + ")"
+			}
+			q += " DO NOTHING"
+		}
+	}
+	if len(returningColumns) > 0 {
+		quoted := make([]string, len(returningColumns))
+		for i, field := range returningColumns {
+			quoted[i] = c.quoteIdentifier(field)
+		}
+		q += " RETURNING " + strings.Join(quoted, ", ")
+	}
+	return q
+}
+
+// singleRowWhere returns the WHERE clause (with a leading space) that limits an
+// UPDATE or DELETE to at most one row matching whereSQL.
+func (c *Client) singleRowWhere(table string, pkColumns []string, whereSQL string) string {
+	filter := ""
+	if whereSQL != "" {
+		filter = " WHERE " + whereSQL
+	}
+	switch c.dialect {
+	case "postgresql":
+		// Without a primary key use (tableoid, ctid): ctid alone is only
+		// unique within one physical table, not across partitions or
+		// inheritance children.
+		key := "tableoid, ctid"
+		if len(pkColumns) == 0 {
+			return " WHERE (" + key + ") IN (SELECT " + key + " FROM " + table + filter + " LIMIT 1 FOR UPDATE)"
+		}
+		if len(pkColumns) > 0 {
+			quoted := make([]string, len(pkColumns))
+			for i, col := range pkColumns {
+				quoted[i] = c.quoteIdentifier(col)
+			}
+			key = strings.Join(quoted, ", ")
+			if len(quoted) > 1 {
+				return " WHERE (" + key + ") IN (SELECT " + key + " FROM " + table + filter + " LIMIT 1 FOR UPDATE)"
+			}
+		}
+		return " WHERE " + key + " IN (SELECT " + key + " FROM " + table + filter + " LIMIT 1 FOR UPDATE)"
+	case "mysql":
+		return filter + " LIMIT 1"
+	case "sqlite":
+		return " WHERE rowid IN (SELECT rowid FROM " + table + filter + " LIMIT 1)"
+	default:
+		return filter
+	}
+}
+
+// buildLeafCondition renders a single field predicate. Only whitelisted
+// operators are accepted.
+func (c *Client) buildLeafCondition(field, operator string, value any, encode func(any) any, argIdx *int) (string, []any, error) {
+	bind := func(v any) (string, any) {
+		*argIdx++
+		ph := c.placeholder(*argIdx)
+		encoded := encode(v)
+		if _, isList := encoded.(listValue); isList && c.dialect == "mysql" {
+			// MySQL lists are JSON columns; compare JSON with JSON.
+			ph = "CAST(" + ph + " AS JSON)"
+		}
+		return ph, encoded
+	}
+	switch operator {
+	case "IS NULL", "IS NOT NULL":
+		return field + " " + operator, nil, nil
+	case "IN", "NOT IN":
+		vals, ok := value.([]any)
+		if !ok {
+			return "", nil, fmt.Errorf("where operator %s expects []any, got %T", operator, value)
+		}
+		if len(vals) == 0 {
+			if operator == "IN" {
+				return "1 = 0", nil, nil
+			}
+			return "1 = 1", nil, nil
+		}
+		phs := make([]string, len(vals))
+		args := make([]any, len(vals))
+		for i, v := range vals {
+			phs[i], args[i] = bind(v)
+		}
+		return field + " " + operator + " (" + strings.Join(phs, ", ") + ")", args, nil
+	case "CONTAINS", "STARTS_WITH", "ENDS_WITH":
+		pattern := escapeLikePattern(fmt.Sprint(value))
+		switch operator {
+		case "CONTAINS":
+			pattern = "%" + pattern + "%"
+		case "STARTS_WITH":
+			pattern += "%"
+		default:
+			pattern = "%" + pattern
+		}
+		*argIdx++
+		return field + " LIKE " + c.placeholder(*argIdx) + " ESCAPE '\\'", []any{pattern}, nil
+	case "=", "!=", "<>", "<", "<=", ">", ">=":
+		ph, arg := bind(value)
+		return field + " " + operator + " " + ph, []any{arg}, nil
+	default:
+		return "", nil, fmt.Errorf("unsupported where operator %q", operator)
+	}
+}
+
+func validAggregateFn(fn string) (string, error) {
+	upper := strings.ToUpper(fn)
+	switch upper {
+	case "AVG", "SUM", "MIN", "MAX":
+		return upper, nil
+	}
+	return "", fmt.Errorf("invalid aggregate function %q", fn)
+}
+
+// newAggregateDest returns the scan destination for an aggregate: AVG/SUM scan
+// as numbers, MIN/MAX keep the column's own type (time, string, decimal, ...).
+func newAggregateDest(fn string) any {
+	if fn == "AVG" || fn == "SUM" {
+		return new(sql.NullFloat64)
+	}
+	return new(any)
+}
+
+func storeAggregate(fn, field string, dest any, avg, sum map[string]*float64, minVals, maxVals map[string]any) {
+	switch fn {
+	case "AVG", "SUM":
+		v := dest.(*sql.NullFloat64)
+		if !v.Valid {
+			return
+		}
+		f := v.Float64
+		if fn == "AVG" {
+			avg[field] = &f
+		} else {
+			sum[field] = &f
+		}
+	default:
+		v := *dest.(*any)
+		if v == nil {
+			return
+		}
+		if b, ok := v.([]byte); ok {
+			v = string(b)
+		}
+		if fn == "MIN" {
+			minVals[field] = v
+		} else {
+			maxVals[field] = v
+		}
+	}
+}
+
+var (
+	cuidCounter     atomic.Uint32
+	cuidFingerprint = newCUIDFingerprint()
+)
+
+const cuidBlockSize = 36 * 36 * 36 * 36
+
+func init() {
+	cuidCounter.Store(cuidRandomUint32())
+}
+
+// newCUID returns a 25-character collision-resistant id in the cuid layout:
+// "c" + timestamp + counter + host fingerprint + 8 random base36 characters.
+func newCUID() string {
+	var b strings.Builder
+	b.Grow(25)
+	b.WriteByte('c')
+	b.WriteString(cuidPad(strconv.FormatInt(time.Now().UnixMilli(), 36), 8))
+	b.WriteString(cuidPad(strconv.FormatUint(uint64(cuidCounter.Add(1)%cuidBlockSize), 36), 4))
+	b.WriteString(cuidFingerprint)
+	b.WriteString(cuidPad(strconv.FormatUint(uint64(cuidRandomUint32()%cuidBlockSize), 36), 4))
+	b.WriteString(cuidPad(strconv.FormatUint(uint64(cuidRandomUint32()%cuidBlockSize), 36), 4))
+	return b.String()
+}
+
+func cuidPad(s string, n int) string {
+	if len(s) >= n {
+		return s[len(s)-n:]
+	}
+	return strings.Repeat("0", n-len(s)) + s
+}
+
+func cuidRandomUint32() uint32 {
+	var buf [4]byte
+	_, _ = cryptorand.Read(buf[:])
+	return binary.BigEndian.Uint32(buf[:])
+}
+
+func newCUIDFingerprint() string {
+	host, _ := os.Hostname()
+	sum := len(host) + 36
+	for _, r := range host {
+		sum += int(r)
+	}
+	return cuidPad(strconv.FormatInt(int64(os.Getpid()), 36), 2) + cuidPad(strconv.FormatInt(int64(sum), 36), 2)
+}
+
+// listValue encodes a scalar list argument: a 1-D PostgreSQL array literal, or
+// a JSON array on MySQL/SQLite where lists are stored as JSON/TEXT.
+type listValue struct {
+	dialect string
+	list    any
+}
+
+// Value implements driver.Valuer.
+func (v listValue) Value() (driver.Value, error) {
+	rv := reflect.ValueOf(v.list)
+	if !rv.IsValid() || rv.Kind() != reflect.Slice {
+		return nil, fmt.Errorf("list value: expected a slice, got %T", v.list)
+	}
+	if v.dialect != "postgresql" {
+		if rv.IsNil() {
+			return "[]", nil
+		}
+		data, err := json.Marshal(v.list)
+		if err != nil {
+			return nil, err
+		}
+		return string(data), nil
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	for i := 0; i < rv.Len(); i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		text, err := pgArrayElementText(rv.Index(i).Interface())
+		if err != nil {
+			return nil, err
+		}
+		b.WriteByte('"')
+		b.WriteString(pgArrayEscaper.Replace(text))
+		b.WriteByte('"')
+	}
+	b.WriteByte('}')
+	return b.String(), nil
+}
+
+var pgArrayEscaper = strings.NewReplacer("\\", "\\\\", "\"", "\\\"")
+
+func pgArrayElementText(v any) (string, error) {
+	switch x := v.(type) {
+	case time.Time:
+		return x.Format("2006-01-02 15:04:05.999999999Z07:00"), nil
+	case json.RawMessage:
+		return string(x), nil
+	case []byte:
+		return "\\x" + hex.EncodeToString(x), nil
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.String:
+		return rv.String(), nil
+	case reflect.Bool:
+		if rv.Bool() {
+			return "t", nil
+		}
+		return "f", nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return strconv.FormatInt(rv.Int(), 10), nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return strconv.FormatUint(rv.Uint(), 10), nil
+	case reflect.Float32, reflect.Float64:
+		return strconv.FormatFloat(rv.Float(), 'g', -1, rv.Type().Bits()), nil
+	}
+	return "", fmt.Errorf("list value: unsupported element type %T", v)
+}
+
+// listScanner scans a list column (PostgreSQL array text or a JSON array) into
+// a pointer to a slice. NULL scans as a nil slice; NULL array elements become
+// the element's zero value.
+type listScanner struct {
+	dialect string
+	dest    any
+}
+
+// Scan implements sql.Scanner.
+func (s listScanner) Scan(src any) error {
+	dest := reflect.ValueOf(s.dest)
+	if dest.Kind() != reflect.Pointer || dest.Elem().Kind() != reflect.Slice {
+		return fmt.Errorf("list scan: destination must be a pointer to a slice, got %T", s.dest)
+	}
+	list := dest.Elem()
+	var text string
+	switch x := src.(type) {
+	case nil:
+		list.Set(reflect.Zero(list.Type()))
+		return nil
+	case string:
+		text = x
+	case []byte:
+		text = string(x)
+	default:
+		return fmt.Errorf("list scan: unsupported source type %T", src)
+	}
+	if s.dialect != "postgresql" {
+		out := reflect.New(list.Type())
+		if err := json.Unmarshal([]byte(text), out.Interface()); err != nil {
+			return fmt.Errorf("list scan: %w", err)
+		}
+		list.Set(out.Elem())
+		return nil
+	}
+	elems, err := parsePGArray(text)
+	if err != nil {
+		return err
+	}
+	out := reflect.MakeSlice(list.Type(), len(elems), len(elems))
+	for i, elem := range elems {
+		if elem == nil {
+			continue
+		}
+		if err := setPGArrayElement(out.Index(i), *elem); err != nil {
+			return err
+		}
+	}
+	list.Set(out)
+	return nil
+}
+
+// parsePGArray splits a 1-D PostgreSQL array literal into its elements; nil
+// entries are NULL elements.
+func parsePGArray(text string) ([]*string, error) {
+	if strings.HasPrefix(text, "[") {
+		if eq := strings.IndexByte(text, '='); eq >= 0 {
+			text = text[eq+1:]
+		}
+	}
+	if len(text) < 2 || text[0] != '{' || text[len(text)-1] != '}' {
+		return nil, fmt.Errorf("list scan: invalid array literal %q", text)
+	}
+	body := text[1 : len(text)-1]
+	elems := []*string{}
+	if body == "" {
+		return elems, nil
+	}
+	for i := 0; ; {
+		var b strings.Builder
+		quoted := i < len(body) && body[i] == '"'
+		if quoted {
+			i++
+			for i < len(body) && body[i] != '"' {
+				if body[i] == '\\' && i+1 < len(body) {
+					i++
+				}
+				b.WriteByte(body[i])
+				i++
+			}
+			if i >= len(body) {
+				return nil, fmt.Errorf("list scan: unterminated quoted element in %q", text)
+			}
+			i++
+		} else {
+			for i < len(body) && body[i] != ',' {
+				switch body[i] {
+				case '{', '}', '"':
+					return nil, fmt.Errorf("list scan: only one-dimensional arrays are supported: %q", text)
+				case '\\':
+					if i+1 < len(body) {
+						i++
+					}
+				}
+				b.WriteByte(body[i])
+				i++
+			}
+		}
+		elem := b.String()
+		if !quoted {
+			elem = strings.TrimSpace(elem)
+		}
+		if !quoted && strings.EqualFold(elem, "NULL") {
+			elems = append(elems, nil)
+		} else {
+			elems = append(elems, &elem)
+		}
+		if i >= len(body) {
+			return elems, nil
+		}
+		if body[i] != ',' {
+			return nil, fmt.Errorf("list scan: unexpected %q in array literal %q", body[i], text)
+		}
+		i++
+	}
+}
+
+var pgTimeLayouts = []string{
+	"2006-01-02 15:04:05.999999999Z07:00",
+	"2006-01-02 15:04:05.999999999Z07",
+	"2006-01-02 15:04:05.999999999",
+	time.RFC3339Nano,
+	"2006-01-02",
+}
+
+func setPGArrayElement(dst reflect.Value, text string) error {
+	switch p := dst.Addr().Interface().(type) {
+	case *time.Time:
+		for _, layout := range pgTimeLayouts {
+			if t, err := time.Parse(layout, text); err == nil {
+				*p = t
+				return nil
+			}
+		}
+		return fmt.Errorf("list scan: invalid timestamp %q", text)
+	case *json.RawMessage:
+		*p = json.RawMessage(text)
+		return nil
+	case *[]byte:
+		if !strings.HasPrefix(text, "\\x") {
+			return fmt.Errorf("list scan: invalid bytea element %q", text)
+		}
+		data, err := hex.DecodeString(text[2:])
+		if err != nil {
+			return fmt.Errorf("list scan: %w", err)
+		}
+		*p = data
+		return nil
+	}
+	switch dst.Kind() {
+	case reflect.String:
+		dst.SetString(text)
+	case reflect.Bool:
+		switch strings.ToLower(text) {
+		case "t", "true":
+			dst.SetBool(true)
+		case "f", "false":
+			dst.SetBool(false)
+		default:
+			return fmt.Errorf("list scan: invalid boolean %q", text)
+		}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		n, err := strconv.ParseInt(text, 10, dst.Type().Bits())
+		if err != nil {
+			return fmt.Errorf("list scan: %w", err)
+		}
+		dst.SetInt(n)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		n, err := strconv.ParseUint(text, 10, dst.Type().Bits())
+		if err != nil {
+			return fmt.Errorf("list scan: %w", err)
+		}
+		dst.SetUint(n)
+	case reflect.Float32, reflect.Float64:
+		f, err := strconv.ParseFloat(text, dst.Type().Bits())
+		if err != nil {
+			return fmt.Errorf("list scan: %w", err)
+		}
+		dst.SetFloat(f)
+	default:
+		return fmt.Errorf("list scan: unsupported element type %s", dst.Type())
+	}
+	return nil
+}
+
 func scanRowsToMaps(rows *sql.Rows) ([]map[string]any, error) {
 	cols, err := rows.Columns()
 	if err != nil {
@@ -547,7 +1185,9 @@ func scanRowsToMaps(rows *sql.Rows) ([]map[string]any, error) {
 	return results, rows.Err()
 }
 
-func scanRowsToStructs[T any](rows *sql.Rows) ([]T, error) {
+var sqlScannerType = reflect.TypeFor[sql.Scanner]()
+
+func scanRowsToStructs[T any](rows *sql.Rows, dialect string) ([]T, error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, err
@@ -591,6 +1231,13 @@ func scanRowsToStructs[T any](rows *sql.Rows) ([]T, error) {
 				field := value.Field(fieldIndex)
 				if field.CanAddr() {
 					dest[i] = field.Addr().Interface()
+					// Only plain scalar lists use the list codec. Byte slices
+					// (json.RawMessage, net.IP, ...) and types that scan
+					// themselves (pq.StringArray, custom JSON) are left to
+					// database/sql.
+					if ft := field.Type(); ft.Kind() == reflect.Slice && ft.Elem().Kind() != reflect.Uint8 && !reflect.PointerTo(ft).Implements(sqlScannerType) {
+						dest[i] = listScanner{dialect: dialect, dest: dest[i]}
+					}
 					continue
 				}
 			}
@@ -615,45 +1262,50 @@ func escapeLikePattern(s string) string {
 func Raw[T any](ctx context.Context, c *Client, query string, args ...any) ([]T, error) {
 	rows, err := c.executor.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, c.dbError(err)
 	}
 	defer rows.Close()
-	return scanRowsToStructs[T](rows)
+	results, err := scanRowsToStructs[T](rows, c.dialect)
+	return results, c.dbError(err)
 }
 
 // RawRows executes a custom SELECT query and returns row maps keyed by column name.
 func (c *Client) RawRows(ctx context.Context, query string, args ...any) ([]map[string]any, error) {
 	rows, err := c.executor.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, c.dbError(err)
 	}
 	defer rows.Close()
-	return scanRowsToMaps(rows)
+	results, err := scanRowsToMaps(rows)
+	return results, c.dbError(err)
 }
 
 // RawExec executes custom SQL and returns affected rows.
 func (c *Client) RawExec(ctx context.Context, query string, args ...any) (int64, error) {
 	result, err := c.executor.ExecContext(ctx, query, args...)
 	if err != nil {
-		return 0, err
+		return 0, c.dbError(err)
 	}
-	return result.RowsAffected()
+	n, err := result.RowsAffected()
+	return n, c.dbError(err)
 }
 {{- end}}
 
 // Tx executes a function within a database transaction.
 // If the function returns nil, the transaction is committed.
 // If the function returns an error, the transaction is rolled back.
+// Calling Tx on a transaction client runs fn inside a SAVEPOINT of the
+// enclosing transaction, so an error rolls back only the nested work.
 func (c *Client) Tx(ctx context.Context, fn func(tx *Client) error) error {
+	if c.tx != nil {
+		return c.savepointTx(ctx, fn)
+	}
 	sqlTx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return {{if .Models}}c.dbError(err){{else}}err{{end}}
 	}
 
-	txClient := &Client{db: c.db{{if .Models}}, executor: sqlTx, dialect: c.dialect{{end}}}
-{{- range .Models}}
-	txClient.{{.Name}} = {{.Name}}Actions{client: txClient}
-{{- end}}
+	txClient := c.withTx(&clientTx{sqlTx: sqlTx})
 
 	defer func() {
 		if p := recover(); p != nil {
@@ -666,11 +1318,56 @@ func (c *Client) Tx(ctx context.Context, fn func(tx *Client) error) error {
 		_ = sqlTx.Rollback()
 		return err
 	}
-	return sqlTx.Commit()
+	return {{if .Models}}c.dbError(sqlTx.Commit()){{else}}sqlTx.Commit(){{end}}
+}
+
+func (c *Client) withTx(state *clientTx) *Client {
+	txClient := &Client{db: c.db, tx: state{{if .Models}}, executor: state.sqlTx, dialect: c.dialect, errorHandler: c.errorHandler{{end}}}
+{{- range .Models}}
+	txClient.{{.Name}} = {{.Name}}Actions{client: txClient}
+{{- end}}
+	return txClient
+}
+
+// savepointTx runs fn inside a SAVEPOINT of the enclosing transaction.
+func (c *Client) savepointTx(ctx context.Context, fn func(tx *Client) error) error {
+	c.tx.savepoints++
+	name := fmt.Sprintf("gco_sp_%d", c.tx.savepoints)
+	if _, err := c.tx.sqlTx.ExecContext(ctx, "SAVEPOINT "+name); err != nil {
+		return {{if .Models}}c.dbError(err){{else}}err{{end}}
+	}
+	cleanupCtx := context.WithoutCancel(ctx)
+
+	defer func() {
+		if p := recover(); p != nil {
+			_, _ = c.tx.sqlTx.ExecContext(cleanupCtx, "ROLLBACK TO SAVEPOINT "+name)
+			panic(p)
+		}
+	}()
+
+	if err := fn(c.withTx(c.tx)); err != nil {
+		if _, rbErr := c.tx.sqlTx.ExecContext(cleanupCtx, "ROLLBACK TO SAVEPOINT "+name); rbErr != nil {
+			return fmt.Errorf("%w (rollback to savepoint: %w)", err, {{if .Models}}c.dbError(rbErr){{else}}rbErr{{end}})
+		}
+		_, _ = c.tx.sqlTx.ExecContext(cleanupCtx, "RELEASE SAVEPOINT "+name)
+		return err
+	}
+	if _, err := c.tx.sqlTx.ExecContext(ctx, "RELEASE SAVEPOINT "+name); err != nil {
+		return {{if .Models}}c.dbError(err){{else}}err{{end}}
+	}
+	return nil
 }
 
 {{range $model := .Models}}
-func quoted{{$model.Name}}Table(c *Client) string { return c.quoteIdentifier({{quote (tableName $model)}}) }
+func quoted{{$model.Name}}Table(c *Client) string {
+{{- if $model.Schema}}
+	if c.dialect == "postgresql" {
+		return c.quoteIdentifier({{quote $model.Schema}}) + "." + c.quoteIdentifier({{quote (tableName $model)}})
+	}
+{{- end}}
+	return c.quoteIdentifier({{quote (tableName $model)}})
+}
+
 func quoted{{$model.Name}}Columns(c *Client) string {
 	cols := []string{ {{scalarColNamesCSV $model}} }
 	for i := range cols { cols[i] = c.quoteIdentifier(cols[i]) }
@@ -688,86 +1385,205 @@ func quote{{$model.Name}}Field(c *Client, field string) (string, error) {
 	}
 }
 
-// build{{$model.Name}}Where recursively builds a WHERE clause string and arguments.
-func build{{$model.Name}}Where(c *Client, wheres []query.{{$model.Name}}WhereClause, argIdx *int) (string, []any) {
-	var parts []string
-	var args []any
-	for _, w := range wheres {
-		switch w.Field {
-		case "__AND__":
-			if subs, ok := w.Value.([]query.{{$model.Name}}WhereClause); ok {
-				sub, subArgs := build{{$model.Name}}Where(c, subs, argIdx)
-				if sub != "" {
-					parts = append(parts, "("+sub+")")
-				}
-				args = append(args, subArgs...)
-			}
-		case "__OR__":
-			if subs, ok := w.Value.([]query.{{$model.Name}}WhereClause); ok {
-				var orParts []string
-				for _, sc := range subs {
-					sub, subArgs := build{{$model.Name}}Where(c, []query.{{$model.Name}}WhereClause{sc}, argIdx)
-					if sub != "" {
-						orParts = append(orParts, sub)
-					}
-					args = append(args, subArgs...)
-				}
-				if len(orParts) > 0 {
-					parts = append(parts, "("+strings.Join(orParts, " OR ")+")")
-				}
-			}
-		case "__NOT__":
-			if sc, ok := w.Value.(query.{{$model.Name}}WhereClause); ok {
-				sub, subArgs := build{{$model.Name}}Where(c, []query.{{$model.Name}}WhereClause{sc}, argIdx)
-				if sub != "" {
-					parts = append(parts, "NOT ("+sub+")")
-				}
-				args = append(args, subArgs...)
-			}
-		default:
-			field, err := quote{{$model.Name}}Field(c, w.Field)
-			if err != nil { parts = append(parts, "1 = 0"); continue }
-			switch w.Operator {
-			case "IS NULL":
-				parts = append(parts, field+" IS NULL")
-			case "IN", "NOT IN":
-				if vals, ok := w.Value.([]any); ok {
-					if len(vals) == 0 {
-						if w.Operator == "IN" {
-							parts = append(parts, "1 = 0")
-						} else {
-							parts = append(parts, "1 = 1")
-						}
-					} else {
-						phs := make([]string, len(vals))
-						for i, v := range vals {
-							*argIdx++
-							phs[i] = c.placeholder(*argIdx)
-							args = append(args, v)
-						}
-						parts = append(parts, field+" "+w.Operator+" ("+strings.Join(phs, ", ")+")")
-					}
-				}
-			case "CONTAINS":
-				*argIdx++
-				parts = append(parts, field+" LIKE "+c.placeholder(*argIdx)+" ESCAPE '\\'")
-				args = append(args, "%"+escapeLikePattern(fmt.Sprint(w.Value))+"%")
-			case "STARTS_WITH":
-				*argIdx++
-				parts = append(parts, field+" LIKE "+c.placeholder(*argIdx)+" ESCAPE '\\'")
-				args = append(args, escapeLikePattern(fmt.Sprint(w.Value))+"%")
-			case "ENDS_WITH":
-				*argIdx++
-				parts = append(parts, field+" LIKE "+c.placeholder(*argIdx)+" ESCAPE '\\'")
-				args = append(args, "%"+escapeLikePattern(fmt.Sprint(w.Value)))
-			default:
-				*argIdx++
-				parts = append(parts, field+" "+w.Operator+" "+c.placeholder(*argIdx))
-				args = append(args, w.Value)
-			}
+// quote{{$model.Name}}WritableField quotes a column the client may write.
+func quote{{$model.Name}}WritableField(c *Client, field string) (string, error) {
+{{- with generatedFields $model}}
+	switch field {
+{{- range .}}
+	case {{quote (columnName .)}}:
+		return "", fmt.Errorf("{{$model.Name}} field %q is a generated column and cannot be written", field)
+{{- end}}
+	}
+{{- end}}
+	return quote{{$model.Name}}Field(c, field)
+}
+
+// encode{{$model.Name}}Value converts list-field values into dialect-aware SQL values.
+func encode{{$model.Name}}Value(c *Client, field string, v any) any {
+{{- with listFields $model}}
+	switch field {
+	case {{range $i, $f := .}}{{if $i}}, {{end}}{{quote (columnName $f)}}{{end}}:
+		if v != nil && reflect.TypeOf(v).Kind() == reflect.Slice {
+			return listValue{dialect: c.dialect, list: v}
 		}
 	}
-	return strings.Join(parts, " AND "), args
+{{- end}}
+	return v
+}
+
+func scan{{$model.Name}}Dest(c *Client, item *model.{{$model.Name}}) []any {
+	return []any{ {{scanDests $model}} }
+}
+
+// fill{{$model.Name}}CUIDs adds client-generated cuid() values for cuid columns missing from sets.
+func fill{{$model.Name}}CUIDs(sets []query.{{$model.Name}}SetClause) []query.{{$model.Name}}SetClause {
+{{- with cuidFields $model}}
+	out := append([]query.{{$model.Name}}SetClause(nil), sets...)
+{{- range .}}
+	if !has{{$model.Name}}Set(out, {{quote (columnName .)}}) {
+		out = append(out, query.{{$model.Name}}SetClause{Field: {{quote (columnName .)}}, Value: newCUID()})
+	}
+{{- end}}
+	return out
+{{- else}}
+	return sets
+{{- end}}
+}
+
+{{- if cuidFields $model}}
+
+func has{{$model.Name}}Set(sets []query.{{$model.Name}}SetClause, field string) bool {
+	for _, s := range sets {
+		if s.Field == field {
+			return true
+		}
+	}
+	return false
+}
+{{- end}}
+
+// {{lower $model.Name}}CreateInputRow returns a CreateInput's values in writable-column
+// order; provided[i] is false when the column DEFAULT applies.
+func {{lower $model.Name}}CreateInputRow(c *Client, d query.{{$model.Name}}CreateInput) ([]any, []bool) {
+	values := make([]any, {{len (writableFields $model)}})
+	provided := make([]bool, {{len (writableFields $model)}})
+{{- range $i, $f := writableFields $model}}
+{{- if isCUID $f}}
+{{- if $f.IsOptional}}
+	if d.{{upper $f.Name}} != nil {
+		values[{{$i}}] = *d.{{upper $f.Name}}
+	} else {
+		values[{{$i}}] = newCUID()
+	}
+{{- else}}
+	values[{{$i}}] = d.{{upper $f.Name}}
+	if d.{{upper $f.Name}} == "" {
+		values[{{$i}}] = newCUID()
+	}
+{{- end}}
+	provided[{{$i}}] = true
+{{- else if hasDBDefault $f}}
+	if d.{{upper $f.Name}} != nil {
+		values[{{$i}}], provided[{{$i}}] = {{if $f.IsList}}listValue{dialect: c.dialect, list: *d.{{upper $f.Name}}}{{else}}*d.{{upper $f.Name}}{{end}}, true
+	}
+{{- else}}
+	values[{{$i}}], provided[{{$i}}] = {{if $f.IsList}}listValue{dialect: c.dialect, list: d.{{upper $f.Name}}}{{else}}d.{{upper $f.Name}}{{end}}, true
+{{- end}}
+{{- end}}
+	return values, provided
+}
+
+// build{{$model.Name}}Where builds an AND-joined WHERE clause string and arguments.
+func build{{$model.Name}}Where(c *Client, wheres []query.{{$model.Name}}WhereClause, argIdx *int) (string, []any, error) {
+	parts := make([]string, 0, len(wheres))
+	var args []any
+	for _, w := range wheres {
+		part, partArgs, err := build{{$model.Name}}Condition(c, w, argIdx)
+		if err != nil {
+			return "", nil, err
+		}
+		parts = append(parts, part)
+		args = append(args, partArgs...)
+	}
+	return strings.Join(parts, " AND "), args, nil
+}
+
+// build{{$model.Name}}Condition renders one where clause. Unknown fields,
+// unsupported operators and malformed AND/OR/NOT values are errors.
+func build{{$model.Name}}Condition(c *Client, w query.{{$model.Name}}WhereClause, argIdx *int) (string, []any, error) {
+	switch w.Field {
+	case "__AND__":
+		subs, ok := w.Value.([]query.{{$model.Name}}WhereClause)
+		if !ok {
+			return "", nil, fmt.Errorf("{{$model.Name}} where: AND expects []query.{{$model.Name}}WhereClause, got %T", w.Value)
+		}
+		if len(subs) == 0 {
+			return "1 = 1", nil, nil
+		}
+		sub, args, err := build{{$model.Name}}Where(c, subs, argIdx)
+		if err != nil {
+			return "", nil, err
+		}
+		return "(" + sub + ")", args, nil
+	case "__OR__":
+		subs, ok := w.Value.([]query.{{$model.Name}}WhereClause)
+		if !ok {
+			return "", nil, fmt.Errorf("{{$model.Name}} where: OR expects []query.{{$model.Name}}WhereClause, got %T", w.Value)
+		}
+		if len(subs) == 0 {
+			return "1 = 0", nil, nil
+		}
+		orParts := make([]string, 0, len(subs))
+		var args []any
+		for _, sc := range subs {
+			sub, subArgs, err := build{{$model.Name}}Condition(c, sc, argIdx)
+			if err != nil {
+				return "", nil, err
+			}
+			orParts = append(orParts, sub)
+			args = append(args, subArgs...)
+		}
+		return "(" + strings.Join(orParts, " OR ") + ")", args, nil
+	case "__NOT__":
+		sc, ok := w.Value.(query.{{$model.Name}}WhereClause)
+		if !ok {
+			return "", nil, fmt.Errorf("{{$model.Name}} where: NOT expects query.{{$model.Name}}WhereClause, got %T", w.Value)
+		}
+		sub, args, err := build{{$model.Name}}Condition(c, sc, argIdx)
+		if err != nil {
+			return "", nil, err
+		}
+		return "NOT (" + sub + ")", args, nil
+	}
+	field, err := quote{{$model.Name}}Field(c, w.Field)
+	if err != nil {
+		return "", nil, err
+	}
+	return c.buildLeafCondition(field, w.Operator, w.Value, func(v any) any { return encode{{$model.Name}}Value(c, w.Field, v) }, argIdx)
+}
+
+// build{{$model.Name}}Set renders "col = $n" assignments for writable columns.
+func build{{$model.Name}}Set(c *Client, sets []query.{{$model.Name}}SetClause, argIdx *int) (string, []any, error) {
+	parts := make([]string, len(sets))
+	args := make([]any, len(sets))
+	for i, s := range sets {
+		field, err := quote{{$model.Name}}WritableField(c, s.Field)
+		if err != nil {
+			return "", nil, err
+		}
+		*argIdx++
+		parts[i] = field + " = " + c.placeholder(*argIdx)
+		args[i] = encode{{$model.Name}}Value(c, s.Field, s.Value)
+	}
+	return strings.Join(parts, ", "), args, nil
+}
+
+// {{lower $model.Name}}ConflictColumns returns the ON CONFLICT target of an upsert:
+// the columns of an equality or an AND of equalities.
+func {{lower $model.Name}}ConflictColumns(c *Client, where query.{{$model.Name}}WhereClause) ([]string, error) {
+	if where.Field == "__AND__" {
+		subs, ok := where.Value.([]query.{{$model.Name}}WhereClause)
+		if !ok || len(subs) == 0 {
+			return nil, fmt.Errorf("{{$model.Name}}.UpsertOne: AND where clause needs equality clauses")
+		}
+		var cols []string
+		for _, sub := range subs {
+			subCols, err := {{lower $model.Name}}ConflictColumns(c, sub)
+			if err != nil {
+				return nil, err
+			}
+			cols = append(cols, subCols...)
+		}
+		return cols, nil
+	}
+	if where.Operator != "=" || strings.HasPrefix(where.Field, "__") {
+		return nil, fmt.Errorf("{{$model.Name}}.UpsertOne: where must be an equality or an AND of equalities on unique fields")
+	}
+	field, err := quote{{$model.Name}}Field(c, where.Field)
+	if err != nil {
+		return nil, err
+	}
+	return []string{field}, nil
 }
 
 // {{$model.Name}}Actions provides database operations for the {{$model.Name}} model.
@@ -832,11 +1648,23 @@ func (b {{$model.Name}}CreateManyBuilder) Returning(columns ...string) {{$model.
 	return next
 }
 
-// BatchSize limits how many rows are inserted per statement.
+// BatchSize limits how many rows are inserted per statement. The effective
+// size never exceeds the dialect's bind-parameter limit (65535 on
+// postgresql/mysql, 32766 on sqlite); n <= 0 uses the largest size allowed.
 func (b {{$model.Name}}CreateManyBuilder) BatchSize(n int) {{$model.Name}}CreateManyBuilder {
 	next := b
 	next.batchSize = n
 	return next
+}
+
+func (b {{$model.Name}}CreateManyBuilder) statements(returningColumns []string) []bulkStatement {
+	rows := make([][]any, len(b.data))
+	provided := make([][]bool, len(b.data))
+	for i, d := range b.data {
+		rows[i], provided[i] = {{lower $model.Name}}CreateInputRow(b.action.client, d)
+	}
+	columns := []string{ {{writableColNamesCSV $model}} }
+	return b.action.client.buildBulkInsert(quoted{{$model.Name}}Table(b.action.client), columns, rows, provided, b.batchSize, b.conflictDoNothing, b.conflictColumns, returningColumns)
 }
 
 // Do executes the bulk insert and returns total affected rows.
@@ -844,24 +1672,15 @@ func (b {{$model.Name}}CreateManyBuilder) Do(ctx context.Context) (int64, error)
 	if len(b.data) == 0 {
 		return 0, nil
 	}
-	batchSize := b.batchSize
-	if batchSize <= 0 || batchSize > len(b.data) {
-		batchSize = len(b.data)
-	}
 	var total int64
-	for start := 0; start < len(b.data); start += batchSize {
-		end := start + batchSize
-		if end > len(b.data) {
-			end = len(b.data)
-		}
-		q, args := b.action.build{{$model.Name}}CreateManySQL(b.data[start:end], b.conflictDoNothing, b.conflictColumns, nil)
-		result, err := b.action.client.executor.ExecContext(ctx, q, args...)
+	for _, stmt := range b.statements(nil) {
+		result, err := b.action.client.executor.ExecContext(ctx, stmt.query, stmt.args...)
 		if err != nil {
-			return total, fmt.Errorf("{{$model.Name}}.BulkCreate: %w", err)
+			return total, fmt.Errorf("{{$model.Name}}.BulkCreate: %w", b.action.client.dbError(err))
 		}
 		n, err := result.RowsAffected()
 		if err != nil {
-			return total, fmt.Errorf("{{$model.Name}}.BulkCreate rows affected: %w", err)
+			return total, fmt.Errorf("{{$model.Name}}.BulkCreate rows affected: %w", b.action.client.dbError(err))
 		}
 		total += n
 	}
@@ -870,7 +1689,8 @@ func (b {{$model.Name}}CreateManyBuilder) Do(ctx context.Context) (int64, error)
 
 // DoReturning executes the bulk insert and returns inserted rows.
 func (b {{$model.Name}}CreateManyBuilder) DoReturning(ctx context.Context) ([]model.{{$model.Name}}, error) {
-	if b.action.client.dialect != "postgresql" {
+	c := b.action.client
+	if c.dialect != "postgresql" {
 		return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning: RETURNING is only supported for postgresql")
 	}
 	if len(b.returningColumns) > 0 {
@@ -879,35 +1699,26 @@ func (b {{$model.Name}}CreateManyBuilder) DoReturning(ctx context.Context) ([]mo
 	if len(b.data) == 0 {
 		return nil, nil
 	}
-	batchSize := b.batchSize
-	if batchSize <= 0 || batchSize > len(b.data) {
-		batchSize = len(b.data)
-	}
 	var results []model.{{$model.Name}}
-	for start := 0; start < len(b.data); start += batchSize {
-		end := start + batchSize
-		if end > len(b.data) {
-			end = len(b.data)
-		}
-		q, args := b.action.build{{$model.Name}}CreateManySQL(b.data[start:end], b.conflictDoNothing, b.conflictColumns, []string{ {{scalarColNamesCSV $model}} })
-		rows, err := b.action.client.executor.QueryContext(ctx, q, args...)
+	for _, stmt := range b.statements([]string{ {{scalarColNamesCSV $model}} }) {
+		rows, err := c.executor.QueryContext(ctx, stmt.query, stmt.args...)
 		if err != nil {
-			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning: %w", err)
+			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning: %w", c.dbError(err))
 		}
 		for rows.Next() {
 			var item model.{{$model.Name}}
-			if err := rows.Scan({{scanFields $model}}); err != nil {
+			if err := rows.Scan(scan{{$model.Name}}Dest(c, &item)...); err != nil {
 				_ = rows.Close()
-				return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning scan: %w", err)
+				return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning scan: %w", c.dbError(err))
 			}
 			results = append(results, item)
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
-			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning rows: %w", err)
+			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning rows: %w", c.dbError(err))
 		}
 		if err := rows.Close(); err != nil {
-			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning close: %w", err)
+			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturning close: %w", c.dbError(err))
 		}
 	}
 	return results, nil
@@ -915,7 +1726,8 @@ func (b {{$model.Name}}CreateManyBuilder) DoReturning(ctx context.Context) ([]mo
 
 // DoReturningValues executes the bulk insert and returns selected column values.
 func (b {{$model.Name}}CreateManyBuilder) DoReturningValues(ctx context.Context) ([]map[string]any, error) {
-	if b.action.client.dialect != "postgresql" {
+	c := b.action.client
+	if c.dialect != "postgresql" {
 		return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturningValues: RETURNING is only supported for postgresql")
 	}
 	if len(b.data) == 0 {
@@ -925,28 +1737,19 @@ func (b {{$model.Name}}CreateManyBuilder) DoReturningValues(ctx context.Context)
 	if len(returningColumns) == 0 {
 		returningColumns = []string{ {{scalarColNamesCSV $model}} }
 	}
-	batchSize := b.batchSize
-	if batchSize <= 0 || batchSize > len(b.data) {
-		batchSize = len(b.data)
-	}
 	var results []map[string]any
-	for start := 0; start < len(b.data); start += batchSize {
-		end := start + batchSize
-		if end > len(b.data) {
-			end = len(b.data)
-		}
-		q, args := b.action.build{{$model.Name}}CreateManySQL(b.data[start:end], b.conflictDoNothing, b.conflictColumns, returningColumns)
-		rows, err := b.action.client.executor.QueryContext(ctx, q, args...)
+	for _, stmt := range b.statements(returningColumns) {
+		rows, err := c.executor.QueryContext(ctx, stmt.query, stmt.args...)
 		if err != nil {
-			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturningValues: %w", err)
+			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturningValues: %w", c.dbError(err))
 		}
 		batch, err := scanRowsToMaps(rows)
 		closeErr := rows.Close()
 		if err != nil {
-			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturningValues scan: %w", err)
+			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturningValues scan: %w", c.dbError(err))
 		}
 		if closeErr != nil {
-			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturningValues close: %w", closeErr)
+			return nil, fmt.Errorf("{{$model.Name}}.BulkCreate.DoReturningValues close: %w", c.dbError(closeErr))
 		}
 		results = append(results, batch...)
 	}
@@ -1134,7 +1937,10 @@ func (a {{$model.Name}}Actions) FindMany(ctx context.Context, opts ...query.{{$m
 	cfg := query.Apply{{$model.Name}}Options(opts)
 	q := "SELECT "+quoted{{$model.Name}}Columns(a.client)+" FROM "+quoted{{$model.Name}}Table(a.client)
 	argIdx := 0
-	where, args := build{{$model.Name}}Where(a.client, cfg.Wheres, &argIdx)
+	where, args, err := build{{$model.Name}}Where(a.client, cfg.Wheres, &argIdx)
+	if err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.FindMany: %w", err)
+	}
 	if where != "" {
 		q += " WHERE " + where
 	}
@@ -1165,18 +1971,21 @@ func (a {{$model.Name}}Actions) FindMany(ctx context.Context, opts ...query.{{$m
 	}
 	rows, err := a.client.executor.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("{{$model.Name}}.FindMany: %w", err)
+		return nil, fmt.Errorf("{{$model.Name}}.FindMany: %w", a.client.dbError(err))
 	}
 	defer rows.Close()
 	var results []model.{{$model.Name}}
 	for rows.Next() {
 		var item model.{{$model.Name}}
-		if err := rows.Scan({{scanFields $model}}); err != nil {
-			return nil, fmt.Errorf("{{$model.Name}}.FindMany scan: %w", err)
+		if err := rows.Scan(scan{{$model.Name}}Dest(a.client, &item)...); err != nil {
+			return nil, fmt.Errorf("{{$model.Name}}.FindMany scan: %w", a.client.dbError(err))
 		}
 		results = append(results, item)
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.FindMany: %w", a.client.dbError(err))
+	}
+	return results, nil
 }
 
 // FindFirst retrieves the first matching {{$model.Name}} record.
@@ -1195,7 +2004,10 @@ func (a {{$model.Name}}Actions) FindFirst(ctx context.Context, opts ...query.{{$
 // FindUnique retrieves a single {{$model.Name}} record by unique constraint.
 func (a {{$model.Name}}Actions) FindUnique(ctx context.Context, where query.{{$model.Name}}WhereClause) (*model.{{$model.Name}}, error) {
 	argIdx := 0
-	whereSQL, args := build{{$model.Name}}Where(a.client, []query.{{$model.Name}}WhereClause{where}, &argIdx)
+	whereSQL, args, err := build{{$model.Name}}Where(a.client, []query.{{$model.Name}}WhereClause{where}, &argIdx)
+	if err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.FindUnique: %w", err)
+	}
 	q := "SELECT "+quoted{{$model.Name}}Columns(a.client)+" FROM "+quoted{{$model.Name}}Table(a.client)
 	if whereSQL != "" {
 		q += " WHERE " + whereSQL
@@ -1203,45 +2015,45 @@ func (a {{$model.Name}}Actions) FindUnique(ctx context.Context, where query.{{$m
 	q += " LIMIT 1"
 	row := a.client.executor.QueryRowContext(ctx, q, args...)
 	var item model.{{$model.Name}}
-	if err := row.Scan({{scanFields $model}}); err != nil {
+	if err := row.Scan(scan{{$model.Name}}Dest(a.client, &item)...); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("{{$model.Name}}.FindUnique: %w", err)
+		return nil, fmt.Errorf("{{$model.Name}}.FindUnique: %w", a.client.dbError(err))
 	}
 	return &item, nil
 }
 
-// CreateOne creates a single {{$model.Name}} record.
+// CreateOne creates a single {{$model.Name}} record. Missing cuid() fields get
+// a client-generated id; omitted defaulted columns use the database DEFAULT.
 func (a {{$model.Name}}Actions) CreateOne(ctx context.Context, sets ...query.{{$model.Name}}SetClause) (*model.{{$model.Name}}, error) {
 	if len(sets) == 0 {
 		return nil, fmt.Errorf("{{$model.Name}}.CreateOne: no fields provided")
 	}
+	sets = fill{{$model.Name}}CUIDs(sets)
 	cols := make([]string, len(sets))
 	vals := make([]any, len(sets))
 	phs := make([]string, len(sets))
 	for i, s := range sets {
-		field, err := quote{{$model.Name}}Field(a.client, s.Field)
-		if err != nil { return nil, err }
+		field, err := quote{{$model.Name}}WritableField(a.client, s.Field)
+		if err != nil { return nil, fmt.Errorf("{{$model.Name}}.CreateOne: %w", err) }
 		cols[i] = field
-		vals[i] = s.Value
+		vals[i] = encode{{$model.Name}}Value(a.client, s.Field, s.Value)
 		phs[i] = a.client.placeholder(i + 1)
 	}
-	q := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", quoted{{$model.Name}}Table(a.client), strings.Join(cols, ", "), strings.Join(phs, ", "))
+	q := "INSERT INTO " + quoted{{$model.Name}}Table(a.client) + " (" + strings.Join(cols, ", ") + ") VALUES (" + strings.Join(phs, ", ") + ")"
 	if a.client.dialect == "postgresql" {
 		q += " RETURNING " + quoted{{$model.Name}}Columns(a.client)
 		row := a.client.executor.QueryRowContext(ctx, q, vals...)
 		var item model.{{$model.Name}}
-		if err := row.Scan({{scanFields $model}}); err != nil {
-			return nil, fmt.Errorf("{{$model.Name}}.CreateOne: %w", err)
+		if err := row.Scan(scan{{$model.Name}}Dest(a.client, &item)...); err != nil {
+			return nil, fmt.Errorf("{{$model.Name}}.CreateOne: %w", a.client.dbError(err))
 		}
 		return &item, nil
 	}
-	result, err := a.client.executor.ExecContext(ctx, q, vals...)
-	if err != nil {
-		return nil, fmt.Errorf("{{$model.Name}}.CreateOne: %w", err)
+	if _, err := a.client.executor.ExecContext(ctx, q, vals...); err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.CreateOne: %w", a.client.dbError(err))
 	}
-	_ = result
 	return nil, nil
 }
 
@@ -1250,83 +2062,37 @@ func (a {{$model.Name}}Actions) CreateMany(ctx context.Context, data []query.{{$
 	return a.BulkCreate(data).Do(ctx)
 }
 
-func (a {{$model.Name}}Actions) build{{$model.Name}}CreateManySQL(data []query.{{$model.Name}}CreateInput, conflictDoNothing bool, conflictColumns []string, returningColumns []string) (string, []any) {
-	cols := []string{ {{scalarColNamesCSV $model}} }
-	for i := range cols { cols[i] = a.client.quoteIdentifier(cols[i]) }
-	argIdx := 0
-	var valueSets []string
-	var args []any
-	for _, d := range data {
-		row := d.ScalarValues()
-		phs := make([]string, len(row))
-		for i, v := range row {
-			argIdx++
-			phs[i] = a.client.placeholder(argIdx)
-			args = append(args, v)
-		}
-		valueSets = append(valueSets, "("+strings.Join(phs, ", ")+")")
-	}
-	q := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", quoted{{$model.Name}}Table(a.client), strings.Join(cols, ", "), strings.Join(valueSets, ", "))
-	if conflictDoNothing {
-		switch a.client.dialect {
-		case "mysql":
-			if len(cols) > 0 {
-				q += " ON DUPLICATE KEY UPDATE " + cols[0] + " = " + cols[0]
-			}
-		default:
-			q += " ON CONFLICT"
-			if len(conflictColumns) > 0 {
-				quoted := make([]string, len(conflictColumns))
-				for i, field := range conflictColumns { quoted[i] = a.client.quoteIdentifier(field) }
-				q += " (" + strings.Join(quoted, ", ") + ")"
-			}
-			q += " DO NOTHING"
-		}
-	}
-	if len(returningColumns) > 0 {
-		quoted := make([]string, len(returningColumns))
-		for i, field := range returningColumns { quoted[i] = a.client.quoteIdentifier(field) }
-		q += " RETURNING " + strings.Join(quoted, ", ")
-	}
-	return q, args
-}
-
-// UpdateOne updates a single {{$model.Name}} record matching the where clause.
+// UpdateOne updates at most one {{$model.Name}} record matching the where clause.
 func (a {{$model.Name}}Actions) UpdateOne(ctx context.Context, where query.{{$model.Name}}WhereClause, sets ...query.{{$model.Name}}SetClause) (*model.{{$model.Name}}, error) {
 	if len(sets) == 0 {
 		return nil, fmt.Errorf("{{$model.Name}}.UpdateOne: no fields to update")
 	}
 	argIdx := 0
-	setParts := make([]string, len(sets))
-	args := make([]any, 0, len(sets)+1)
-	for i, s := range sets {
-		argIdx++
-		field, err := quote{{$model.Name}}Field(a.client, s.Field)
-		if err != nil { return nil, err }
-		setParts[i] = field + " = " + a.client.placeholder(argIdx)
-		args = append(args, s.Value)
+	setSQL, args, err := build{{$model.Name}}Set(a.client, sets, &argIdx)
+	if err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.UpdateOne: %w", err)
 	}
-	whereSQL, whereArgs := build{{$model.Name}}Where(a.client, []query.{{$model.Name}}WhereClause{where}, &argIdx)
+	whereSQL, whereArgs, err := build{{$model.Name}}Where(a.client, []query.{{$model.Name}}WhereClause{where}, &argIdx)
+	if err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.UpdateOne: %w", err)
+	}
 	args = append(args, whereArgs...)
-	q := fmt.Sprintf("UPDATE %s SET %s", quoted{{$model.Name}}Table(a.client), strings.Join(setParts, ", "))
-	if whereSQL != "" {
-		q += " WHERE " + whereSQL
-	}
+	table := quoted{{$model.Name}}Table(a.client)
+	q := "UPDATE " + table + " SET " + setSQL + a.client.singleRowWhere(table, {{pkColumnsLiteral $model}}, whereSQL)
 	if a.client.dialect == "postgresql" {
 		q += " RETURNING " + quoted{{$model.Name}}Columns(a.client)
 		row := a.client.executor.QueryRowContext(ctx, q, args...)
 		var item model.{{$model.Name}}
-		if err := row.Scan({{scanFields $model}}); err != nil {
+		if err := row.Scan(scan{{$model.Name}}Dest(a.client, &item)...); err != nil {
 			if err == sql.ErrNoRows {
 				return nil, nil
 			}
-			return nil, fmt.Errorf("{{$model.Name}}.UpdateOne: %w", err)
+			return nil, fmt.Errorf("{{$model.Name}}.UpdateOne: %w", a.client.dbError(err))
 		}
 		return &item, nil
 	}
-	_, err := a.client.executor.ExecContext(ctx, q, args...)
-	if err != nil {
-		return nil, fmt.Errorf("{{$model.Name}}.UpdateOne: %w", err)
+	if _, err := a.client.executor.ExecContext(ctx, q, args...); err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.UpdateOne: %w", a.client.dbError(err))
 	}
 	return nil, nil
 }
@@ -1337,72 +2103,68 @@ func (a {{$model.Name}}Actions) UpdateMany(ctx context.Context, wheres []query.{
 		return 0, fmt.Errorf("{{$model.Name}}.UpdateMany: no fields to update")
 	}
 	argIdx := 0
-	setParts := make([]string, len(sets))
-	args := make([]any, 0, len(sets)+len(wheres))
-	for i, s := range sets {
-		argIdx++
-		field, err := quote{{$model.Name}}Field(a.client, s.Field)
-		if err != nil { return 0, err }
-		setParts[i] = field + " = " + a.client.placeholder(argIdx)
-		args = append(args, s.Value)
+	setSQL, args, err := build{{$model.Name}}Set(a.client, sets, &argIdx)
+	if err != nil {
+		return 0, fmt.Errorf("{{$model.Name}}.UpdateMany: %w", err)
 	}
-	whereSQL, whereArgs := build{{$model.Name}}Where(a.client, wheres, &argIdx)
+	whereSQL, whereArgs, err := build{{$model.Name}}Where(a.client, wheres, &argIdx)
+	if err != nil {
+		return 0, fmt.Errorf("{{$model.Name}}.UpdateMany: %w", err)
+	}
 	args = append(args, whereArgs...)
-	q := fmt.Sprintf("UPDATE %s SET %s", quoted{{$model.Name}}Table(a.client), strings.Join(setParts, ", "))
+	q := "UPDATE " + quoted{{$model.Name}}Table(a.client) + " SET " + setSQL
 	if whereSQL != "" {
 		q += " WHERE " + whereSQL
 	}
 	result, err := a.client.executor.ExecContext(ctx, q, args...)
 	if err != nil {
-		return 0, fmt.Errorf("{{$model.Name}}.UpdateMany: %w", err)
+		return 0, fmt.Errorf("{{$model.Name}}.UpdateMany: %w", a.client.dbError(err))
 	}
-	return result.RowsAffected()
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("{{$model.Name}}.UpdateMany rows affected: %w", a.client.dbError(err))
+	}
+	return n, nil
 }
 
-// UpsertOne creates or updates a single {{$model.Name}} record.
+// UpsertOne creates or updates a single {{$model.Name}} record. where must be an
+// equality, or an AND of equalities, over a unique key; it is the conflict
+// target. With no update fields an existing row is left unchanged (and
+// returned on postgresql).
 func (a {{$model.Name}}Actions) UpsertOne(ctx context.Context, where query.{{$model.Name}}WhereClause, create []query.{{$model.Name}}SetClause, update []query.{{$model.Name}}SetClause) (*model.{{$model.Name}}, error) {
 	if len(create) == 0 {
 		return nil, fmt.Errorf("{{$model.Name}}.UpsertOne: no create fields provided")
 	}
+	create = fill{{$model.Name}}CUIDs(create)
 	argIdx := 0
 	cols := make([]string, len(create))
 	phs := make([]string, len(create))
 	args := make([]any, 0, len(create)+len(update))
 	for i, s := range create {
-		field, err := quote{{$model.Name}}Field(a.client, s.Field)
-		if err != nil { return nil, err }
+		field, err := quote{{$model.Name}}WritableField(a.client, s.Field)
+		if err != nil { return nil, fmt.Errorf("{{$model.Name}}.UpsertOne: %w", err) }
 		cols[i] = field
 		argIdx++
 		phs[i] = a.client.placeholder(argIdx)
-		args = append(args, s.Value)
+		args = append(args, encode{{$model.Name}}Value(a.client, s.Field, s.Value))
 	}
-	q := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", quoted{{$model.Name}}Table(a.client), strings.Join(cols, ", "), strings.Join(phs, ", "))
+	q := "INSERT INTO " + quoted{{$model.Name}}Table(a.client) + " (" + strings.Join(cols, ", ") + ") VALUES (" + strings.Join(phs, ", ") + ")"
+	updateSQL, updateArgs, err := build{{$model.Name}}Set(a.client, update, &argIdx)
+	if err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.UpsertOne: %w", err)
+	}
+	args = append(args, updateArgs...)
 	if a.client.dialect == "mysql" {
-		if len(update) > 0 {
-			uParts := make([]string, len(update))
-			for i, s := range update {
-				argIdx++
-				field, err := quote{{$model.Name}}Field(a.client, s.Field)
-				if err != nil { return nil, err }
-				uParts[i] = field + " = " + a.client.placeholder(argIdx)
-				args = append(args, s.Value)
-			}
-			q += " ON DUPLICATE KEY UPDATE " + strings.Join(uParts, ", ")
+		if len(update) == 0 {
+			updateSQL = cols[0] + " = " + cols[0]
 		}
+		q += " ON DUPLICATE KEY UPDATE " + updateSQL
 	} else {
-		conflictField, err := quote{{$model.Name}}Field(a.client, where.Field)
+		conflictCols, err := {{lower $model.Name}}ConflictColumns(a.client, where)
 		if err != nil { return nil, err }
-		q += fmt.Sprintf(" ON CONFLICT (%s) DO", conflictField)
+		q += " ON CONFLICT (" + strings.Join(conflictCols, ", ") + ") DO"
 		if len(update) > 0 {
-			uParts := make([]string, len(update))
-			for i, s := range update {
-				argIdx++
-				field, err := quote{{$model.Name}}Field(a.client, s.Field)
-				if err != nil { return nil, err }
-				uParts[i] = field + " = " + a.client.placeholder(argIdx)
-				args = append(args, s.Value)
-			}
-			q += " UPDATE SET " + strings.Join(uParts, ", ")
+			q += " UPDATE SET " + updateSQL
 		} else {
 			q += " NOTHING"
 		}
@@ -1411,41 +2173,51 @@ func (a {{$model.Name}}Actions) UpsertOne(ctx context.Context, where query.{{$mo
 		q += " RETURNING " + quoted{{$model.Name}}Columns(a.client)
 		row := a.client.executor.QueryRowContext(ctx, q, args...)
 		var item model.{{$model.Name}}
-		if err := row.Scan({{scanFields $model}}); err != nil {
-			return nil, fmt.Errorf("{{$model.Name}}.UpsertOne: %w", err)
+		if err := row.Scan(scan{{$model.Name}}Dest(a.client, &item)...); err != nil {
+			if err != sql.ErrNoRows || len(update) > 0 {
+				return nil, fmt.Errorf("{{$model.Name}}.UpsertOne: %w", a.client.dbError(err))
+			}
+			// ON CONFLICT DO NOTHING returns no row for an existing record.
+			existing, findErr := a.FindUnique(ctx, where)
+			if findErr != nil {
+				return nil, fmt.Errorf("{{$model.Name}}.UpsertOne: load existing row: %w", findErr)
+			}
+			if existing == nil {
+				return nil, fmt.Errorf("{{$model.Name}}.UpsertOne: existing row not found by where clause: %w", sql.ErrNoRows)
+			}
+			return existing, nil
 		}
 		return &item, nil
 	}
-	_, err := a.client.executor.ExecContext(ctx, q, args...)
-	if err != nil {
-		return nil, fmt.Errorf("{{$model.Name}}.UpsertOne: %w", err)
+	if _, err := a.client.executor.ExecContext(ctx, q, args...); err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.UpsertOne: %w", a.client.dbError(err))
 	}
 	return nil, nil
 }
 
-// DeleteOne deletes a single {{$model.Name}} record matching the where clause.
+// DeleteOne deletes at most one {{$model.Name}} record matching the where clause.
 func (a {{$model.Name}}Actions) DeleteOne(ctx context.Context, where query.{{$model.Name}}WhereClause) (*model.{{$model.Name}}, error) {
 	argIdx := 0
-	whereSQL, args := build{{$model.Name}}Where(a.client, []query.{{$model.Name}}WhereClause{where}, &argIdx)
-	q := "DELETE FROM "+quoted{{$model.Name}}Table(a.client)
-	if whereSQL != "" {
-		q += " WHERE " + whereSQL
+	whereSQL, args, err := build{{$model.Name}}Where(a.client, []query.{{$model.Name}}WhereClause{where}, &argIdx)
+	if err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.DeleteOne: %w", err)
 	}
+	table := quoted{{$model.Name}}Table(a.client)
+	q := "DELETE FROM " + table + a.client.singleRowWhere(table, {{pkColumnsLiteral $model}}, whereSQL)
 	if a.client.dialect == "postgresql" {
 		q += " RETURNING " + quoted{{$model.Name}}Columns(a.client)
 		row := a.client.executor.QueryRowContext(ctx, q, args...)
 		var item model.{{$model.Name}}
-		if err := row.Scan({{scanFields $model}}); err != nil {
+		if err := row.Scan(scan{{$model.Name}}Dest(a.client, &item)...); err != nil {
 			if err == sql.ErrNoRows {
 				return nil, nil
 			}
-			return nil, fmt.Errorf("{{$model.Name}}.DeleteOne: %w", err)
+			return nil, fmt.Errorf("{{$model.Name}}.DeleteOne: %w", a.client.dbError(err))
 		}
 		return &item, nil
 	}
-	_, err := a.client.executor.ExecContext(ctx, q, args...)
-	if err != nil {
-		return nil, fmt.Errorf("{{$model.Name}}.DeleteOne: %w", err)
+	if _, err := a.client.executor.ExecContext(ctx, q, args...); err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.DeleteOne: %w", a.client.dbError(err))
 	}
 	return nil, nil
 }
@@ -1453,95 +2225,129 @@ func (a {{$model.Name}}Actions) DeleteOne(ctx context.Context, where query.{{$mo
 // DeleteMany deletes multiple {{$model.Name}} records matching the where clauses.
 func (a {{$model.Name}}Actions) DeleteMany(ctx context.Context, wheres ...query.{{$model.Name}}WhereClause) (int64, error) {
 	argIdx := 0
-	whereSQL, args := build{{$model.Name}}Where(a.client, wheres, &argIdx)
+	whereSQL, args, err := build{{$model.Name}}Where(a.client, wheres, &argIdx)
+	if err != nil {
+		return 0, fmt.Errorf("{{$model.Name}}.DeleteMany: %w", err)
+	}
 	q := "DELETE FROM "+quoted{{$model.Name}}Table(a.client)
 	if whereSQL != "" {
 		q += " WHERE " + whereSQL
 	}
 	result, err := a.client.executor.ExecContext(ctx, q, args...)
 	if err != nil {
-		return 0, fmt.Errorf("{{$model.Name}}.DeleteMany: %w", err)
+		return 0, fmt.Errorf("{{$model.Name}}.DeleteMany: %w", a.client.dbError(err))
 	}
-	return result.RowsAffected()
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("{{$model.Name}}.DeleteMany rows affected: %w", a.client.dbError(err))
+	}
+	return n, nil
 }
 
 // Count returns the number of {{$model.Name}} records matching the where clauses.
 func (a {{$model.Name}}Actions) Count(ctx context.Context, wheres ...query.{{$model.Name}}WhereClause) (int64, error) {
 	argIdx := 0
-	whereSQL, args := build{{$model.Name}}Where(a.client, wheres, &argIdx)
+	whereSQL, args, err := build{{$model.Name}}Where(a.client, wheres, &argIdx)
+	if err != nil {
+		return 0, fmt.Errorf("{{$model.Name}}.Count: %w", err)
+	}
 	q := "SELECT COUNT(*) FROM "+quoted{{$model.Name}}Table(a.client)
 	if whereSQL != "" {
 		q += " WHERE " + whereSQL
 	}
 	var count int64
 	if err := a.client.executor.QueryRowContext(ctx, q, args...).Scan(&count); err != nil {
-		return 0, fmt.Errorf("{{$model.Name}}.Count: %w", err)
+		return 0, fmt.Errorf("{{$model.Name}}.Count: %w", a.client.dbError(err))
 	}
 	return count, nil
 }
 
-// Aggregate computes aggregate values for {{$model.Name}}.
+// Aggregate computes aggregate values over all {{$model.Name}} records.
 func (a {{$model.Name}}Actions) Aggregate(ctx context.Context, opts ...query.{{$model.Name}}AggregateOption) (*query.{{$model.Name}}AggregateResult, error) {
+	return a.AggregateWhere(ctx, nil, opts...)
+}
+
+// AggregateWhere computes aggregate values over {{$model.Name}} records matching
+// the where clauses. AVG/SUM are float64; MIN/MAX keep the column's value type.
+func (a {{$model.Name}}Actions) AggregateWhere(ctx context.Context, wheres []query.{{$model.Name}}WhereClause, opts ...query.{{$model.Name}}AggregateOption) (*query.{{$model.Name}}AggregateResult, error) {
 	selParts := []string{"COUNT(*)"}
-	for _, opt := range opts {
-		fn := strings.ToUpper(opt.Fn)
-		if fn != "AVG" && fn != "SUM" && fn != "MIN" && fn != "MAX" { return nil, fmt.Errorf("invalid aggregate function %q", opt.Fn) }
+	fns := make([]string, len(opts))
+	for i, opt := range opts {
+		fn, err := validAggregateFn(opt.Fn)
+		if err != nil { return nil, err }
 		field, err := quote{{$model.Name}}Field(a.client, opt.Field)
 		if err != nil { return nil, err }
-		selParts = append(selParts, fmt.Sprintf("%s(%s)", fn, field))
+		fns[i] = fn
+		selParts = append(selParts, fn+"("+field+")")
 	}
-	q := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selParts, ", "), quoted{{$model.Name}}Table(a.client))
-	row := a.client.executor.QueryRowContext(ctx, q)
+	q := "SELECT " + strings.Join(selParts, ", ") + " FROM " + quoted{{$model.Name}}Table(a.client)
+	argIdx := 0
+	whereSQL, args, err := build{{$model.Name}}Where(a.client, wheres, &argIdx)
+	if err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.Aggregate: %w", err)
+	}
+	if whereSQL != "" {
+		q += " WHERE " + whereSQL
+	}
 	result := &query.{{$model.Name}}AggregateResult{
 		Avg: make(map[string]*float64),
 		Sum: make(map[string]*float64),
 		Min: make(map[string]any),
 		Max: make(map[string]any),
 	}
-	aggVals := make([]sql.NullFloat64, len(opts))
 	scanDest := make([]any, 0, 1+len(opts))
 	scanDest = append(scanDest, &result.Count)
-	for i := range opts {
-		scanDest = append(scanDest, &aggVals[i])
+	for _, fn := range fns {
+		scanDest = append(scanDest, newAggregateDest(fn))
 	}
-	if err := row.Scan(scanDest...); err != nil {
-		return nil, fmt.Errorf("{{$model.Name}}.Aggregate: %w", err)
+	if err := a.client.executor.QueryRowContext(ctx, q, args...).Scan(scanDest...); err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.Aggregate: %w", a.client.dbError(err))
 	}
 	for i, opt := range opts {
-		if aggVals[i].Valid {
-			v := aggVals[i].Float64
-			switch strings.ToLower(opt.Fn) {
-			case "avg":
-				result.Avg[opt.Field] = &v
-			case "sum":
-				result.Sum[opt.Field] = &v
-			case "min":
-				result.Min[opt.Field] = v
-			case "max":
-				result.Max[opt.Field] = v
-			}
-		}
+		storeAggregate(fns[i], opt.Field, scanDest[i+1], result.Avg, result.Sum, result.Min, result.Max)
 	}
 	return result, nil
 }
 
-// GroupBy performs a GROUP BY query on {{$model.Name}}.
+// GroupBy performs a GROUP BY query over all {{$model.Name}} records.
 func (a {{$model.Name}}Actions) GroupBy(ctx context.Context, fields []string, opts ...query.{{$model.Name}}AggregateOption) ([]query.{{$model.Name}}GroupByResult, error) {
+	return a.GroupByWhere(ctx, fields, nil, opts...)
+}
+
+// GroupByWhere performs a GROUP BY query over {{$model.Name}} records matching the
+// where clauses.
+func (a {{$model.Name}}Actions) GroupByWhere(ctx context.Context, fields []string, wheres []query.{{$model.Name}}WhereClause, opts ...query.{{$model.Name}}AggregateOption) ([]query.{{$model.Name}}GroupByResult, error) {
 	selParts := make([]string, 0, len(fields)+1+len(opts))
 	groupFields := make([]string, len(fields))
-	for i, field := range fields { quoted, err := quote{{$model.Name}}Field(a.client, field); if err != nil { return nil, err }; groupFields[i] = quoted }
+	for i, field := range fields {
+		quoted, err := quote{{$model.Name}}Field(a.client, field)
+		if err != nil { return nil, err }
+		groupFields[i] = quoted
+	}
 	selParts = append(selParts, groupFields...)
 	selParts = append(selParts, "COUNT(*)")
-	for _, opt := range opts {
-		fn := strings.ToUpper(opt.Fn)
-		if fn != "AVG" && fn != "SUM" && fn != "MIN" && fn != "MAX" { return nil, fmt.Errorf("invalid aggregate function %q", opt.Fn) }
-		field, err := quote{{$model.Name}}Field(a.client, opt.Field); if err != nil { return nil, err }
-		selParts = append(selParts, fmt.Sprintf("%s(%s)", fn, field))
+	fns := make([]string, len(opts))
+	for i, opt := range opts {
+		fn, err := validAggregateFn(opt.Fn)
+		if err != nil { return nil, err }
+		field, err := quote{{$model.Name}}Field(a.client, opt.Field)
+		if err != nil { return nil, err }
+		fns[i] = fn
+		selParts = append(selParts, fn+"("+field+")")
 	}
-	q := fmt.Sprintf("SELECT %s FROM %s GROUP BY %s", strings.Join(selParts, ", "), quoted{{$model.Name}}Table(a.client), strings.Join(groupFields, ", "))
-	rows, err := a.client.executor.QueryContext(ctx, q)
+	q := "SELECT " + strings.Join(selParts, ", ") + " FROM " + quoted{{$model.Name}}Table(a.client)
+	argIdx := 0
+	whereSQL, args, err := build{{$model.Name}}Where(a.client, wheres, &argIdx)
 	if err != nil {
 		return nil, fmt.Errorf("{{$model.Name}}.GroupBy: %w", err)
+	}
+	if whereSQL != "" {
+		q += " WHERE " + whereSQL
+	}
+	q += " GROUP BY " + strings.Join(groupFields, ", ")
+	rows, err := a.client.executor.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.GroupBy: %w", a.client.dbError(err))
 	}
 	defer rows.Close()
 	var results []query.{{$model.Name}}GroupByResult
@@ -1556,38 +2362,33 @@ func (a {{$model.Name}}Actions) GroupBy(ctx context.Context, fields []string, op
 		groupVals := make([]any, len(fields))
 		scanDest := make([]any, 0, len(fields)+1+len(opts))
 		for i := range fields {
-			groupVals[i] = new(any)
-			scanDest = append(scanDest, groupVals[i])
+			scanDest = append(scanDest, &groupVals[i])
 		}
 		scanDest = append(scanDest, &r.Count)
-		aggVals := make([]sql.NullFloat64, len(opts))
-		for i := range opts {
-			scanDest = append(scanDest, &aggVals[i])
+		aggDest := make([]any, len(fns))
+		for i, fn := range fns {
+			aggDest[i] = newAggregateDest(fn)
+			scanDest = append(scanDest, aggDest[i])
 		}
 		if err := rows.Scan(scanDest...); err != nil {
-			return nil, fmt.Errorf("{{$model.Name}}.GroupBy scan: %w", err)
+			return nil, fmt.Errorf("{{$model.Name}}.GroupBy scan: %w", a.client.dbError(err))
 		}
 		for i, f := range fields {
-			r.Group[f] = *(groupVals[i].(*any))
+			v := groupVals[i]
+			if b, ok := v.([]byte); ok {
+				v = string(b)
+			}
+			r.Group[f] = v
 		}
 		for i, opt := range opts {
-			if aggVals[i].Valid {
-				v := aggVals[i].Float64
-				switch strings.ToLower(opt.Fn) {
-				case "avg":
-					r.Avg[opt.Field] = &v
-				case "sum":
-					r.Sum[opt.Field] = &v
-				case "min":
-					r.Min[opt.Field] = v
-				case "max":
-					r.Max[opt.Field] = v
-				}
-			}
+			storeAggregate(fns[i], opt.Field, aggDest[i], r.Avg, r.Sum, r.Min, r.Max)
 		}
 		results = append(results, r)
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("{{$model.Name}}.GroupBy: %w", a.client.dbError(err))
+	}
+	return results, nil
 }
 {{end}}
 `

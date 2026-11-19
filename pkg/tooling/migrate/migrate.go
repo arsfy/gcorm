@@ -36,6 +36,7 @@ type MigrationManifest struct {
 type ChangeRecord struct {
 	Type     string `json:"type"`
 	Model    string `json:"model"`
+	Schema   string `json:"schema,omitempty"`
 	Field    string `json:"field,omitempty"`
 	Rollback string `json:"rollback"`
 }
@@ -177,6 +178,7 @@ func runDiff(args []string) error {
 		changeRecords = append(changeRecords, ChangeRecord{
 			Type:     string(c.Type),
 			Model:    c.Model,
+			Schema:   c.Schema,
 			Field:    c.Field,
 			Rollback: string(c.Rollback),
 		})
@@ -221,7 +223,11 @@ func runDiff(args []string) error {
 	// Print summary.
 	fmt.Printf("Created migration %s with %d change(s):\n", dirName, len(cs.Changes))
 	for _, c := range orderedChanges {
-		fmt.Printf("  %s %s", c.Type, c.Model)
+		if c.Schema != "" {
+			fmt.Printf("  %s %s.%s", c.Type, c.Schema, c.Model)
+		} else {
+			fmt.Printf("  %s %s", c.Type, c.Model)
+		}
 		if c.Field != "" {
 			fmt.Printf(".%s", c.Field)
 		}

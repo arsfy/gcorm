@@ -186,9 +186,6 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 	if err := validateNoInternalTableConflict(targetSchema); err != nil {
 		return nil, err
 	}
-	if provider == "postgresql" && targetSchema.Datasource != nil && len(targetSchema.Datasource.Schemas) > 1 {
-		return nil, fmt.Errorf("db push does not yet support multiple postgresql datasource schemas; use schema or a single schemas entry")
-	}
 	if provider == "mysql" {
 		return pushCompiledMySQL(ctx, db, targetSchema, schemaHash, dsn, opts)
 	}
@@ -199,27 +196,54 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 }
 
 func pushTransactional(ctx context.Context, db transactionalRunner, provider string, targetSchema *ir.Schema, schemaHash, dsn string, opts Options, checkForeignKeys bool) (*Result, error) {
+	return pushTransactionalPhase(ctx, db, provider, targetSchema, schemaHash, dsn, opts, checkForeignKeys, nil)
+}
+
+// beginPushTransaction starts a locked push transaction. PostgreSQL resolves
+// unqualified names in the default schema and then in public.
+func beginPushTransaction(ctx context.Context, db transactionalRunner, provider string, targetSchema *ir.Schema, dsn string, opts Options) (*sql.Tx, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	if provider == "postgresql" {
+		defaultSchema := resolveSchemaName(targetSchema, dsn)
+		// PostgreSQL skips missing schemas in search_path, so objects for a
+		// missing default schema would silently land in public. Create it.
+		if err := ensurePostgresSchema(ctx, tx, defaultSchema); err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, postgresSearchPathSQL(defaultSchema)); err != nil {
+			tx.Rollback()
+			return nil, fmt.Errorf("set postgresql search_path: %w", err)
+		}
+	}
+	if !opts.DisableLock {
+		if err := lockPushTransaction(ctx, tx, provider); err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+	}
+	return tx, nil
+}
+
+// pushTransactionalPhase plans and applies a push in one transaction. When
+// the plan starts with PostgreSQL steps that must be committed before later
+// statements use them (new enum values), those steps are applied and
+// committed first, and the remaining changes are planned again in a new
+// locked transaction from the updated database. committed carries the result
+// of that first phase.
+func pushTransactionalPhase(ctx context.Context, db transactionalRunner, provider string, targetSchema *ir.Schema, schemaHash, dsn string, opts Options, checkForeignKeys bool, committed *Result) (*Result, error) {
 	var tx *sql.Tx
 	var runner sqlRunner = db
 	if !opts.DryRun {
 		var err error
-		tx, err = db.BeginTx(ctx, nil)
+		tx, err = beginPushTransaction(ctx, db, provider, targetSchema, dsn, opts)
 		if err != nil {
-			return nil, fmt.Errorf("begin transaction: %w", err)
+			return nil, err
 		}
 		defer tx.Rollback()
-		if provider == "postgresql" {
-			schemaName := resolveSchemaName(targetSchema, dsn)
-			quotedSchema := `"` + strings.ReplaceAll(schemaName, `"`, `""`) + `"`
-			if _, err := tx.ExecContext(ctx, "SET LOCAL search_path TO "+quotedSchema); err != nil {
-				return nil, fmt.Errorf("set postgresql search_path: %w", err)
-			}
-		}
-		if !opts.DisableLock {
-			if err := lockPushTransaction(ctx, tx, provider); err != nil {
-				return nil, err
-			}
-		}
 		runner = tx
 	}
 
@@ -235,15 +259,20 @@ func pushTransactional(ctx context.Context, db transactionalRunner, provider str
 		ModelCount:  len(targetSchema.Models),
 		ChangeCount: len(cs.Changes),
 	}
+	if committed != nil {
+		result.ChangeCount = committed.ChangeCount
+		result.Statements = append(result.Statements, committed.Statements...)
+		result.AppliedStatements = append(result.AppliedStatements, committed.AppliedStatements...)
+	}
 	if len(cs.Changes) == 0 {
-		result.Noop = true
+		result.Noop = committed == nil
 		if opts.DryRun {
 			return result, nil
 		}
 		if err := ensureSchemaPushesTable(ctx, tx, provider); err != nil {
 			return nil, err
 		}
-		if err := insertSchemaPushRecord(ctx, tx, provider, schemaHash, len(targetSchema.Models), 0); err != nil {
+		if err := insertSchemaPushRecord(ctx, tx, provider, schemaHash, len(targetSchema.Models), result.ChangeCount); err != nil {
 			return nil, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -258,7 +287,7 @@ func pushTransactional(ctx context.Context, db transactionalRunner, provider str
 	}
 
 	gen := migrate.DDLGenerator{Dialect: provider, Schema: targetSchema}
-	stmts, unsupported := upStatements(gen, cs)
+	stmts, commitCount, unsupported := upStatements(gen, cs)
 	if len(unsupported) > 0 {
 		return nil, fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
 	}
@@ -268,6 +297,26 @@ func pushTransactional(ctx context.Context, db transactionalRunner, provider str
 	}
 	if opts.DryRun {
 		return result, nil
+	}
+
+	if commitCount > 0 {
+		if committed != nil {
+			return nil, fmt.Errorf("db push: enum changes are still pending after they were committed")
+		}
+		for _, stmt := range stmts[:commitCount] {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return nil, fmt.Errorf("execute SQL %s: %w", statementSummary(stmt), err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit enum changes: %w", err)
+		}
+		phase := &Result{ChangeCount: len(cs.Changes), Statements: stmts[:commitCount], AppliedStatements: stmts[:commitCount]}
+		next, err := pushTransactionalPhase(ctx, db, provider, targetSchema, schemaHash, dsn, opts, checkForeignKeys, phase)
+		if err != nil {
+			return nil, fmt.Errorf("%w; the enum changes were already committed:\n%s", err, strings.Join(stmts[:commitCount], "\n"))
+		}
+		return next, nil
 	}
 
 	var views []string
@@ -301,7 +350,7 @@ func pushTransactional(ctx context.Context, db transactionalRunner, provider str
 			return nil, err
 		}
 	}
-	if err := insertSchemaPushRecord(ctx, tx, provider, schemaHash, len(targetSchema.Models), len(cs.Changes)); err != nil {
+	if err := insertSchemaPushRecord(ctx, tx, provider, schemaHash, len(targetSchema.Models), result.ChangeCount); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -367,7 +416,7 @@ func pushCompiledMySQL(ctx context.Context, db *sql.DB, targetSchema *ir.Schema,
 	}
 
 	gen := migrate.DDLGenerator{Dialect: "mysql", Schema: targetSchema}
-	stmts, unsupported := upStatements(gen, cs)
+	stmts, _, unsupported := upStatements(gen, cs)
 	if len(unsupported) > 0 {
 		return nil, fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
 	}
@@ -413,7 +462,7 @@ func planWithoutIntrospection(targetSchema *ir.Schema, schemaHash string) (*Resu
 	}
 
 	gen := migrate.DDLGenerator{Dialect: provider, Schema: targetSchema}
-	stmts, unsupported := upStatements(gen, cs)
+	stmts, _, unsupported := upStatements(gen, cs)
 	if len(unsupported) > 0 {
 		return nil, fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
 	}
@@ -601,39 +650,6 @@ func normalizePostgresURL(rawURL string) (string, error) {
 	return parsedURL.String(), nil
 }
 
-func resolveSchemaName(schema *ir.Schema, dsn string) string {
-	if schema != nil && schema.Datasource != nil && schema.Datasource.Schema != "" {
-		return schema.Datasource.Schema
-	}
-	if schema != nil && schema.Datasource != nil && len(schema.Datasource.Schemas) == 1 {
-		return schema.Datasource.Schemas[0]
-	}
-	if schemaName := postgresSchemaFromURL(dsn); schemaName != "" {
-		return schemaName
-	}
-	return "public"
-}
-
-func postgresSchemaFromURL(rawURL string) string {
-	parsedURL, err := url.Parse(rawURL)
-	if err != nil {
-		return ""
-	}
-
-	query := parsedURL.Query()
-	if schemaName := strings.TrimSpace(query.Get("schema")); schemaName != "" {
-		return schemaName
-	}
-
-	searchPath := strings.TrimSpace(query.Get("search_path"))
-	if searchPath == "" {
-		return ""
-	}
-	parts := strings.Split(searchPath, ",")
-	first := strings.TrimSpace(parts[0])
-	return strings.Trim(first, `"`)
-}
-
 func isPostgresURL(rawURL string) bool {
 	lower := strings.ToLower(rawURL)
 	return strings.HasPrefix(lower, "postgresql://") || strings.HasPrefix(lower, "postgres://")
@@ -714,7 +730,11 @@ func riskyChanges(cs *migrate.Changeset) []string {
 		if c.Rollback == migrate.SafeRollback {
 			continue
 		}
-		label := fmt.Sprintf("  - %s %s", c.Type, c.Model)
+		table := c.Model
+		if c.Schema != "" {
+			table = c.Schema + "." + c.Model
+		}
+		label := fmt.Sprintf("  - %s %s", c.Type, table)
 		if c.Field != "" {
 			label += "." + c.Field
 		}
@@ -762,18 +782,25 @@ func splitStatements(sqlText, dialect string) ([]string, []string) {
 	return stmts, unsupported
 }
 
-func upStatements(gen migrate.DDLGenerator, cs *migrate.Changeset) ([]string, []string) {
-	var statements, unsupported []string
+// upStatements returns the driver statements of a changeset. The first
+// commitCount statements come from DDL steps that must be committed before
+// the rest run (see migrate.DDLStep.RequiresCommit).
+func upStatements(gen migrate.DDLGenerator, cs *migrate.Changeset) (statements []string, commitCount int, unsupported []string) {
 	for _, step := range gen.UpSteps(cs) {
+		var parsed []string
 		if step.SingleStatement {
-			statements = append(statements, strings.TrimSuffix(step.SQL, ";"))
-			continue
+			parsed = []string{strings.TrimSuffix(step.SQL, ";")}
+		} else {
+			var comments []string
+			parsed, comments = splitStatements(step.SQL, gen.Dialect)
+			unsupported = append(unsupported, comments...)
 		}
-		parsed, comments := splitStatements(step.SQL, gen.Dialect)
 		statements = append(statements, parsed...)
-		unsupported = append(unsupported, comments...)
+		if step.RequiresCommit && commitCount == len(statements)-len(parsed) {
+			commitCount = len(statements)
+		}
 	}
-	return statements, unsupported
+	return statements, commitCount, unsupported
 }
 
 func splitSQLStatements(sqlText, dialect string) []string {
@@ -1150,57 +1177,6 @@ func validateNoInternalTableConflict(schema *ir.Schema) error {
 	return nil
 }
 
-func introspectPostgres(ctx context.Context, db sqlRunner, schemaName string) (*ir.Schema, error) {
-	return introspectPostgresWithTarget(ctx, db, schemaName, nil)
-}
-
-func introspectPostgresWithTarget(ctx context.Context, db sqlRunner, schemaName string, targetSchema *ir.Schema) (*ir.Schema, error) {
-	schema := &ir.Schema{
-		Datasource: &ir.Datasource{
-			Provider: "postgresql",
-			Schema:   schemaName,
-		},
-	}
-
-	models, err := loadPostgresTables(ctx, db, schemaName)
-	if err != nil {
-		return nil, err
-	}
-	enums, enumNames, err := loadPostgresEnums(ctx, db, schemaName, targetSchema)
-	if err != nil {
-		return nil, err
-	}
-	schema.Enums = enums
-	if err := loadPostgresColumns(ctx, db, schemaName, models, targetSchema, enumNames); err != nil {
-		return nil, err
-	}
-	if err := loadPostgresPrimaryKeys(ctx, db, schemaName, models); err != nil {
-		return nil, err
-	}
-	if err := loadPostgresUniqueConstraints(ctx, db, schemaName, models); err != nil {
-		return nil, err
-	}
-	if err := loadPostgresIndexes(ctx, db, schemaName, models); err != nil {
-		return nil, err
-	}
-	if err := loadPostgresForeignKeys(ctx, db, schemaName, models); err != nil {
-		return nil, err
-	}
-	if err := loadPostgresTriggers(ctx, db, schemaName, models); err != nil {
-		return nil, err
-	}
-
-	names := make([]string, 0, len(models))
-	for name := range models {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		schema.Models = append(schema.Models, models[name])
-	}
-	return schema, nil
-}
-
 func introspectDatabase(ctx context.Context, db sqlRunner, provider string, targetSchema *ir.Schema, dsn string) (*ir.Schema, error) {
 	switch provider {
 	case "postgresql":
@@ -1283,84 +1259,6 @@ func appendSortedModels(schema *ir.Schema, models map[string]*ir.Model) {
 	}
 }
 
-func loadPostgresTables(ctx context.Context, db sqlRunner, schemaName string) (map[string]*ir.Model, error) {
-	rows, err := db.QueryContext(ctx, `
-SELECT table_name
-FROM information_schema.tables
-WHERE table_schema = $1 AND table_type = 'BASE TABLE'
-ORDER BY table_name`, schemaName)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	models := make(map[string]*ir.Model)
-	for rows.Next() {
-		var tableName string
-		if err := rows.Scan(&tableName); err != nil {
-			return nil, err
-		}
-		if isInternalTable(tableName) {
-			continue
-		}
-		models[tableName] = &ir.Model{
-			Name:   tableName,
-			DBName: tableName,
-			Schema: schemaName,
-		}
-	}
-	return models, rows.Err()
-}
-
-func loadPostgresEnums(ctx context.Context, db sqlRunner, schemaName string, targetSchema *ir.Schema) ([]*ir.Enum, map[string]string, error) {
-	rows, err := db.QueryContext(ctx, `
-SELECT typ.typname, enum.enumlabel
-FROM pg_type typ
-JOIN pg_namespace ns ON ns.oid = typ.typnamespace
-JOIN pg_enum enum ON enum.enumtypid = typ.oid
-WHERE ns.nspname = $1
-ORDER BY typ.typname, enum.enumsortorder`, schemaName)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer rows.Close()
-
-	targetEnums := make(map[string]*ir.Enum)
-	if targetSchema != nil {
-		for _, enum := range targetSchema.Enums {
-			targetEnums[postgresEnumDatabaseName(enum)] = enum
-		}
-	}
-
-	byDatabaseName := make(map[string]*ir.Enum)
-	var databaseNames []string
-	for rows.Next() {
-		var databaseName, label string
-		if err := rows.Scan(&databaseName, &label); err != nil {
-			return nil, nil, err
-		}
-		enum := byDatabaseName[databaseName]
-		if enum == nil {
-			enum = postgresIntrospectedEnum(databaseName, targetEnums[databaseName])
-			byDatabaseName[databaseName] = enum
-			databaseNames = append(databaseNames, databaseName)
-		}
-		enum.Values = append(enum.Values, postgresIntrospectedEnumValue(label, targetEnums[databaseName]))
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, err
-	}
-
-	enums := make([]*ir.Enum, 0, len(databaseNames))
-	names := make(map[string]string, len(databaseNames))
-	for _, databaseName := range databaseNames {
-		enum := byDatabaseName[databaseName]
-		enums = append(enums, enum)
-		names[databaseName] = enum.Name
-	}
-	return enums, names, nil
-}
-
 func postgresEnumDatabaseName(enum *ir.Enum) string {
 	if enum == nil {
 		return ""
@@ -1393,105 +1291,6 @@ func postgresIntrospectedEnumValue(label string, target *ir.Enum) *ir.EnumValue 
 	return &ir.EnumValue{Name: label}
 }
 
-func loadPostgresColumns(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model, targetSchema *ir.Schema, enumNames map[string]string) error {
-	rows, err := db.QueryContext(ctx, `
-SELECT c.table_name, c.column_name, c.is_nullable, c.data_type, c.udt_name, c.column_default, c.is_identity,
-       format_type(a.atttypid, a.atttypmod)
-FROM information_schema.columns c
-JOIN pg_namespace n ON n.nspname = c.table_schema
-JOIN pg_class cls ON cls.relnamespace = n.oid AND cls.relname = c.table_name
-JOIN pg_attribute a ON a.attrelid = cls.oid AND a.attname = c.column_name
-WHERE c.table_schema = $1
-ORDER BY c.table_name, c.ordinal_position`, schemaName)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var tableName, columnName, isNullable, dataType, udtName, isIdentity, formattedType string
-		var columnDefault sql.NullString
-		if err := rows.Scan(&tableName, &columnName, &isNullable, &dataType, &udtName, &columnDefault, &isIdentity, &formattedType); err != nil {
-			return err
-		}
-		model := models[tableName]
-		if model == nil {
-			continue
-		}
-		field := &ir.Field{
-			Name:       columnName,
-			DBName:     columnName,
-			Type:       ir.FieldKindScalar,
-			IsOptional: isNullable == "YES",
-			Default:    postgresDefaultValue(columnDefault.String, isIdentity == "YES"),
-		}
-		targetField := findPostgresTargetField(targetSchema, tableName, columnName)
-		applyPostgresColumnType(field, dataType, udtName, formattedType, targetField, enumNames)
-		model.Fields = append(model.Fields, field)
-	}
-	return rows.Err()
-}
-
-func findPostgresTargetField(schema *ir.Schema, tableName, columnName string) *ir.Field {
-	if schema == nil {
-		return nil
-	}
-	for _, model := range schema.Models {
-		if model.TableName() == tableName {
-			return findFieldByColumn(model, columnName)
-		}
-	}
-	return nil
-}
-
-func applyPostgresColumnType(field *ir.Field, dataType, udtName, formattedType string, targetField *ir.Field, enumNames map[string]string) {
-	databaseType := strings.TrimPrefix(udtName, "_")
-	if enumName := enumNames[databaseType]; enumName != "" {
-		field.Type = ir.FieldKindEnum
-		field.EnumType = enumName
-		field.IsList = strings.EqualFold(strings.TrimSpace(dataType), "ARRAY") || strings.HasPrefix(udtName, "_")
-		return
-	}
-
-	field.ScalarType, field.IsList = postgresColumnType(dataType, udtName)
-	field.NativeType = postgresNativeType(formattedType, field.ScalarType)
-	if targetField != nil && targetField.NativeType != nil &&
-		targetField.Type == ir.FieldKindScalar && targetField.ScalarType == field.ScalarType &&
-		targetField.IsList == field.IsList && postgresNativeTypeMatches(formattedType, targetField.NativeType, targetField.IsList) {
-		clone := *targetField.NativeType
-		clone.Args = append([]string(nil), targetField.NativeType.Args...)
-		field.NativeType = &clone
-	}
-}
-
-func postgresNativeTypeMatches(formatted string, native *ir.NativeType, isList bool) bool {
-	if native == nil {
-		return false
-	}
-	expected := strings.ToLower(native.Name)
-	switch expected {
-	case "varchar":
-		expected = "character varying"
-	case "decimal":
-		expected = "numeric"
-	case "timestamptz":
-		expected = "timestamp with time zone"
-	case "timestamp":
-		expected = "timestamp without time zone"
-	case "uuid":
-		expected = "uuid"
-	}
-	actual := strings.ToLower(strings.TrimSpace(formatted))
-	actual = strings.ReplaceAll(actual, ", ", ",")
-	// format_type places type modifiers between the base name and any
-	// trailing qualifiers, e.g. "timestamp(6) without time zone".
-	actualBase, actualArgs, actualIsList := splitPostgresFormattedTypeArgs(actual)
-	if actualBase != expected || actualIsList != isList {
-		return false
-	}
-	return actualArgs == strings.Join(native.Args, ",")
-}
-
 func splitPostgresFormattedTypeArgs(formatted string) (base, args string, isList bool) {
 	s := strings.TrimSpace(formatted)
 	for strings.HasSuffix(s, "[]") {
@@ -1506,224 +1305,6 @@ func splitPostgresFormattedTypeArgs(formatted string) (base, args string, isList
 		}
 	}
 	return s, args, isList
-}
-
-func loadPostgresPrimaryKeys(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
-	rows, err := db.QueryContext(ctx, `
-SELECT tc.table_name, kcu.column_name
-FROM information_schema.table_constraints tc
-JOIN information_schema.key_column_usage kcu
-  ON tc.constraint_name = kcu.constraint_name
- AND tc.table_schema = kcu.table_schema
- AND tc.table_name = kcu.table_name
-WHERE tc.table_schema = $1
-  AND tc.constraint_type = 'PRIMARY KEY'
-ORDER BY tc.table_name, kcu.ordinal_position`, schemaName)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	grouped := map[string][]string{}
-	for rows.Next() {
-		var tableName, columnName string
-		if err := rows.Scan(&tableName, &columnName); err != nil {
-			return err
-		}
-		grouped[tableName] = append(grouped[tableName], columnName)
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	for tableName, fields := range grouped {
-		model := models[tableName]
-		if model == nil {
-			continue
-		}
-		model.PrimaryKey = &ir.PrimaryKey{
-			Fields:      fields,
-			IsComposite: len(fields) > 1,
-		}
-		if len(fields) == 1 {
-			if field := findFieldByColumn(model, fields[0]); field != nil {
-				field.IsID = true
-			}
-		}
-	}
-	return nil
-}
-
-func loadPostgresUniqueConstraints(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
-	rows, err := db.QueryContext(ctx, `
-SELECT tc.table_name, tc.constraint_name, kcu.column_name
-FROM information_schema.table_constraints tc
-JOIN information_schema.key_column_usage kcu
-  ON tc.constraint_name = kcu.constraint_name
- AND tc.table_schema = kcu.table_schema
- AND tc.table_name = kcu.table_name
-WHERE tc.table_schema = $1
-  AND tc.constraint_type = 'UNIQUE'
-ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`, schemaName)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	type uniqueKey struct {
-		table string
-		name  string
-	}
-	grouped := map[uniqueKey][]string{}
-	for rows.Next() {
-		var tableName, constraintName, columnName string
-		if err := rows.Scan(&tableName, &constraintName, &columnName); err != nil {
-			return err
-		}
-		grouped[uniqueKey{table: tableName, name: constraintName}] = append(grouped[uniqueKey{table: tableName, name: constraintName}], columnName)
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	for key, fields := range grouped {
-		model := models[key.table]
-		if model == nil {
-			continue
-		}
-		if len(fields) == 1 {
-			if field := findFieldByColumn(model, fields[0]); field != nil {
-				field.IsUnique = true
-			}
-		}
-		model.UniqueConstraints = append(model.UniqueConstraints, &ir.UniqueConstraint{
-			Name:   key.name,
-			Fields: fields,
-		})
-	}
-	return nil
-}
-
-func loadPostgresIndexes(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
-	rows, err := db.QueryContext(ctx, `
-SELECT
-  t.relname AS table_name,
-  i.relname AS index_name,
-  ix.indisunique,
-  array_agg(COALESCE(a.attname, '') ORDER BY keys.ord) AS columns,
-  array_agg(pg_get_indexdef(ix.indexrelid, keys.ord::int, false) ORDER BY keys.ord) AS column_defs,
-  array_agg((ix.indoption::int2[])[keys.ord::int - 1] ORDER BY keys.ord) AS column_options,
-  array_agg(opc.opcname ORDER BY keys.ord) AS opclasses,
-  array_agg(CASE WHEN coll.oid IS NULL THEN '' ELSE collns.nspname || '.' || coll.collname END ORDER BY keys.ord) AS collations,
-  pg_get_expr(ix.indpred, ix.indrelid) AS predicate
-FROM pg_class t
-JOIN pg_namespace ns ON ns.oid = t.relnamespace
-JOIN pg_index ix ON t.oid = ix.indrelid
-JOIN pg_class i ON i.oid = ix.indexrelid
-JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS keys(attnum, ord) ON true
-LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = keys.attnum
-JOIN LATERAL unnest(ix.indclass) WITH ORDINALITY AS classes(opcoid, ord) ON classes.ord = keys.ord
-JOIN pg_opclass opc ON opc.oid = classes.opcoid
-JOIN LATERAL unnest(ix.indcollation) WITH ORDINALITY AS index_collations(colloid, ord) ON index_collations.ord = keys.ord
-LEFT JOIN pg_collation coll ON coll.oid = index_collations.colloid
-LEFT JOIN pg_namespace collns ON collns.oid = coll.collnamespace
-LEFT JOIN pg_constraint c ON c.conindid = ix.indexrelid
-WHERE ns.nspname = $1
-  AND t.relkind = 'r'
-  AND NOT ix.indisprimary
-  AND c.oid IS NULL
-GROUP BY t.relname, i.relname, ix.indisunique, ix.indpred, ix.indrelid, ix.indexrelid
-ORDER BY t.relname, i.relname`, schemaName)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var tableName, indexName string
-		var isUnique bool
-		var columns, columnDefs, columnOptions, opclasses, collations []byte
-		var predicate sql.NullString
-		if err := rows.Scan(&tableName, &indexName, &isUnique, &columns, &columnDefs, &columnOptions, &opclasses, &collations, &predicate); err != nil {
-			return err
-		}
-		model := models[tableName]
-		if model == nil {
-			continue
-		}
-		fields := parsePostgresTextArray(string(columns))
-		model.Indexes = append(model.Indexes, &ir.Index{
-			Name:     indexName,
-			Fields:   fields,
-			Columns:  parsePostgresIndexColumns(fields, parsePostgresTextArray(string(columnDefs)), parsePostgresTextArray(string(columnOptions)), parsePostgresTextArray(string(opclasses)), parsePostgresTextArray(string(collations))),
-			Where:    strings.TrimSpace(predicate.String),
-			IsUnique: isUnique,
-		})
-	}
-	return rows.Err()
-}
-
-func loadPostgresForeignKeys(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
-	rows, err := db.QueryContext(ctx, `
-SELECT src.relname,
-       con.conname,
-       src_col.attname,
-       dst.relname,
-       dst_col.attname,
-       CASE con.confdeltype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END,
-       CASE con.confupdtype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END
-FROM pg_constraint con
-JOIN pg_class src ON src.oid = con.conrelid
-JOIN pg_namespace ns ON ns.oid = src.relnamespace
-JOIN pg_class dst ON dst.oid = con.confrelid
-JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS keys(src_attnum, dst_attnum, ord) ON true
-JOIN pg_attribute src_col ON src_col.attrelid = src.oid AND src_col.attnum = keys.src_attnum
-JOIN pg_attribute dst_col ON dst_col.attrelid = dst.oid AND dst_col.attnum = keys.dst_attnum
-WHERE con.contype = 'f' AND ns.nspname = $1
-ORDER BY src.relname, con.conname, keys.ord`, schemaName)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	type fkKey struct {
-		table string
-		name  string
-	}
-	grouped := map[fkKey]*ir.Relation{}
-	for rows.Next() {
-		var tableName, constraintName, columnName, foreignTable, foreignColumn, onDelete, onUpdate string
-		if err := rows.Scan(&tableName, &constraintName, &columnName, &foreignTable, &foreignColumn, &onDelete, &onUpdate); err != nil {
-			return err
-		}
-		key := fkKey{table: tableName, name: constraintName}
-		rel := grouped[key]
-		if rel == nil {
-			rel = &ir.Relation{
-				Name:           constraintName,
-				ConstraintName: constraintName,
-				FromModel:      tableName,
-				ToModel:        foreignTable,
-				OnDelete:       onDelete,
-				OnUpdate:       onUpdate,
-			}
-			grouped[key] = rel
-		}
-		rel.Fields = append(rel.Fields, columnName)
-		rel.References = append(rel.References, foreignColumn)
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	for key, rel := range grouped {
-		model := models[key.table]
-		if model == nil {
-			continue
-		}
-		model.Relations = append(model.Relations, rel)
-	}
-	return nil
 }
 
 func loadMySQLTables(ctx context.Context, db sqlRunner) (map[string]*ir.Model, error) {
@@ -2357,35 +1938,6 @@ func postgresColumnType(dataType, udtName string) (string, bool) {
 	return postgresScalarType(dataType, udtName), false
 }
 
-func postgresNativeType(formatted, scalar string) *ir.NativeType {
-	lower := strings.ToLower(strings.TrimSpace(formatted))
-	name := ""
-	args := []string{}
-	switch {
-	case strings.HasPrefix(lower, "character varying("):
-		name = "VarChar"
-	case strings.HasPrefix(lower, "numeric("):
-		name = "Decimal"
-	case strings.HasPrefix(lower, "timestamp(") && strings.Contains(lower, "without time zone"):
-		name = "Timestamp"
-	case strings.HasPrefix(lower, "timestamp(") && strings.Contains(lower, "with time zone"):
-		name = "Timestamptz"
-	case lower == "text" && scalar == "String":
-		return nil
-	default:
-		return nil
-	}
-	if start := strings.Index(lower, "("); start >= 0 {
-		if end := strings.LastIndex(lower, ")"); end > start {
-			args = strings.Split(lower[start+1:end], ",")
-			for i := range args {
-				args[i] = strings.TrimSpace(args[i])
-			}
-		}
-	}
-	return &ir.NativeType{Name: name, Args: args}
-}
-
 func postgresScalarType(dataType, udtName string) string {
 	upperType := strings.ToUpper(strings.TrimSpace(dataType))
 	upperUDT := strings.ToUpper(strings.TrimSpace(udtName))
@@ -2404,7 +1956,7 @@ func postgresScalarType(dataType, udtName string) string {
 		return "Decimal"
 	case strings.Contains(upperType, "BOOLEAN"), upperUDT == "BOOL":
 		return "Boolean"
-	case strings.Contains(upperType, "TIMESTAMP"), strings.Contains(upperType, "DATE"), strings.Contains(upperType, "TIME"), upperUDT == "TIMESTAMP", upperUDT == "TIMESTAMPTZ", upperUDT == "DATE", upperUDT == "TIME":
+	case strings.Contains(upperType, "TIMESTAMP"), strings.Contains(upperType, "DATE"), strings.Contains(upperType, "TIME"), upperUDT == "TIMESTAMP", upperUDT == "TIMESTAMPTZ", upperUDT == "DATE", upperUDT == "TIME", upperUDT == "TIMETZ":
 		return "DateTime"
 	case strings.Contains(upperType, "BYTEA"), upperUDT == "BYTEA":
 		return "Bytes"

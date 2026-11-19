@@ -140,10 +140,46 @@ through your deployment system.
 
 ## Introspect Did Not Generate A Full Schema
 
-The current `gco introspect` command detects provider information and prints
-guidance, but full live database introspection is not implemented there.
+`gco introspect` reads the live catalog through the same introspection used by
+`gco db push`. Review the generated file for:
 
-`gco db push` still performs internal introspection for schema comparison.
+- `// ... is a read-only generated column` comments: the column is computed by
+  the database. Its `@default(dbgenerated("expr"))` documents the expression;
+  never write the field from application code. `db push` leaves generated
+  columns alone, but the schema language cannot declare them, so
+  `migrate init-sql`/`migrate diff` would create a plain `DEFAULT` instead
+  (PostgreSQL rejects defaults that reference other columns). Create such
+  columns with custom SQL in migrations.
+- `// WARNING: ... nullable array column`: schema lists are always `NOT NULL`,
+  so `db push` would add `NOT NULL` to that column. Backfill `NULL` rows first
+  or keep the column out of pushes.
+- `schema = "..."` in the datasource: the tables were read from that
+  non-`public` PostgreSQL schema, so later pushes keep targeting it.
+- `// WARNING:` comments for partial unique indexes and unique-index options
+  that the schema language cannot express. Recreate those with custom SQL.
+- Enum values or names with `@map`/`@@map`: the database label was not a valid
+  schema identifier and was renamed in the schema only.
+
+## Native Type Or @@schema Rejected
+
+Validation rejects `@db.*` annotations that the provider's DDL cannot create
+(for example `@db.TinyInt` or `@db.Blob` on PostgreSQL) or that do not match
+the field type (for example `@db.Uuid` on an `Int`). See the native type table
+in the [Schema Guide](Schema-Guide.md#native-types).
+
+`@@schema("name")` is PostgreSQL-only. If the datasource sets `schemas`, add the
+name to that list.
+
+## Classifying Database Errors
+
+`dialect.PostgreSQL{}.ClassifyError` uses the driver's SQLSTATE (pgx
+`*pgconn.PgError`, lib/pq `*pq.Error`, or a `(SQLSTATE XXXXX)` suffix) and puts
+`sqlstate`, `constraint`, `table` and `column` in `DBError.Meta` when known.
+Mapped codes: `23505` unique, `23503` foreign key, `23502` not null, `23514`
+check, `23P01` exclusion, `22001` truncation, `22003` numeric out of range,
+`22P02` invalid text representation, `40001` serialization, `40P01` deadlock,
+`57014` query canceled, `08xxx` and `53300` connection. Message text is only
+inspected when no code is available, and never inside quoted identifiers.
 
 ## Generated Code Is Stale
 

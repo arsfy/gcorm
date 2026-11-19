@@ -105,6 +105,9 @@ On every run, `dbpush.Push`:
 5. Refuses destructive or review-required changes unless
    `AllowDestructive` is true.
 6. Executes supported SQL. PostgreSQL and SQLite use a transaction.
+   PostgreSQL commits new enum values in a separate locked transaction first,
+   then plans and applies the rest; `Result.AppliedStatements` lists both
+   parts.
 7. Records a row in `__gco_schema_pushes`.
 
 For MySQL, DDL statements are not atomic. MySQL implicitly commits most DDL, so

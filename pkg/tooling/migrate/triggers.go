@@ -9,15 +9,17 @@ import (
 	"github.com/arsfy/gcorm/pkg/tooling/internal/triggerddl"
 )
 
-func (g DDLGenerator) createTriggerSteps(table string, trigger *ir.Trigger) []DDLStep {
+// createTriggerSteps creates a managed trigger. On PostgreSQL its function
+// lives in the table's schema.
+func (g DDLGenerator) createTriggerSteps(schemaName, table string, trigger *ir.Trigger) []DDLStep {
 	if trigger == nil {
 		return nil
 	}
 	header := fmt.Sprintf("CREATE TRIGGER %s %s %s ON %s FOR EACH ROW",
-		g.quoteID(trigger.Name), trigger.Timing, trigger.Event, g.quoteID(table))
+		g.quoteID(trigger.Name), trigger.Timing, trigger.Event, g.tableRef(schemaName, table))
 	switch g.Dialect {
 	case "postgresql":
-		name := g.quoteID(triggerddl.PostgresFunctionName(table, trigger.Name)) + "()"
+		name := g.qualifiedName(schemaName, triggerddl.PostgresFunctionName(table, trigger.Name)) + "()"
 		tag := "$gco$"
 		for n := 1; strings.Contains(trigger.Body, tag); n++ {
 			tag = "$gco" + strconv.Itoa(n) + "$"
@@ -36,11 +38,11 @@ func (g DDLGenerator) createTriggerSteps(table string, trigger *ir.Trigger) []DD
 	return nil
 }
 
-func (g DDLGenerator) dropTriggerSQL(table, name string) string {
+func (g DDLGenerator) dropTriggerSQL(schemaName, table, name string) string {
 	sql := "DROP TRIGGER IF EXISTS " + g.quoteID(name)
 	switch g.Dialect {
 	case "postgresql":
-		sql += " ON " + g.quoteID(table) + ";\nDROP FUNCTION IF EXISTS " + g.quoteID(triggerddl.PostgresFunctionName(table, name)) + "()"
+		sql += " ON " + g.tableRef(schemaName, table) + ";\nDROP FUNCTION IF EXISTS " + g.qualifiedName(schemaName, triggerddl.PostgresFunctionName(table, name)) + "()"
 	case "sqlite":
 		sql = "DROP TRIGGER IF EXISTS main." + g.quoteID(name)
 	}
@@ -78,7 +80,7 @@ func (g DDLGenerator) sqliteRebuildTriggers(cs *Changeset, tables map[string]boo
 		}
 		for _, trigger := range model.Triggers {
 			if !dropping[trigger.Name] {
-				restore = append(restore, g.createTriggerSteps(model.TableName(), trigger)...)
+				restore = append(restore, g.createTriggerSteps("", model.TableName(), trigger)...)
 			}
 		}
 	}

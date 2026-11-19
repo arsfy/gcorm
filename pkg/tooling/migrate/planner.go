@@ -5,6 +5,7 @@ package migrate
 import (
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -15,27 +16,33 @@ import (
 type ChangeType string
 
 const (
-	CreateTable  ChangeType = "CreateTable"
-	DropTable    ChangeType = "DropTable"
-	RenameTable  ChangeType = "RenameTable"
-	AddColumn    ChangeType = "AddColumn"
-	DropColumn   ChangeType = "DropColumn"
-	RenameColumn ChangeType = "RenameColumn"
-	AlterType    ChangeType = "AlterType"
-	AlterNull    ChangeType = "AlterNullability"
-	AlterDefault ChangeType = "AlterDefault"
-	AddIndex     ChangeType = "AddIndex"
-	DropIndex    ChangeType = "DropIndex"
-	AddUnique    ChangeType = "AddUnique"
-	DropUnique   ChangeType = "DropUnique"
-	ChangePK     ChangeType = "ChangePrimaryKey"
-	AddFK        ChangeType = "AddForeignKey"
-	DropFK       ChangeType = "DropForeignKey"
-	CreateEnum   ChangeType = "CreateEnum"
-	AlterEnum    ChangeType = "AlterEnum"
-	DropEnum     ChangeType = "DropEnum"
-	AddTrigger   ChangeType = "AddTrigger"
-	DropTrigger  ChangeType = "DropTrigger"
+	CreateTable ChangeType = "CreateTable"
+	DropTable   ChangeType = "DropTable"
+	RenameTable ChangeType = "RenameTable"
+	// SetTableSchema moves an existing table to another PostgreSQL schema.
+	// OldValue and NewValue hold the source and target schema names.
+	SetTableSchema ChangeType = "SetTableSchema"
+	AddColumn      ChangeType = "AddColumn"
+	DropColumn     ChangeType = "DropColumn"
+	RenameColumn   ChangeType = "RenameColumn"
+	AlterType      ChangeType = "AlterType"
+	AlterNull      ChangeType = "AlterNullability"
+	AlterDefault   ChangeType = "AlterDefault"
+	AddIndex       ChangeType = "AddIndex"
+	DropIndex      ChangeType = "DropIndex"
+	AddUnique      ChangeType = "AddUnique"
+	DropUnique     ChangeType = "DropUnique"
+	ChangePK       ChangeType = "ChangePrimaryKey"
+	AddFK          ChangeType = "AddForeignKey"
+	DropFK         ChangeType = "DropForeignKey"
+	CreateEnum     ChangeType = "CreateEnum"
+	AlterEnum      ChangeType = "AlterEnum"
+	DropEnum       ChangeType = "DropEnum"
+	// RenameEnum renames an enum's database type after an @@map change.
+	// OldValue and NewValue hold the previous and new type names.
+	RenameEnum  ChangeType = "RenameEnum"
+	AddTrigger  ChangeType = "AddTrigger"
+	DropTrigger ChangeType = "DropTrigger"
 )
 
 // RollbackSafety indicates how safe it is to reverse a change.
@@ -51,6 +58,7 @@ const (
 type Change struct {
 	Type     ChangeType
 	Model    string            // Table/model name.
+	Schema   string            // PostgreSQL schema of the table (@@schema); empty uses search_path.
 	Field    string            // Column name (if applicable).
 	OldValue string            // Previous value (for renames, type changes).
 	NewValue string            // New value.
@@ -93,6 +101,11 @@ func Diff(old, new *ir.Schema) *Changeset {
 
 	oldModels := indexModels(old.Models)
 	newModels := indexModels(new.Models)
+	moves := matchSchemaMoves(oldModels, newModels)
+	movedFrom := make(map[string]bool, len(moves))
+	for _, oldKey := range moves {
+		movedFrom[oldKey] = true
+	}
 	allNames := mergedSortedKeys(oldModels, newModels)
 	var createdTables []string
 
@@ -102,14 +115,23 @@ func Diff(old, new *ir.Schema) *Changeset {
 
 		switch {
 		case inNew && !inOld:
-			cs.add(Change{Type: CreateTable, Model: name})
+			if oldKey, moved := moves[name]; moved {
+				oldM = oldModels[oldKey]
+				cs.add(Change{Type: SetTableSchema, Model: newM.TableName(), Schema: newM.Schema, OldValue: oldM.Schema, NewValue: newM.Schema})
+				compareModels(cs, old, new, oldM, newM)
+				break
+			}
+			cs.add(Change{Type: CreateTable, Model: newM.TableName(), Schema: newM.Schema})
 			createdTables = append(createdTables, name)
 		case inOld && !inNew:
-			cs.add(Change{Type: DropTable, Model: name})
+			if movedFrom[name] {
+				continue
+			}
+			cs.add(Change{Type: DropTable, Model: oldM.TableName(), Schema: oldM.Schema})
 		default:
 			compareModels(cs, old, new, oldM, newM)
 		}
-		compareTriggers(cs, name, oldM, newM)
+		compareTriggers(cs, oldM, newM)
 	}
 
 	addForeignKeysForCreatedTables(cs, newModels, createdTables)
@@ -118,7 +140,35 @@ func Diff(old, new *ir.Schema) *Changeset {
 	return cs
 }
 
-func compareTriggers(cs *Changeset, table string, oldModel, newModel *ir.Model) {
+// matchSchemaMoves pairs a target-only model with a source-only model that
+// has the same table name in a different schema. Each table name must be
+// unambiguous on both sides. The result maps target keys to source keys.
+func matchSchemaMoves(oldModels, newModels map[string]*ir.Model) map[string]string {
+	onlyByTable := func(models, other map[string]*ir.Model) map[string][]string {
+		out := make(map[string][]string)
+		for key, model := range models {
+			if _, ok := other[key]; !ok {
+				out[model.TableName()] = append(out[model.TableName()], key)
+			}
+		}
+		return out
+	}
+	oldOnly := onlyByTable(oldModels, newModels)
+	newOnly := onlyByTable(newModels, oldModels)
+	moves := make(map[string]string)
+	for table, newKeys := range newOnly {
+		oldKeys := oldOnly[table]
+		if len(newKeys) == 1 && len(oldKeys) == 1 {
+			moves[newKeys[0]] = oldKeys[0]
+		}
+	}
+	return moves
+}
+
+// compareTriggers diffs managed triggers. Drops use the source table location
+// and additions the target location, because triggers are dropped before and
+// created after any SetTableSchema change.
+func compareTriggers(cs *Changeset, oldModel, newModel *ir.Model) {
 	oldTriggers := indexTriggers(oldModel)
 	newTriggers := indexTriggers(newModel)
 	for _, name := range mergedSortedKeys(oldTriggers, newTriggers) {
@@ -127,10 +177,10 @@ func compareTriggers(cs *Changeset, table string, oldModel, newModel *ir.Model) 
 			continue
 		}
 		if old != nil {
-			cs.add(Change{Type: DropTrigger, Model: table, Field: name, Trigger: old})
+			cs.add(Change{Type: DropTrigger, Model: oldModel.TableName(), Schema: oldModel.Schema, Field: name, Trigger: old})
 		}
 		if new != nil {
-			cs.add(Change{Type: AddTrigger, Model: table, Field: name, Trigger: new})
+			cs.add(Change{Type: AddTrigger, Model: newModel.TableName(), Schema: newModel.Schema, Field: name, Trigger: new})
 		}
 	}
 }
@@ -163,19 +213,90 @@ func compareEnums(cs *Changeset, old, new *ir.Schema) {
 		case okOld && !okNew:
 			cs.add(Change{Type: DropEnum, Model: name})
 		default:
+			if oldName, newName := enumTypeName(oe), enumTypeName(ne); oldName != newName {
+				cs.add(Change{Type: RenameEnum, Model: name, OldValue: oldName, NewValue: newName})
+			}
 			if enumSignature(oe) != enumSignature(ne) {
-				cs.add(Change{Type: AlterEnum, Model: name, OldValue: enumSignature(oe), NewValue: enumSignature(ne)})
+				rollback := ReviewRequired
+				if len(removedEnumLabels(oe, ne)) > 0 {
+					rollback = DestructiveRollback
+				}
+				cs.add(Change{Type: AlterEnum, Model: name, OldValue: enumSignature(oe), NewValue: enumSignature(ne), Rollback: rollback})
 			}
 		}
 	}
 }
+
+// enumTypeName returns the database type name of an enum (@@map or name).
+func enumTypeName(e *ir.Enum) string {
+	if e.DBName != "" {
+		return e.DBName
+	}
+	return e.Name
+}
+
+// enumValueLabel returns the database label of an enum value (@map or name).
+func enumValueLabel(v *ir.EnumValue) string {
+	if v.DBName != "" {
+		return v.DBName
+	}
+	return v.Name
+}
+
+// enumLabelRenames returns old->new database labels for values whose @map
+// changed, in target declaration order.
+func enumLabelRenames(old, new *ir.Enum) [][2]string {
+	oldByName := make(map[string]*ir.EnumValue, len(old.Values))
+	for _, v := range old.Values {
+		oldByName[v.Name] = v
+	}
+	var renames [][2]string
+	for _, v := range new.Values {
+		if ov := oldByName[v.Name]; ov != nil && enumValueLabel(ov) != enumValueLabel(v) {
+			renames = append(renames, [2]string{enumValueLabel(ov), enumValueLabel(v)})
+		}
+	}
+	return renames
+}
+
+// enumLabelsAfterRenames returns the source labels with value renames applied.
+func enumLabelsAfterRenames(old, new *ir.Enum) []string {
+	renamed := make(map[string]string)
+	for _, rename := range enumLabelRenames(old, new) {
+		renamed[rename[0]] = rename[1]
+	}
+	labels := make([]string, len(old.Values))
+	for i, v := range old.Values {
+		labels[i] = coalesce(renamed[enumValueLabel(v)], enumValueLabel(v))
+	}
+	return labels
+}
+
+// removedEnumLabels returns the labels a source enum loses in the target.
+func removedEnumLabels(old, new *ir.Enum) []string {
+	target := make(map[string]bool, len(new.Values))
+	for _, v := range new.Values {
+		target[enumValueLabel(v)] = true
+	}
+	var removed []string
+	for _, label := range enumLabelsAfterRenames(old, new) {
+		if !target[label] {
+			removed = append(removed, label)
+		}
+	}
+	return removed
+}
+
+// enumSignature lists an enum's database labels in declaration order.
+// Renaming a value while keeping its @map label changes nothing in the
+// database.
 func enumSignature(e *ir.Enum) string {
 	if e == nil {
 		return ""
 	}
 	values := make([]string, len(e.Values))
 	for i, v := range e.Values {
-		values[i] = v.Name + "=" + v.DBName
+		values[i] = strconv.Quote(enumValueLabel(v))
 	}
 	return strings.Join(values, ",")
 }
@@ -192,12 +313,16 @@ func (cs *Changeset) add(c Change) {
 // ---------------------------------------------------------------------------
 
 func compareModels(cs *Changeset, oldSchema, newSchema *ir.Schema, oldM, newM *ir.Model) {
+	start := len(cs.Changes)
 	tableName := newM.TableName()
 	compareFields(cs, tableName, oldM.ScalarFields(), newM.ScalarFields())
 	compareIndexes(cs, tableName, oldSchema, newSchema, oldM, newM)
 	compareUniques(cs, tableName, oldM, newM)
 	comparePrimaryKey(cs, tableName, oldM, newM)
 	compareForeignKeys(cs, tableName, oldSchema, newSchema, oldM, newM)
+	for i := start; i < len(cs.Changes); i++ {
+		cs.Changes[i].Schema = newM.Schema
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -224,10 +349,13 @@ func compareFields(cs *Changeset, model string, oldFields, newFields []*ir.Field
 	}
 }
 
+// compareField diffs a column. A generated column is read-only: its type
+// and expression are never altered, only its nullability.
 func compareField(cs *Changeset, model string, of, nf *ir.Field) {
+	generated := of.IsGenerated || nf.IsGenerated
 	oldType := fieldTypeSignature(of)
 	newType := fieldTypeSignature(nf)
-	if oldType != newType {
+	if oldType != newType && !generated {
 		cs.add(Change{
 			Type: AlterType, Model: model, Field: columnName(nf),
 			OldValue: oldType, NewValue: newType, OldField: of, NewField: nf,
@@ -241,8 +369,11 @@ func compareField(cs *Changeset, model string, of, nf *ir.Field) {
 		})
 	}
 
-	od := formatDefault(of.Default)
-	nd := formatDefault(nf.Default)
+	if generated {
+		return
+	}
+	od := databaseDefaultSignature(of.Default)
+	nd := databaseDefaultSignature(nf.Default)
 	if od != nd {
 		cs.add(Change{
 			Type: AlterDefault, Model: model, Field: columnName(nf),
@@ -274,6 +405,19 @@ func formatDefault(d *ir.DefaultValue) string {
 	return d.Value
 }
 
+// databaseDefaultSignature is the default as the database stores it. cuid()
+// values are generated by the client, so the column has no default.
+func databaseDefaultSignature(d *ir.DefaultValue) string {
+	if isCUIDDefault(d) {
+		return ""
+	}
+	return formatDefault(d)
+}
+
+func isCUIDDefault(d *ir.DefaultValue) bool {
+	return d != nil && d.IsFunction && d.FuncName == "cuid"
+}
+
 func fieldTypeSignature(f *ir.Field) string {
 	if f == nil {
 		return ""
@@ -299,8 +443,9 @@ func fieldTypeSignature(f *ir.Field) string {
 // ---------------------------------------------------------------------------
 
 func compareIndexes(cs *Changeset, model string, oldSchema, newSchema *ir.Schema, oldM, newM *ir.Model) {
-	oldMap := mapIndexes(oldM, oldM.Indexes)
-	newMap := mapIndexes(newM, newM.Indexes)
+	provider := schemaProvider(newSchema, oldSchema)
+	oldMap := mapIndexes(provider, oldM, oldM.Indexes)
+	newMap := mapIndexes(provider, newM, newM.Indexes)
 	allKeys := mergedSortedKeys(oldMap, newMap)
 
 	for _, k := range allKeys {
@@ -1013,38 +1158,43 @@ func effectiveIndexColumns(idx *ir.Index) []ir.IndexColumn {
 	return cols
 }
 
-func mapIndexes(model *ir.Model, idxs []*ir.Index) map[string]*ir.Index {
+func mapIndexes(provider string, model *ir.Model, idxs []*ir.Index) map[string]*ir.Index {
 	m := make(map[string]*ir.Index, len(idxs))
 	for _, idx := range idxs {
-		m[idxKey(model, idx)] = normalizedIndex(model, idx)
+		m[idxKey(provider, model, idx)] = normalizedIndex(provider, model, idx)
 	}
 	return m
 }
 
-func idxKey(model *ir.Model, idx *ir.Index) string {
-	return effectiveIndexName(model, idx)
+func idxKey(provider string, model *ir.Model, idx *ir.Index) string {
+	return effectiveIndexName(provider, model, idx)
 }
 
-func effectiveIndexName(model *ir.Model, idx *ir.Index) string {
+// schemaProvider returns the datasource provider of the first schema that
+// declares one.
+func schemaProvider(schemas ...*ir.Schema) string {
+	for _, schema := range schemas {
+		if schema != nil && schema.Datasource != nil && schema.Datasource.Provider != "" {
+			return schema.Datasource.Provider
+		}
+	}
+	return ""
+}
+
+// effectiveIndexName returns the explicit index name or the generated
+// default name for provider (see DefaultIndexNameFor).
+func effectiveIndexName(provider string, model *ir.Model, idx *ir.Index) string {
 	if idx == nil {
 		return ""
 	}
 	if idx.Name != "" {
 		return idx.Name
 	}
-	name := defaultIndexName(model, normalizeFieldNames(model, idx.Fields))
-	if idx.IsUnique {
-		return "uq_" + strings.TrimPrefix(name, "idx_")
-	}
-	return name
-}
-
-func defaultIndexName(model *ir.Model, fields []string) string {
 	tableName := ""
 	if model != nil {
 		tableName = model.TableName()
 	}
-	return "idx_" + tableName + "_" + strings.Join(fields, "_")
+	return DefaultIndexNameFor(provider, tableName, normalizeFieldNames(model, idx.Fields), idx.IsUnique)
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,6 +1285,14 @@ func pkString(model *ir.Model, pk *ir.PrimaryKey) string {
 // Foreign keys (derived from relations with fields/references)
 // ---------------------------------------------------------------------------
 
+// foreignKey is a relation normalized to database names: Fields and
+// References hold column names and ToModel the target table, which lives in
+// ToSchema.
+type foreignKey struct {
+	*ir.Relation
+	ToSchema string
+}
+
 func compareForeignKeys(cs *Changeset, model string, oldSchema, newSchema *ir.Schema, oldM, newM *ir.Model) {
 	oldMap := mapFKRelations(oldSchema, oldM, oldM.Relations)
 	newMap := mapFKRelations(newSchema, newM, newM.Relations)
@@ -1166,11 +1324,12 @@ func compareForeignKeys(cs *Changeset, model string, oldSchema, newSchema *ir.Sc
 }
 
 func addForeignKeysForCreatedTables(cs *Changeset, newModels map[string]*ir.Model, createdTables []string) {
-	for _, tableName := range createdTables {
-		model := newModels[tableName]
+	for _, key := range createdTables {
+		model := newModels[key]
 		if model == nil {
 			continue
 		}
+		tableName := model.TableName()
 		relations := mapFKRelations(cs.New, model, model.Relations)
 		keys := make([]string, 0, len(relations))
 		for key := range relations {
@@ -1180,47 +1339,53 @@ func addForeignKeysForCreatedTables(cs *Changeset, newModels map[string]*ir.Mode
 		for _, key := range keys {
 			rel := relations[key]
 			cs.add(Change{
-				Type: AddFK, Model: tableName, NewValue: rel.ToModel,
+				Type: AddFK, Model: tableName, Schema: model.Schema, NewValue: rel.ToModel,
 				Details: fkDetails(rel),
 			})
 		}
 	}
 }
 
-func mapFKRelations(schema *ir.Schema, model *ir.Model, rels []*ir.Relation) map[string]*ir.Relation {
-	m := make(map[string]*ir.Relation)
+func mapFKRelations(schema *ir.Schema, model *ir.Model, rels []*ir.Relation) map[string]foreignKey {
+	m := make(map[string]foreignKey)
 	for _, r := range rels {
 		if len(r.Fields) > 0 && len(r.References) > 0 {
-			normalized := normalizedRelation(schema, model, r)
-			m[fkKey(normalized)] = normalized
+			fk := foreignKey{Relation: normalizedRelation(schema, model, r)}
+			if target := findModel(schema, r.ToModel); target != nil {
+				fk.ToSchema = target.Schema
+			}
+			m[fkKey(fk)] = fk
 		}
 	}
 	return m
 }
 
-func mapFKRelationsByIdentity(rels map[string]*ir.Relation) map[string]*ir.Relation {
-	m := make(map[string]*ir.Relation, len(rels))
+func mapFKRelationsByIdentity(rels map[string]foreignKey) map[string]foreignKey {
+	m := make(map[string]foreignKey, len(rels))
 	for _, rel := range rels {
 		m[fkIdentityKey(rel)] = rel
 	}
 	return m
 }
 
-func fkIdentityKey(r *ir.Relation) string {
-	return strings.Join(r.Fields, ",") + "->" + r.ToModel + "(" + strings.Join(r.References, ",") + ")"
+func fkIdentityKey(r foreignKey) string {
+	return strings.Join(r.Fields, ",") + "->" + tableKey(r.ToSchema, r.ToModel) + "(" + strings.Join(r.References, ",") + ")"
 }
 
-func fkKey(r *ir.Relation) string {
+func fkKey(r foreignKey) string {
 	return fkIdentityKey(r) +
 		"|delete=" + effectiveReferentialAction(r.OnDelete) +
 		"|update=" + effectiveReferentialAction(r.OnUpdate)
 }
 
-func fkDetails(r *ir.Relation) map[string]string {
+func fkDetails(r foreignKey) map[string]string {
 	details := map[string]string{
 		"fields":     strings.Join(r.Fields, ","),
 		"references": strings.Join(r.References, ","),
 		"toModel":    r.ToModel,
+	}
+	if r.ToSchema != "" {
+		details["toSchema"] = r.ToSchema
 	}
 	if r.ConstraintName != "" {
 		details["name"] = r.ConstraintName
@@ -1238,12 +1403,66 @@ func fkDetails(r *ir.Relation) map[string]string {
 // Generic helpers
 // ---------------------------------------------------------------------------
 
+// indexModels keys models by table identity: schema and table name.
 func indexModels(models []*ir.Model) map[string]*ir.Model {
 	m := make(map[string]*ir.Model, len(models))
 	for _, model := range models {
-		m[model.TableName()] = model
+		m[modelKey(model)] = model
 	}
 	return m
+}
+
+// tableKey identifies a table by schema and name. Tables without a schema
+// are keyed by their bare name.
+func tableKey(schemaName, table string) string {
+	if schemaName == "" {
+		return table
+	}
+	return schemaName + "\x00" + table
+}
+
+func modelKey(m *ir.Model) string {
+	return tableKey(m.Schema, m.TableName())
+}
+
+// findTableModel looks up the model for a table in the given schema. When no
+// model matches exactly, a single model with that table name in another
+// schema is returned, which resolves tables moved by SetTableSchema.
+func findTableModel(schema *ir.Schema, schemaName, table string) *ir.Model {
+	if schema == nil {
+		return nil
+	}
+	var byTable []*ir.Model
+	for _, m := range schema.Models {
+		if m.TableName() != table && m.Name != table {
+			continue
+		}
+		if m.Schema == schemaName {
+			return m
+		}
+		byTable = append(byTable, m)
+	}
+	if len(byTable) == 1 {
+		return byTable[0]
+	}
+	return nil
+}
+
+// findTableField looks up a field by column or field name in a table.
+func findTableField(schema *ir.Schema, schemaName, table, fieldName string) *ir.Field {
+	return fieldByName(findTableModel(schema, schemaName, table), fieldName)
+}
+
+func fieldByName(m *ir.Model, fieldName string) *ir.Field {
+	if m == nil {
+		return nil
+	}
+	for _, f := range m.Fields {
+		if f.Name == fieldName || columnName(f) == fieldName {
+			return f
+		}
+	}
+	return nil
 }
 
 func indexFields(fields []*ir.Field) map[string]*ir.Field {
@@ -1286,13 +1505,19 @@ func coalesce(values ...string) string {
 	return ""
 }
 
-// findModel looks up a model by name in a schema.
+// findModel looks up a model by name in a schema, falling back to a table
+// name. A model name wins over another model's table name.
 func findModel(schema *ir.Schema, name string) *ir.Model {
 	if schema == nil {
 		return nil
 	}
 	for _, m := range schema.Models {
-		if m.Name == name || m.TableName() == name {
+		if m.Name == name {
+			return m
+		}
+	}
+	for _, m := range schema.Models {
+		if m.TableName() == name {
 			return m
 		}
 	}
@@ -1301,16 +1526,13 @@ func findModel(schema *ir.Schema, name string) *ir.Model {
 
 // findField looks up a scalar field by model and field name.
 func findField(schema *ir.Schema, modelName, fieldName string) *ir.Field {
-	m := findModel(schema, modelName)
-	if m == nil {
-		return nil
-	}
-	for _, f := range m.Fields {
-		if f.Name == fieldName || columnName(f) == fieldName {
-			return f
-		}
-	}
-	return nil
+	return fieldByName(findModel(schema, modelName), fieldName)
+}
+
+// ColumnName returns the database column name of a field: its @map name or
+// its name in snake_case.
+func ColumnName(f *ir.Field) string {
+	return columnName(f)
 }
 
 // columnName returns the database column name for a field.
@@ -1361,14 +1583,14 @@ func resolveColumnName(model *ir.Model, name string) string {
 	return name
 }
 
-func normalizedIndex(model *ir.Model, idx *ir.Index) *ir.Index {
+func normalizedIndex(provider string, model *ir.Model, idx *ir.Index) *ir.Index {
 	if idx == nil {
 		return nil
 	}
 	clone := *idx
 	clone.Fields = normalizeFieldNames(model, idx.Fields)
 	clone.Columns = normalizeIndexColumns(model, idx)
-	clone.Name = effectiveIndexName(model, &clone)
+	clone.Name = effectiveIndexName(provider, model, &clone)
 	return &clone
 }
 
