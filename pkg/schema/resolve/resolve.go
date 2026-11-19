@@ -170,6 +170,21 @@ func (r *resolver) resolveModel(m *ast.ModelDecl) *ir.Model {
 			model.PrimaryKey = r.resolveCompositePK(attr)
 		case "index":
 			model.Indexes = append(model.Indexes, r.resolveIndex(attr, false))
+		case "trigger":
+			trigger := &ir.Trigger{}
+			for _, arg := range attr.Args {
+				switch arg.Name {
+				case "name":
+					trigger.Name = exprToString(arg.Value)
+				case "timing":
+					trigger.Timing = strings.ToUpper(exprToString(arg.Value))
+				case "event":
+					trigger.Event = strings.ToUpper(exprToString(arg.Value))
+				case "body":
+					trigger.Body = strings.TrimSpace(exprToString(arg.Value))
+				}
+			}
+			model.Triggers = append(model.Triggers, trigger)
 		case "unique":
 			idx := r.resolveIndex(attr, true)
 			if indexHasExpression(idx) {

@@ -16,18 +16,21 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 
+	"github.com/arsfy/gcorm/pkg/schema/ast"
 	"github.com/arsfy/gcorm/pkg/schema/compiler"
+	"github.com/arsfy/gcorm/pkg/schema/formatter"
 	"github.com/arsfy/gcorm/pkg/schema/ir"
 	"github.com/arsfy/gcorm/pkg/tooling/dbpush"
 )
 
 // TableInfo represents a database table discovered during introspection.
 type TableInfo struct {
-	Name    string
-	Schema  string // database schema/namespace
-	Columns []ColumnInfo
-	Indexes []IndexInfo
-	FKs     []ForeignKeyInfo
+	Name     string
+	Schema   string // database schema/namespace
+	Columns  []ColumnInfo
+	Indexes  []IndexInfo
+	FKs      []ForeignKeyInfo
+	Triggers []*ir.Trigger
 }
 
 // ColumnInfo describes a single database column.
@@ -137,7 +140,7 @@ func tablesFromIR(schema *ir.Schema) []TableInfo {
 	}
 	out := make([]TableInfo, 0, len(schema.Models))
 	for _, model := range schema.Models {
-		t := TableInfo{Name: model.TableName(), Schema: model.Schema}
+		t := TableInfo{Name: model.TableName(), Schema: model.Schema, Triggers: model.Triggers}
 		pk := map[string]bool{}
 		if model.PrimaryKey != nil {
 			for _, f := range model.PrimaryKey.Fields {
@@ -306,6 +309,11 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 				args = append(args, formatIndexExpressions(idx.Expressions))
 			}
 			fmt.Fprintf(&b, "\n  @@%s(%s)\n", kind, strings.Join(args, ", "))
+		}
+		for _, trigger := range t.Triggers {
+			fmt.Fprintf(&b, "\n  @@trigger(name: %s, timing: %s, event: %s, body: %s)\n",
+				formatter.FormatExpression(ast.StringLiteral{Value: trigger.Name}), trigger.Timing, trigger.Event,
+				formatter.FormatExpression(ast.StringLiteral{Value: trigger.Body}))
 		}
 
 		if modelName != t.Name {

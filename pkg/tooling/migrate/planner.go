@@ -34,6 +34,8 @@ const (
 	CreateEnum   ChangeType = "CreateEnum"
 	AlterEnum    ChangeType = "AlterEnum"
 	DropEnum     ChangeType = "DropEnum"
+	AddTrigger   ChangeType = "AddTrigger"
+	DropTrigger  ChangeType = "DropTrigger"
 )
 
 // RollbackSafety indicates how safe it is to reverse a change.
@@ -54,8 +56,9 @@ type Change struct {
 	NewValue string            // New value.
 	Details  map[string]string // Additional context.
 	Rollback RollbackSafety
-	OldField *ir.Field // Complete source column definition for dialects such as MySQL.
-	NewField *ir.Field // Complete target column definition for dialects such as MySQL.
+	OldField *ir.Field   // Complete source column definition for dialects such as MySQL.
+	NewField *ir.Field   // Complete target column definition for dialects such as MySQL.
+	Trigger  *ir.Trigger // Definition for either an add or a drop.
 }
 
 // Changeset is an ordered list of changes from old to new schema.
@@ -68,7 +71,7 @@ type Changeset struct {
 // classifyRollback returns the safety classification for a change type.
 func classifyRollback(ct ChangeType) RollbackSafety {
 	switch ct {
-	case CreateTable, AddColumn, AddIndex, AddUnique, AddFK, CreateEnum:
+	case CreateTable, AddColumn, AddIndex, AddUnique, AddFK, CreateEnum, AddTrigger:
 		return SafeRollback
 	case DropTable, DropColumn, DropIndex, DropUnique, DropFK:
 		return DestructiveRollback
@@ -106,12 +109,40 @@ func Diff(old, new *ir.Schema) *Changeset {
 		default:
 			compareModels(cs, old, new, oldM, newM)
 		}
+		compareTriggers(cs, name, oldM, newM)
 	}
 
 	addForeignKeysForCreatedTables(cs, newModels, createdTables)
 	compareEnums(cs, old, new)
 
 	return cs
+}
+
+func compareTriggers(cs *Changeset, table string, oldModel, newModel *ir.Model) {
+	oldTriggers := indexTriggers(oldModel)
+	newTriggers := indexTriggers(newModel)
+	for _, name := range mergedSortedKeys(oldTriggers, newTriggers) {
+		old, new := oldTriggers[name], newTriggers[name]
+		if old != nil && new != nil && *old == *new {
+			continue
+		}
+		if old != nil {
+			cs.add(Change{Type: DropTrigger, Model: table, Field: name, Trigger: old})
+		}
+		if new != nil {
+			cs.add(Change{Type: AddTrigger, Model: table, Field: name, Trigger: new})
+		}
+	}
+}
+
+func indexTriggers(model *ir.Model) map[string]*ir.Trigger {
+	triggers := make(map[string]*ir.Trigger)
+	if model != nil {
+		for _, trigger := range model.Triggers {
+			triggers[trigger.Name] = trigger
+		}
+	}
+	return triggers
 }
 
 func compareEnums(cs *Changeset, old, new *ir.Schema) {

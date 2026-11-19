@@ -1,0 +1,95 @@
+package migrate
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/arsfy/gcorm/pkg/schema/ir"
+	"github.com/arsfy/gcorm/pkg/tooling/internal/triggerddl"
+)
+
+func (g DDLGenerator) createTriggerSteps(table string, trigger *ir.Trigger) []DDLStep {
+	if trigger == nil {
+		return nil
+	}
+	header := fmt.Sprintf("CREATE TRIGGER %s %s %s ON %s FOR EACH ROW",
+		g.quoteID(trigger.Name), trigger.Timing, trigger.Event, g.quoteID(table))
+	switch g.Dialect {
+	case "postgresql":
+		name := g.quoteID(triggerddl.PostgresFunctionName(table, trigger.Name)) + "()"
+		tag := "$gco$"
+		for n := 1; strings.Contains(trigger.Body, tag); n++ {
+			tag = "$gco" + strconv.Itoa(n) + "$"
+		}
+		function := fmt.Sprintf("CREATE OR REPLACE FUNCTION %s RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS %s\n%s\n%s;",
+			name, tag, trigger.Body, tag)
+		return []DDLStep{
+			{SQL: function, SingleStatement: true},
+			{SQL: header + " EXECUTE FUNCTION " + name + ";"},
+		}
+	case "mysql":
+		return []DDLStep{{SQL: header + "\n" + triggerddl.MySQLBegin + "\n" + trigger.Body + "\nEND;", SingleStatement: true}}
+	case "sqlite":
+		return []DDLStep{{SQL: header + "\n" + triggerddl.SQLiteBegin + "\n" + trigger.Body + "\nEND;", SingleStatement: true}}
+	}
+	return nil
+}
+
+func (g DDLGenerator) dropTriggerSQL(table, name string) string {
+	sql := "DROP TRIGGER IF EXISTS " + g.quoteID(name)
+	switch g.Dialect {
+	case "postgresql":
+		sql += " ON " + g.quoteID(table) + ";\nDROP FUNCTION IF EXISTS " + g.quoteID(triggerddl.PostgresFunctionName(table, name)) + "()"
+	case "sqlite":
+		sql = "DROP TRIGGER IF EXISTS main." + g.quoteID(name)
+	}
+	return sql + ";"
+}
+
+func (g DDLGenerator) scriptSQL(step DDLStep) string {
+	if g.Dialect != "mysql" || !step.SingleStatement {
+		return step.SQL
+	}
+	delimiter := "//"
+	for n := 1; strings.Contains(step.SQL, delimiter); n++ {
+		delimiter = "~gco" + strconv.Itoa(n) + "~"
+	}
+	return "DELIMITER " + delimiter + "\n" + strings.TrimSuffix(step.SQL, ";") + delimiter + "\nDELIMITER ;"
+}
+
+func (g DDLGenerator) sqliteRebuildTriggers(cs *Changeset) (drop, restore []DDLStep) {
+	if cs.Old == nil {
+		return nil, nil
+	}
+	dropping := make(map[string]bool)
+	droppedTables := make(map[string]bool)
+	for _, change := range cs.Changes {
+		switch change.Type {
+		case DropTrigger:
+			dropping[change.Field] = true
+		case DropTable:
+			droppedTables[change.Model] = true
+		}
+	}
+
+	// A trigger on a different table can reference the rebuilt table. SQLite
+	// checks those references during ALTER TABLE RENAME, while the original
+	// table no longer exists. Restore definitions once all tables are ready.
+	for _, model := range cs.Old.Models {
+		for _, trigger := range model.Triggers {
+			if !dropping[trigger.Name] {
+				drop = append(drop, DDLStep{SQL: g.dropTriggerSQL(model.TableName(), trigger.Name)})
+				restore = append(restore, g.createTriggerSteps(model.TableName(), trigger)...)
+			}
+		}
+	}
+	for _, trigger := range cs.Old.UnmanagedTriggers {
+		drop = append(drop, DDLStep{SQL: g.dropTriggerSQL(trigger.Table, trigger.Name)})
+		if !droppedTables[trigger.Table] {
+			sql := strings.TrimSuffix(strings.TrimSpace(trigger.SQL), ";") + ";"
+			restore = append(restore, DDLStep{SQL: sql, SingleStatement: true})
+		}
+	}
+	return drop, restore
+}

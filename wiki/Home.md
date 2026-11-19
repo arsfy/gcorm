@@ -26,6 +26,7 @@ files, and push schema changes directly to a database.
 
 - [Configuration](Configuration.md)
 - [CLI Reference](CLI-Reference.md)
+- [Database Triggers](Triggers.md)
 - [Release and Upgrade](Release-and-Upgrade.md)
 
 ## Project Status

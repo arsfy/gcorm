@@ -173,16 +173,15 @@ gco migrate resolve --rolled-back 20260101_120000_init
 
 ## gco introspect
 
-Detect provider information for an existing database URL.
+Generate a schema file from an existing database.
 
 ```sh
 gco introspect --url "$DATABASE_URL"
 gco introspect --url "$DATABASE_URL" --provider postgresql --output schema
 ```
 
-Current behavior: live full-schema introspection is not implemented in the CLI
-command. `db push` has its own internal database introspection for comparing the
-current database schema with the target `.gcorm` schema.
+The command writes `schema.gcorm` to the output directory. It includes managed
+trigger declarations. See [Database Triggers](Triggers.md).
 
 ## gco version
 

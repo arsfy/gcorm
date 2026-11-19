@@ -87,8 +87,10 @@ func Validate(doc *ast.Document) *ValidationResult {
 	for _, e := range doc.Enums {
 		v.validateEnum(e)
 	}
-	v.validateExpressionIndexProvider(&ast.DocumentSet{Documents: []*ast.Document{doc}})
-	v.validateCrossReferences(&ast.DocumentSet{Documents: []*ast.Document{doc}})
+	ds := &ast.DocumentSet{Documents: []*ast.Document{doc}}
+	v.validateExpressionIndexProvider(ds)
+	v.validateTriggers(ds)
+	v.validateCrossReferences(ds)
 	return v.result
 }
 
@@ -155,6 +157,7 @@ func ValidateDocumentSet(ds *ast.DocumentSet) *ValidationResult {
 
 	// Cross-reference validation.
 	v.validateExpressionIndexProvider(ds)
+	v.validateTriggers(ds)
 	v.validateCrossReferences(ds)
 
 	return v.result
@@ -683,6 +686,8 @@ func (v *validator) validateRelation(a ast.Attribute, f ast.FieldDecl, m ast.Mod
 
 func (v *validator) validateModelAttribute(a ast.Attribute, m ast.ModelDecl, fieldNames map[string]bool) {
 	switch a.Name {
+	case "trigger":
+		// Validated across the document set because name scope depends on the provider.
 	case "id":
 		v.validateConstraintFields(a, m, fieldNames, "@@id")
 	case "unique":
@@ -1098,20 +1103,23 @@ func (v *validator) validateCrossReferences(ds *ast.DocumentSet) {
 	}
 }
 
-func (v *validator) validateExpressionIndexProvider(ds *ast.DocumentSet) {
-	provider := ""
+func datasourceProvider(ds *ast.DocumentSet) string {
 	for _, doc := range ds.Documents {
 		for _, datasource := range doc.Datasources {
 			for _, entry := range datasource.Entries {
 				if entry.Key == "provider" {
 					if value, ok := entry.Value.(ast.StringLiteral); ok {
-						provider = value.Value
+						return value.Value
 					}
 				}
 			}
 		}
 	}
-	if provider == "" || provider == "postgresql" {
+	return "postgresql"
+}
+
+func (v *validator) validateExpressionIndexProvider(ds *ast.DocumentSet) {
+	if provider := datasourceProvider(ds); provider == "" || provider == "postgresql" {
 		return
 	}
 	for _, doc := range ds.Documents {

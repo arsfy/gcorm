@@ -253,8 +253,7 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 	}
 
 	gen := migrate.DDLGenerator{Dialect: provider, Schema: targetSchema}
-	sqlText := gen.GenerateUp(cs)
-	stmts, unsupported := splitStatements(sqlText, provider)
+	stmts, unsupported := upStatements(gen, cs)
 	if len(unsupported) > 0 {
 		return nil, fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
 	}
@@ -340,8 +339,7 @@ func pushCompiledMySQL(ctx context.Context, db *sql.DB, targetSchema *ir.Schema,
 	}
 
 	gen := migrate.DDLGenerator{Dialect: "mysql", Schema: targetSchema}
-	sqlText := gen.GenerateUp(cs)
-	stmts, unsupported := splitStatements(sqlText, "mysql")
+	stmts, unsupported := upStatements(gen, cs)
 	if len(unsupported) > 0 {
 		return nil, fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
 	}
@@ -387,7 +385,7 @@ func planWithoutIntrospection(targetSchema *ir.Schema, schemaHash string) (*Resu
 	}
 
 	gen := migrate.DDLGenerator{Dialect: provider, Schema: targetSchema}
-	stmts, unsupported := splitStatements(gen.GenerateUp(cs), provider)
+	stmts, unsupported := upStatements(gen, cs)
 	if len(unsupported) > 0 {
 		return nil, fmt.Errorf("db push generated unsupported SQL:\n%s", strings.Join(unsupported, "\n"))
 	}
@@ -734,6 +732,20 @@ func splitStatements(sqlText, dialect string) ([]string, []string) {
 	}
 
 	return stmts, unsupported
+}
+
+func upStatements(gen migrate.DDLGenerator, cs *migrate.Changeset) ([]string, []string) {
+	var statements, unsupported []string
+	for _, step := range gen.UpSteps(cs) {
+		if step.SingleStatement {
+			statements = append(statements, strings.TrimSuffix(step.SQL, ";"))
+			continue
+		}
+		parsed, comments := splitStatements(step.SQL, gen.Dialect)
+		statements = append(statements, parsed...)
+		unsupported = append(unsupported, comments...)
+	}
+	return statements, unsupported
 }
 
 func splitSQLStatements(sqlText, dialect string) []string {
@@ -1146,6 +1158,9 @@ func introspectPostgresWithTarget(ctx context.Context, db sqlRunner, schemaName 
 	if err := loadPostgresForeignKeys(ctx, db, schemaName, models); err != nil {
 		return nil, err
 	}
+	if err := loadPostgresTriggers(ctx, db, schemaName, models); err != nil {
+		return nil, err
+	}
 
 	names := make([]string, 0, len(models))
 	for name := range models {
@@ -1193,6 +1208,9 @@ func introspectMySQL(ctx context.Context, db sqlRunner) (*ir.Schema, error) {
 	if err := loadMySQLForeignKeys(ctx, db, models); err != nil {
 		return nil, err
 	}
+	if err := loadMySQLTriggers(ctx, db, models); err != nil {
+		return nil, err
+	}
 
 	appendSortedModels(schema, models)
 	return schema, nil
@@ -1216,6 +1234,9 @@ func introspectSQLiteWithTarget(ctx context.Context, db sqlRunner, targetSchema 
 		return nil, err
 	}
 	if err := loadSQLiteForeignKeys(ctx, db, models); err != nil {
+		return nil, err
+	}
+	if err := loadSQLiteTriggers(ctx, db, schema, models); err != nil {
 		return nil, err
 	}
 

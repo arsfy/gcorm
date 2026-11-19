@@ -20,31 +20,61 @@ type DDLGenerator struct {
 
 // GenerateUp produces the up migration SQL.
 func (g DDLGenerator) GenerateUp(cs *Changeset) string {
-	var b strings.Builder
-	if g.Dialect == "postgresql" && cs != nil {
-		b.WriteString(g.postgresEnumChanges(cs))
-		if b.Len() > 0 {
-			b.WriteString("\n\n")
+	steps := g.UpSteps(cs)
+	script := make([]string, 0, len(steps))
+	for _, step := range steps {
+		script = append(script, g.scriptSQL(step))
+	}
+	return strings.TrimRight(strings.Join(script, "\n\n"), "\n")
+}
+
+// DDLStep is a SQL fragment in migration order. SingleStatement marks a
+// complete statement whose internal semicolons must be sent to the server.
+type DDLStep struct {
+	SQL             string
+	SingleStatement bool
+}
+
+// UpSteps returns the SQL for database drivers applying an up migration.
+func (g DDLGenerator) UpSteps(cs *Changeset) []DDLStep {
+	if cs == nil {
+		return nil
+	}
+	var steps []DDLStep
+	if g.Dialect == "postgresql" {
+		if sql := g.postgresEnumChanges(cs); sql != "" {
+			steps = append(steps, DDLStep{SQL: sql})
 		}
 	}
 	createdTables := make(map[string]bool)
 	rebuildTables := make(map[string]bool)
-	if cs != nil {
-		for _, c := range cs.Changes {
-			if c.Type == CreateTable {
-				createdTables[c.Model] = true
-			}
-			if g.Dialect == "sqlite" && sqliteRequiresRebuild(c.Type) {
-				rebuildTables[c.Model] = true
-			}
+	for _, c := range cs.Changes {
+		if c.Type == CreateTable {
+			createdTables[c.Model] = true
 		}
+		if g.Dialect == "sqlite" && sqliteRequiresRebuild(c.Type) {
+			rebuildTables[c.Model] = true
+		}
+	}
+	var restore []DDLStep
+	if len(rebuildTables) > 0 {
+		drop, create := g.sqliteRebuildTriggers(cs)
+		steps = append(steps, drop...)
+		restore = create
 	}
 	rebuilt := make(map[string]bool)
 	for _, c := range g.orderedChanges(cs) {
+		switch c.Type {
+		case AddTrigger:
+			steps = append(steps, g.createTriggerSteps(c.Model, c.Trigger)...)
+			continue
+		case DropTrigger:
+			steps = append(steps, DDLStep{SQL: g.dropTriggerSQL(c.Model, c.Field)})
+			continue
+		}
 		if rebuildTables[c.Model] && !createdTables[c.Model] {
 			if !rebuilt[c.Model] {
-				b.WriteString(g.sqliteRebuildTableSQL(c.Model, cs))
-				b.WriteString("\n\n")
+				steps = append(steps, DDLStep{SQL: g.sqliteRebuildTableSQL(c.Model, cs)})
 				rebuilt[c.Model] = true
 			}
 			continue
@@ -52,13 +82,11 @@ func (g DDLGenerator) GenerateUp(cs *Changeset) string {
 		if g.Dialect == "sqlite" && c.Type == AddFK && createdTables[c.Model] {
 			continue
 		}
-		sql := g.changeToUp(c, cs)
-		if sql != "" {
-			b.WriteString(sql)
-			b.WriteString("\n\n")
+		if sql := g.changeToUp(c, cs); sql != "" {
+			steps = append(steps, DDLStep{SQL: sql})
 		}
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return append(steps, restore...)
 }
 
 func (g DDLGenerator) postgresEnumChanges(cs *Changeset) string {
@@ -749,6 +777,7 @@ func (g DDLGenerator) orderedChanges(cs *Changeset) []Change {
 	createTables := make([]Change, 0)
 	addFKs := make([]Change, 0)
 	dropTables := make([]Change, 0)
+	var dropTriggers, addTriggers []Change
 
 	for _, c := range cs.Changes {
 		switch c.Type {
@@ -764,12 +793,17 @@ func (g DDLGenerator) orderedChanges(cs *Changeset) []Change {
 			addFKs = append(addFKs, c)
 		case DropTable:
 			dropTables = append(dropTables, c)
+		case DropTrigger:
+			dropTriggers = append(dropTriggers, c)
+		case AddTrigger:
+			addTriggers = append(addTriggers, c)
 		default:
 			others = append(others, c)
 		}
 	}
 
 	ordered := make([]Change, 0, len(cs.Changes))
+	ordered = append(ordered, dropTriggers...)
 	ordered = append(ordered, createEnums...)
 	ordered = append(ordered, dropFKs...)
 	ordered = append(ordered, orderOtherChanges(others)...)
@@ -777,6 +811,7 @@ func (g DDLGenerator) orderedChanges(cs *Changeset) []Change {
 	ordered = append(ordered, addFKs...)
 	ordered = append(ordered, g.sortTableChanges(dropTables, cs.Old, true)...)
 	ordered = append(ordered, dropEnums...)
+	ordered = append(ordered, addTriggers...)
 	return ordered
 }
 
@@ -936,6 +971,18 @@ func (g DDLGenerator) changeToDown(c Change, cs *Changeset) string {
 		g.Schema = cs.Old
 	}
 	switch c.Type {
+	case AddTrigger:
+		return g.dropTriggerSQL(c.Model, c.Field)
+	case DropTrigger:
+		if cs != nil && findModel(cs.Old, c.Model) != nil && findModel(cs.New, c.Model) == nil {
+			return fmt.Sprintf("-- WARNING: restore table %s before recreating its trigger %s", g.quoteID(c.Model), g.quoteID(c.Field))
+		}
+		steps := g.createTriggerSteps(c.Model, c.Trigger)
+		statements := make([]string, 0, len(steps))
+		for _, step := range steps {
+			statements = append(statements, g.scriptSQL(step))
+		}
+		return strings.Join(statements, "\n\n")
 	case CreateTable:
 		return fmt.Sprintf("DROP TABLE %s;", g.quoteID(c.Model))
 	case DropTable:

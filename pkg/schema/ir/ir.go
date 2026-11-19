@@ -6,10 +6,11 @@ import "github.com/arsfy/gcorm/pkg/schema/ast"
 
 // Schema is the fully resolved schema graph, the output of the compiler pipeline.
 type Schema struct {
-	Datasource *Datasource
-	Generators []*Generator
-	Models     []*Model
-	Enums      []*Enum
+	Datasource        *Datasource
+	Generators        []*Generator
+	Models            []*Model
+	Enums             []*Enum
+	UnmanagedTriggers []DatabaseTrigger `json:"-"` // SQLite definitions retained during table rebuilds.
 }
 
 // Datasource holds the resolved database connection configuration.
@@ -42,9 +43,25 @@ type Model struct {
 	Fields            []*Field
 	Relations         []*Relation
 	Indexes           []*Index
+	Triggers          []*Trigger `json:",omitempty"`
 	PrimaryKey        *PrimaryKey
 	UniqueConstraints []*UniqueConstraint
 	Span              ast.Span
+}
+
+// Trigger is a GCORM-managed, row-level database trigger.
+type Trigger struct {
+	Name   string
+	Timing string // BEFORE or AFTER.
+	Event  string // INSERT, UPDATE, or DELETE.
+	Body   string // Provider-specific SQL.
+}
+
+// DatabaseTrigger is a live SQLite trigger defined outside GCORM.
+type DatabaseTrigger struct {
+	Table string
+	Name  string
+	SQL   string
 }
 
 // TableName returns the database table name (DBName if set, otherwise Name).

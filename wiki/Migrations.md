@@ -61,6 +61,9 @@ from embedded `.gcorm` files, see [Embedded DB Push](Embedded-DB-Push.md).
 
 This makes generated migrations easier to inspect in code review.
 
+For trigger creation, replacement, and removal, including MySQL's script
+delimiter, see [Database Triggers](Triggers.md).
+
 ## Development Command
 
 ```sh

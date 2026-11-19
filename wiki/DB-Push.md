@@ -62,9 +62,12 @@ before running `db push`.
 4. Introspects the current database schema.
 5. Computes a diff.
 6. Refuses destructive changes unless `--force` is provided.
-7. Executes supported SQL statements in a transaction.
+7. Executes supported SQL statements using the provider's DDL transaction behavior.
 
 If no changes are detected, the command exits without executing SQL.
+
+GCORM compares managed triggers on every push. Updating or removing a trigger
+requires `--force`. See [Database Triggers](Triggers.md).
 
 ## Destructive Changes
 
@@ -114,6 +117,7 @@ MySQL:
 
 - Use DSNs with `parseTime=true` for `DateTime` fields.
 - Uses `?` placeholders.
+- DDL commits statement by statement. A failed push can leave earlier changes applied.
 
 SQLite:
 

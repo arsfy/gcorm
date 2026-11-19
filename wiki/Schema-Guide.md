@@ -159,6 +159,7 @@ Common model attributes:
 - `@@index([...])`: index.
 - `@@map("table_name")`: map model to a database table name.
 - `@@schema("name")`: PostgreSQL schema name.
+- `@@trigger(...)` declares a row-level database trigger. See [Database Triggers](Triggers.md).
 
 ## Advanced Indexes
 
