@@ -24,7 +24,8 @@ func TestDDLSQLiteRebuildTable(t *testing.T) {
 	up := gen.GenerateUp(cs)
 
 	for _, want := range []string{
-		"PRAGMA defer_foreign_keys = ON;",
+		"PRAGMA foreign_keys = OFF;",
+		"BEGIN IMMEDIATE;",
 		`CREATE TABLE "__gco_new_User"`,
 		`INSERT INTO "__gco_new_User" ("id", "name", "age") SELECT "id", "name", "age" FROM "User";`,
 		`DROP TABLE "User";`,

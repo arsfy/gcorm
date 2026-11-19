@@ -97,7 +97,7 @@ triggers created by custom SQL stay outside GCORM's management. A declaration
 that reuses an existing unmanaged name produces a database error. Dropping a
 table also drops its triggers.
 
-During a SQLite table rebuild, `db push` reads native trigger definitions from
-the database and recreates those on surviving tables and views. When applying
-generated migration files to SQLite, include any native trigger definitions
-needed by your rebuild in the reviewed SQL.
+During a SQLite table rebuild, `db push` restores native triggers attached to
+the rebuilt table and checks that managed triggers compile against the new
+schema. When applying generated migration files, include any native trigger
+definitions needed by the rebuild in the reviewed SQL. See [SQLite migration notes](Migrations.md#sqlite-notes).

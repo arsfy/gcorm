@@ -149,6 +149,10 @@ result, err := dbpush.Push(ctx, db, dbpush.Options{
 ```
 
 `DryRun` does not create user tables and does not write `__gco_schema_pushes`.
+
+For SQLite table rebuilds, `Result.Statements` shows the DDL that `Push` runs
+inside its managed transaction. For a standalone rebuild script with its own
+transaction and foreign-key check, use [migrate diff](Migrations.md#generate-a-migration).
 By default it still introspects the live database so the plan reflects current
 database state. On large databases, this can run catalog queries over tables,
 columns, indexes, and foreign keys.

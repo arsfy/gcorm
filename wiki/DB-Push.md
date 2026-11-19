@@ -122,8 +122,11 @@ MySQL:
 SQLite:
 
 - File URLs and plain file paths are supported.
-- Some schema changes require table rebuild patterns.
-- Transaction behavior depends on the SQLite driver and connection settings.
+- During a table rebuild, GCORM preserves child rows and the last assigned
+  `AUTOINCREMENT` value. It checks foreign keys before committing if enforcement
+  was enabled on the connection.
+- The push rolls back when it would break a previously valid view or when a
+  managed trigger cannot compile against the resulting schema.
 
 ## Limitations
 

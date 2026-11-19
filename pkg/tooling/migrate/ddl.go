@@ -25,7 +25,11 @@ func (g DDLGenerator) GenerateUp(cs *Changeset) string {
 	for _, step := range steps {
 		script = append(script, g.scriptSQL(step))
 	}
-	return strings.TrimRight(strings.Join(script, "\n\n"), "\n")
+	sql := strings.TrimRight(strings.Join(script, "\n\n"), "\n")
+	if g.Dialect == "sqlite" && cs.RebuildsSQLiteTables() {
+		return sqliteRebuildScript(sql)
+	}
+	return sql
 }
 
 // DDLStep is a SQL fragment in migration order. SingleStatement marks a
@@ -36,6 +40,7 @@ type DDLStep struct {
 }
 
 // UpSteps returns the SQL for database drivers applying an up migration.
+// Callers applying a SQLite rebuild must manage its transaction and PRAGMAs.
 func (g DDLGenerator) UpSteps(cs *Changeset) []DDLStep {
 	if cs == nil {
 		return nil
@@ -47,20 +52,16 @@ func (g DDLGenerator) UpSteps(cs *Changeset) []DDLStep {
 		}
 	}
 	createdTables := make(map[string]bool)
-	rebuildTables := make(map[string]bool)
 	for _, c := range cs.Changes {
 		if c.Type == CreateTable {
 			createdTables[c.Model] = true
 		}
-		if g.Dialect == "sqlite" && sqliteRequiresRebuild(c.Type) {
-			rebuildTables[c.Model] = true
-		}
 	}
+	var rebuildTables map[string]bool
 	var restore []DDLStep
-	if len(rebuildTables) > 0 {
-		drop, create := g.sqliteRebuildTriggers(cs)
-		steps = append(steps, drop...)
-		restore = create
+	if g.Dialect == "sqlite" {
+		rebuildTables = sqliteRebuildTables(cs)
+		restore = g.sqliteRebuildTriggers(cs, rebuildTables)
 	}
 	rebuilt := make(map[string]bool)
 	for _, c := range g.orderedChanges(cs) {
@@ -72,7 +73,7 @@ func (g DDLGenerator) UpSteps(cs *Changeset) []DDLStep {
 			steps = append(steps, DDLStep{SQL: g.dropTriggerSQL(c.Model, c.Field)})
 			continue
 		}
-		if rebuildTables[c.Model] && !createdTables[c.Model] {
+		if rebuildTables[c.Model] {
 			if !rebuilt[c.Model] {
 				steps = append(steps, DDLStep{SQL: g.sqliteRebuildTableSQL(c.Model, cs)})
 				rebuilt[c.Model] = true
@@ -157,10 +158,37 @@ func (g DDLGenerator) postgresCreateEnumSQL(e *ir.Enum) string {
 	return "DO " + delimiter + " BEGIN\n" + stmt + "\nEXCEPTION WHEN duplicate_object THEN NULL;\nEND " + delimiter + ";"
 }
 
-func sqliteRequiresRebuild(t ChangeType) bool {
-	switch t {
+// RebuildsSQLiteTables reports whether the changes need SQLite's copy-and-swap
+// procedure when applied to an existing schema.
+func (cs *Changeset) RebuildsSQLiteTables() bool {
+	return len(sqliteRebuildTables(cs)) > 0
+}
+
+func sqliteRebuildTables(cs *Changeset) map[string]bool {
+	tables := make(map[string]bool)
+	if cs == nil {
+		return tables
+	}
+	for _, c := range cs.Changes {
+		if sqliteRequiresRebuild(c) {
+			tables[c.Model] = true
+		}
+	}
+	for _, c := range cs.Changes {
+		if c.Type == CreateTable || c.Type == DropTable {
+			delete(tables, c.Model)
+		}
+	}
+	return tables
+}
+
+func sqliteRequiresRebuild(c Change) bool {
+	switch c.Type {
 	case DropColumn, AlterType, AlterNull, AlterDefault, AddUnique, DropUnique, ChangePK, AddFK, DropFK:
 		return true
+	case AddColumn:
+		// SQLite only accepts constant defaults in ALTER TABLE ADD COLUMN.
+		return c.NewField != nil && c.NewField.Default != nil && c.NewField.Default.IsFunction
 	}
 	return false
 }
@@ -187,12 +215,30 @@ func (g DDLGenerator) sqliteRebuildTableSQL(table string, cs *Changeset) string 
 		}
 	}
 	var b strings.Builder
-	b.WriteString("PRAGMA defer_foreign_keys = ON;\n")
 	b.WriteString(create)
 	b.WriteString("\n")
 	if len(cols) > 0 {
 		quoted := g.quoteIDs(cols)
 		fmt.Fprintf(&b, "INSERT INTO %s (%s) SELECT %s FROM %s;\n", g.quoteID(temp), strings.Join(quoted, ", "), strings.Join(quoted, ", "), g.quoteID(table))
+	} else if oldModel != nil {
+		// Even if every column changed, copy one row per original row.
+		// Required fields without defaults cause the copy to fail.
+		var defaults []string
+		for _, f := range newModel.ScalarFields() {
+			cols = append(cols, columnName(f))
+			value := "NULL"
+			if f.Default != nil && !g.isAutoIncrementField(f) {
+				value = g.defaultExprForField(f)
+			}
+			defaults = append(defaults, value)
+		}
+		fmt.Fprintf(&b, "INSERT INTO %s (%s) SELECT %s FROM %s;\n", g.quoteID(temp), strings.Join(g.quoteIDs(cols), ", "), strings.Join(defaults, ", "), g.quoteID(table))
+	}
+	if autoColumn := g.sqliteInlineAutoIncrementPrimaryKeyColumn(oldModel); autoColumn != "" &&
+		autoColumn == g.sqliteInlineAutoIncrementPrimaryKeyColumn(newModel) {
+		oldName, newName := quoteSQLString(table), quoteSQLString(temp)
+		fmt.Fprintf(&b, "UPDATE main.sqlite_sequence SET seq = max(seq, coalesce((SELECT seq FROM main.sqlite_sequence WHERE name = %s), seq)) WHERE name = %s;\n", oldName, newName)
+		fmt.Fprintf(&b, "INSERT INTO main.sqlite_sequence (name, seq) SELECT %s, seq FROM main.sqlite_sequence WHERE name = %s AND NOT EXISTS (SELECT 1 FROM main.sqlite_sequence WHERE name = %s);\n", newName, oldName, newName)
 	}
 	fmt.Fprintf(&b, "DROP TABLE %s;\nALTER TABLE %s RENAME TO %s;", g.quoteID(table), g.quoteID(temp), g.quoteID(table))
 	for _, idx := range newModel.Indexes {
@@ -209,6 +255,17 @@ func (g DDLGenerator) sqliteRebuildTableSQL(table string, cs *Changeset) string 
 
 // GenerateDown produces the best-effort down migration SQL.
 func (g DDLGenerator) GenerateDown(cs *Changeset) string {
+	if g.Dialect == "sqlite" && cs != nil && cs.Old != nil && cs.New != nil {
+		reverse := Diff(cs.New, cs.Old)
+		if cs.RebuildsSQLiteTables() || reverse.RebuildsSQLiteTables() {
+			g.Schema = cs.Old
+			sql := g.GenerateUp(reverse)
+			if !reverse.RebuildsSQLiteTables() {
+				sql = sqliteRebuildScript(sql)
+			}
+			return "-- REVIEW REQUIRED: restores the previous schema. Review data lost by dropped columns or tables.\n" + sql
+		}
+	}
 	var b strings.Builder
 	ordered := g.orderedChanges(cs)
 	for i := len(ordered) - 1; i >= 0; i-- {
@@ -220,6 +277,21 @@ func (g DDLGenerator) GenerateDown(cs *Changeset) string {
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func sqliteRebuildScript(sql string) string {
+	return `PRAGMA foreign_keys = OFF;
+BEGIN IMMEDIATE;
+PRAGMA legacy_alter_table = ON;
+
+` + sql + `
+
+CREATE TEMP TABLE "__gco_fk_check" (ok INTEGER CONSTRAINT foreign_key_check CHECK (ok));
+INSERT OR ROLLBACK INTO temp."__gco_fk_check" SELECT 0 FROM pragma_foreign_key_check LIMIT 1;
+DROP TABLE temp."__gco_fk_check";
+COMMIT;
+PRAGMA legacy_alter_table = OFF;
+PRAGMA foreign_keys = ON;`
 }
 
 // ---------------------------------------------------------------------------

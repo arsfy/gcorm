@@ -58,38 +58,35 @@ func (g DDLGenerator) scriptSQL(step DDLStep) string {
 	return "DELIMITER " + delimiter + "\n" + strings.TrimSuffix(step.SQL, ";") + delimiter + "\nDELIMITER ;"
 }
 
-func (g DDLGenerator) sqliteRebuildTriggers(cs *Changeset) (drop, restore []DDLStep) {
-	if cs.Old == nil {
-		return nil, nil
+func (g DDLGenerator) sqliteRebuildTriggers(cs *Changeset, tables map[string]bool) []DDLStep {
+	if cs.Old == nil || len(tables) == 0 {
+		return nil
 	}
 	dropping := make(map[string]bool)
-	droppedTables := make(map[string]bool)
 	for _, change := range cs.Changes {
-		switch change.Type {
-		case DropTrigger:
+		if change.Type == DropTrigger {
 			dropping[change.Field] = true
-		case DropTable:
-			droppedTables[change.Model] = true
 		}
 	}
 
-	// A trigger on a different table can reference the rebuilt table. SQLite
-	// checks those references during ALTER TABLE RENAME, while the original
-	// table no longer exists. Restore definitions once all tables are ready.
+	// SQLite drops triggers attached to the replaced table. Other triggers
+	// and views retain their references with legacy_alter_table enabled.
+	var restore []DDLStep
 	for _, model := range cs.Old.Models {
+		if !tables[model.TableName()] {
+			continue
+		}
 		for _, trigger := range model.Triggers {
 			if !dropping[trigger.Name] {
-				drop = append(drop, DDLStep{SQL: g.dropTriggerSQL(model.TableName(), trigger.Name)})
 				restore = append(restore, g.createTriggerSteps(model.TableName(), trigger)...)
 			}
 		}
 	}
 	for _, trigger := range cs.Old.UnmanagedTriggers {
-		drop = append(drop, DDLStep{SQL: g.dropTriggerSQL(trigger.Table, trigger.Name)})
-		if !droppedTables[trigger.Table] {
+		if tables[trigger.Table] {
 			sql := strings.TrimSuffix(strings.TrimSpace(trigger.SQL), ";") + ";"
 			restore = append(restore, DDLStep{SQL: sql, SingleStatement: true})
 		}
 	}
-	return drop, restore
+	return restore
 }

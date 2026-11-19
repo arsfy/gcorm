@@ -50,6 +50,7 @@ type IndexInfo struct {
 	Columns     []string
 	Expressions []string
 	IsUnique    bool
+	Where       string
 }
 
 // ForeignKeyInfo describes a foreign key relationship.
@@ -163,7 +164,7 @@ func tablesFromIR(schema *ir.Schema) []TableInfo {
 			t.Columns = append(t.Columns, c)
 		}
 		for _, idx := range model.Indexes {
-			info := IndexInfo{Name: idx.Name, Columns: append([]string(nil), idx.Fields...), IsUnique: idx.IsUnique}
+			info := IndexInfo{Name: idx.Name, Columns: append([]string(nil), idx.Fields...), IsUnique: idx.IsUnique, Where: idx.Where}
 			if len(idx.Columns) > 0 {
 				info.Columns = make([]string, len(idx.Columns))
 				info.Expressions = make([]string, len(idx.Columns))
@@ -292,6 +293,10 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 
 		// Model-level indexes.
 		for _, idx := range t.Indexes {
+			if idx.IsUnique && idx.Where != "" {
+				fmt.Fprintf(&b, "\n  // WARNING: partial unique index %q requires custom SQL\n", idx.Name)
+				continue
+			}
 			cols := indexSchemaFields(t, idx, fieldNames[t.Name])
 			if len(cols) != len(idx.Columns) {
 				fmt.Fprintf(&b, "\n  // WARNING: index %q omitted because its columns could not be represented\n", idx.Name)
@@ -307,6 +312,9 @@ func GenerateSchema(provider string, tables []TableInfo) string {
 			}
 			if hasIndexExpressions(idx.Expressions) {
 				args = append(args, formatIndexExpressions(idx.Expressions))
+			}
+			if idx.Where != "" {
+				args = append(args, "where: "+formatter.FormatExpression(ast.StringLiteral{Value: idx.Where}))
 			}
 			fmt.Fprintf(&b, "\n  @@%s(%s)\n", kind, strings.Join(args, ", "))
 		}

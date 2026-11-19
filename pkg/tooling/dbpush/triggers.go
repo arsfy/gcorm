@@ -10,7 +10,8 @@ import (
 
 func loadPostgresTriggers(ctx context.Context, db sqlRunner, schemaName string, models map[string]*ir.Model) error {
 	rows, err := db.QueryContext(ctx, `
-SELECT c.relname, t.tgname, t.tgtype, p.proname, p.prosrc
+SELECT c.relname, t.tgname, t.tgtype, p.proname, p.prosrc,
+       t.tgenabled <> 'O' OR t.tgqual IS NOT NULL OR t.tgnargs <> 0 OR t.tgattr <> ''::int2vector
 FROM pg_catalog.pg_trigger t
 JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -25,7 +26,7 @@ ORDER BY c.relname, t.tgname`, schemaName)
 		var table, function string
 		var flags int
 		trigger := &ir.Trigger{}
-		if err := rows.Scan(&table, &trigger.Name, &flags, &function, &trigger.Body); err != nil {
+		if err := rows.Scan(&table, &trigger.Name, &flags, &function, &trigger.Body, &trigger.NeedsReplacement); err != nil {
 			return err
 		}
 		model := models[table]

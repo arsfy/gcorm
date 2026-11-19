@@ -64,6 +64,14 @@ func TestPushTriggerLifecycle(t *testing.T) {
 				execTriggerSQL(t, db, "DROP TRIGGER item_audit ON "+table)
 				pushTriggerSchema(t, db, dsn, content, false)
 				requireTriggerNoop(t, db, dsn, content)
+
+				execTriggerSQL(t, db, "ALTER TABLE "+table+" DISABLE TRIGGER item_audit")
+				_, err := Push(t.Context(), db, Options{SchemaFS: triggerFS(content), DatabaseURL: dsn})
+				if err == nil || !strings.Contains(err.Error(), "DropTrigger") {
+					t.Fatalf("repair of disabled trigger without force returned %v", err)
+				}
+				pushTriggerSchema(t, db, dsn, content, true)
+				requireTriggerNoop(t, db, dsn, content)
 			}
 			execTriggerSQL(t, db, "INSERT INTO "+table+" (id) VALUES (1)")
 			requireAuditMessage(t, db, logTable, 1, message+"!")

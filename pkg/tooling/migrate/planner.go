@@ -364,6 +364,10 @@ func indexSignature(schema *ir.Schema, idx *ir.Index) string {
 	}
 	enumTypes := postgresEnumTypeNames(schema)
 	cols := effectiveIndexColumns(idx)
+	predicate := strings.TrimSpace(idx.Where)
+	if schema == nil || schema.Datasource == nil || schema.Datasource.Provider != "sqlite" {
+		predicate = normalizeIndexPredicate(predicate)
+	}
 	return strings.Join([]string{
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string {
 			if strings.TrimSpace(c.Expression) != "" {
@@ -375,7 +379,7 @@ func indexSignature(schema *ir.Schema, idx *ir.Index) string {
 			return normalizeIndexExpressionWithEnums(c.Expression, enumTypes)
 		}), ","),
 		boolStr(idx.IsUnique),
-		normalizeIndexPredicate(idx.Where),
+		predicate,
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexSort(c.Sort) }), ","),
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexNulls(c.Sort, c.Nulls) }), ","),
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexOpClass(c.OpClass) }), ","),

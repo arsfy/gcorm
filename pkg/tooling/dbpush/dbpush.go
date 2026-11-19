@@ -32,6 +32,11 @@ type sqlRunner interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
+type transactionalRunner interface {
+	sqlRunner
+	BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+}
+
 // IntrospectDatabase exposes the live-database reflection used by db push so
 // the introspect CLI and schema push always observe the same database shape.
 func IntrospectDatabase(ctx context.Context, db *sql.DB, provider string, target *ir.Schema, dsn string) (*ir.Schema, error) {
@@ -187,10 +192,17 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 	if provider == "mysql" {
 		return pushCompiledMySQL(ctx, db, targetSchema, schemaHash, dsn, opts)
 	}
+	if provider == "sqlite" && !opts.DryRun {
+		return pushCompiledSQLite(ctx, db, targetSchema, schemaHash, dsn, opts)
+	}
+	return pushTransactional(ctx, db, provider, targetSchema, schemaHash, dsn, opts, false)
+}
 
+func pushTransactional(ctx context.Context, db transactionalRunner, provider string, targetSchema *ir.Schema, schemaHash, dsn string, opts Options, checkForeignKeys bool) (*Result, error) {
 	var tx *sql.Tx
 	var runner sqlRunner = db
 	if !opts.DryRun {
+		var err error
 		tx, err = db.BeginTx(ctx, nil)
 		if err != nil {
 			return nil, fmt.Errorf("begin transaction: %w", err)
@@ -205,13 +217,6 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 		}
 		if !opts.DisableLock {
 			if err := lockPushTransaction(ctx, tx, provider); err != nil {
-				return nil, err
-			}
-		}
-		if provider == "sqlite" {
-			// Force acquisition of SQLite's writer lock before introspection so
-			// concurrent pushes cannot both plan from the same stale schema.
-			if err := ensureSchemaPushesTable(ctx, tx, provider); err != nil {
 				return nil, err
 			}
 		}
@@ -265,12 +270,35 @@ func pushCompiled(ctx context.Context, db *sql.DB, targetSchema *ir.Schema, sche
 		return result, nil
 	}
 
+	var views []string
+	sqliteTableChange := provider == "sqlite" && sqliteChangesTableShape(cs)
+	if sqliteTableChange {
+		views, err = validSQLiteViews(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := ensureSchemaPushesTable(ctx, tx, provider); err != nil {
 		return nil, err
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return nil, fmt.Errorf("execute SQL %s: %w", statementSummary(stmt), err)
+		}
+	}
+	for _, view := range views {
+		if err := prepareSQLiteView(ctx, tx, view); err != nil {
+			return nil, fmt.Errorf("SQLite schema change would break view %q: %w", view, err)
+		}
+	}
+	if provider == "sqlite" {
+		if err := checkSQLiteTriggerActions(ctx, tx, targetSchema); err != nil {
+			return nil, err
+		}
+	}
+	if checkForeignKeys && sqliteTableChange {
+		if err := checkSQLiteForeignKeys(ctx, tx); err != nil {
+			return nil, err
 		}
 	}
 	if err := insertSchemaPushRecord(ctx, tx, provider, schemaHash, len(targetSchema.Models), len(cs.Changes)); err != nil {
@@ -1020,7 +1048,7 @@ func lockPushTransaction(ctx context.Context, tx *sql.Tx, provider string) error
 			return fmt.Errorf("acquire db push lock: %w", err)
 		}
 	case "sqlite":
-		// SQLite serializes schema writes through the transaction itself.
+		return lockSQLitePush(ctx, tx)
 	default:
 		return fmt.Errorf("db push lock unsupported for provider %q", provider)
 	}
@@ -2223,6 +2251,18 @@ func loadSQLiteIndexes(ctx context.Context, db sqlRunner, models map[string]*ir.
 			fields, err := loadSQLiteIndexColumns(ctx, db, idx.name)
 			if err != nil {
 				return err
+			}
+			if idx.partial {
+				var createSQL string
+				if err := db.QueryRowContext(ctx, "SELECT sql FROM main.sqlite_schema WHERE type = 'index' AND name = ?", idx.name).Scan(&createSQL); err != nil {
+					return err
+				}
+				where := sqliteIndexPredicate(createSQL)
+				if where == "" {
+					return fmt.Errorf("cannot read SQLite partial index %q predicate", idx.name)
+				}
+				model.Indexes = append(model.Indexes, &ir.Index{Name: idx.name, Fields: fields, IsUnique: idx.unique, Where: where})
+				continue
 			}
 			if idx.unique {
 				if len(fields) == 1 {

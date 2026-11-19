@@ -115,8 +115,20 @@ Before applying generated SQL:
 ## SQLite Notes
 
 SQLite supports fewer direct `ALTER TABLE` operations than PostgreSQL and MySQL.
-Some changes require table rebuilds. Review generated SQLite SQL especially
-carefully before applying it to a database that contains important data.
+Some changes require a table rebuild. Rebuild scripts use their own transaction
+and check foreign keys before committing. Run them on a dedicated connection
+with no open transaction and stop on the first error. If using the SQLite CLI,
+run `sqlite3 -bail database.db < up.sql`. An application runner should roll back
+and close the connection on error. A successful script enables foreign keys.
+
+The generated down script restores the previous schema where the snapshot
+supports it. Dropped column values and rows from dropped tables cannot be
+recovered from the SQL snapshot. Review required columns without defaults before
+running the rollback.
+
+When tables contain native SQLite features that the schema cannot express,
+include their definitions in the reviewed migration. This applies to native
+constraints and triggers as well as views whose referenced columns change.
 
 ## Migration Or DB Push
 

@@ -2784,7 +2784,8 @@ func TestIntrospectSQLiteIndexesEdgeCases(t *testing.T) {
 	statements := []string{
 		`CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b INT, c TEXT)`,
 		`CREATE UNIQUE INDEX uq_ab ON t(a, b)`,
-		`CREATE INDEX idx_partial ON t(c) WHERE c IS NOT NULL`,
+		`CREATE INDEX "idx_) WHERE" ON t(c) /* ) WHERE */ WHERE c = ') WHERE' AND a > 0`,
+		`CREATE UNIQUE INDEX uq_partial ON t(c) WHERE a = 1`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.Exec(stmt); err != nil {
@@ -2814,12 +2815,19 @@ func TestIntrospectSQLiteIndexesEdgeCases(t *testing.T) {
 	var partial *ir.Index
 	for _, idx := range model.Indexes {
 		switch idx.Name {
-		case "idx_partial":
+		case "idx_) WHERE":
 			partial = idx
+		case "uq_partial":
+			if !idx.IsUnique || idx.Where != "a = 1" {
+				t.Fatalf("partial unique index = %#v", idx)
+			}
 		}
 	}
-	if partial == nil || len(partial.Fields) != 1 || partial.Fields[0] != "c" {
-		t.Fatalf("partial index = %#v, want idx_partial on c", partial)
+	if partial == nil || len(partial.Fields) != 1 || partial.Fields[0] != "c" || partial.Where != "c = ') WHERE' AND a > 0" {
+		t.Fatalf("partial index = %#v, want index on c with original predicate", partial)
+	}
+	if c := findFieldByColumn(model, "c"); c == nil || c.IsUnique {
+		t.Fatalf("partial unique index marked c as unconditionally unique: %+v", c)
 	}
 }
 
