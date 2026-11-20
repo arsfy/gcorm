@@ -374,7 +374,7 @@ func compareField(cs *Changeset, model string, of, nf *ir.Field) {
 	}
 	od := databaseDefaultSignature(of.Default)
 	nd := databaseDefaultSignature(nf.Default)
-	if od != nd {
+	if od != nd && !equivalentJSONDefaults(of, nf) {
 		cs.add(Change{
 			Type: AlterDefault, Model: model, Field: columnName(nf),
 			OldValue: od, NewValue: nd, OldField: of, NewField: nf,
@@ -1137,8 +1137,12 @@ func normalizeIndexCollation(collation string) string {
 	collation = strings.Trim(strings.TrimSpace(collation), `"`)
 	collation = strings.ReplaceAll(collation, `"."`, ".")
 	collation = strings.ReplaceAll(collation, `"`, "")
+	// Built-in collations live in pg_catalog, which introspection reports.
+	if len(collation) > len("pg_catalog.") && strings.EqualFold(collation[:len("pg_catalog.")], "pg_catalog.") {
+		collation = collation[len("pg_catalog."):]
+	}
 	switch strings.ToLower(collation) {
-	case "default", "pg_catalog.default":
+	case "default":
 		return ""
 	default:
 		return collation

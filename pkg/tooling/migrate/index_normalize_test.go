@@ -72,3 +72,12 @@ func TestStripPostgresLiteralCastsLeavesIdentifiersAlone(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+func TestNormalizeIndexCollationIgnoresPgCatalogSchema(t *testing.T) {
+	if got, want := normalizeIndexCollation(`pg_catalog."C"`), normalizeIndexCollation("C"); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if normalizeIndexCollation("pg_catalog.C") == normalizeIndexCollation("POSIX") {
+		t.Fatal("different collations must stay different")
+	}
+}

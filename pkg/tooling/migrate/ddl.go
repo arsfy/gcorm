@@ -683,6 +683,11 @@ func (g DDLGenerator) postgresAlterDefaultSQL(c Change) string {
 	return strings.Join(statements, "\n")
 }
 
+// AddIndexSQL renders the CREATE INDEX statement for an AddIndex change.
+func (g DDLGenerator) AddIndexSQL(c Change) string {
+	return g.addIndexSQL(c)
+}
+
 func (g DDLGenerator) addIndexSQL(c Change) string {
 	name := c.NewValue
 	if name == "" {

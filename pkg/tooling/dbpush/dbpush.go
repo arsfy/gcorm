@@ -253,6 +253,12 @@ func pushTransactionalPhase(ctx context.Context, db transactionalRunner, provide
 	}
 
 	cs := migrate.Diff(currentSchema, targetSchema)
+	if provider == "postgresql" {
+		cs, err = dropEquivalentPostgresIndexRebuilds(ctx, db, tx, cs, targetSchema)
+		if err != nil {
+			return nil, err
+		}
+	}
 	result := &Result{
 		Provider:    provider,
 		SchemaHash:  schemaHash,
