@@ -541,9 +541,12 @@ func normalizeIndexExpressionWithEnums(expression string, enumTypes map[string]s
 	for hasWrappingParens(expression) {
 		expression = strings.TrimSpace(expression[1 : len(expression)-1])
 	}
+	expression = uppercaseSQLKeywords(expression)
 	expression = stripPostgresImplicitCaseElseNull(expression)
 	expression = stripPostgresTextCasts(expression)
 	expression = stripPostgresEnumLiteralCasts(expression, enumTypes)
+	expression = stripPostgresLiteralCasts(expression, false)
+	expression = rewritePostgresArrayMembership(expression)
 	for {
 		next := stripPostgresCaseWhenParens(expression)
 		if next == expression {
@@ -558,6 +561,7 @@ func normalizeIndexExpressionWithEnums(expression string, enumTypes map[string]s
 		}
 		expression = next
 	}
+	expression = normalizeSQLCommas(expression)
 	return strings.Join(strings.Fields(expression), " ")
 }
 
@@ -854,6 +858,11 @@ func normalizeIndexPredicate(where string) string {
 	for hasWrappingParens(where) {
 		where = strings.TrimSpace(where[1 : len(where)-1])
 	}
+	where = uppercaseSQLKeywords(where)
+	where = stripPostgresTextLiteralCasts(where)
+	where = stripPostgresTextCasts(where)
+	where = stripPostgresLiteralCasts(where, true)
+	where = rewritePostgresArrayMembership(where)
 	for {
 		next := stripSimplePredicateParens(where)
 		if next == where {
@@ -861,7 +870,7 @@ func normalizeIndexPredicate(where string) string {
 		}
 		where = next
 	}
-	where = stripPostgresTextLiteralCasts(where)
+	where = normalizeSQLCommas(where)
 	return strings.Join(strings.Fields(where), " ")
 }
 
@@ -1021,7 +1030,7 @@ func stripSimplePredicateParens(s string) string {
 		}
 		inner := strings.TrimSpace(s[i+1 : end])
 		upper := strings.ToUpper(inner)
-		if strings.Contains(upper, " AND ") || strings.Contains(upper, " OR ") {
+		if strings.Contains(upper, " AND ") || strings.Contains(upper, " OR ") || hasTopLevelComma(inner) {
 			b.WriteByte(s[i])
 			continue
 		}

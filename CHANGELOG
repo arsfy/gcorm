@@ -5,13 +5,13 @@
 - `@@trigger` accepts `columns: [field, ...]` on `event: Update` triggers to
   fire only when an `UPDATE` sets one of the listed fields. PostgreSQL and
   SQLite render it as `UPDATE OF "col", ...`, using `@map` column names.
-  - The validator requires `event: Update` and distinct scalar fields of the
-    model, and rejects `columns` on MySQL, which has no `UPDATE OF`.
-  - `db push` and `migrate diff` compare the list as a set: reordering it is
-    not a change, while adding or removing a column replaces the trigger.
-  - `db push` reads the columns from `pg_trigger.tgattr` on PostgreSQL and
-    from the `OF` clause on SQLite, and `gco introspect` writes them back as
-    field names.
+- The validator requires `event: Update` and distinct scalar fields of the
+model, and rejects `columns` on MySQL, which has no `UPDATE OF`.
+- `db push` and `migrate diff` compare the list as a set: reordering it is
+not a change, while adding or removing a column replaces the trigger.
+- `db push` reads the columns from `pg_trigger.tgattr` on PostgreSQL and
+from the `OF` clause on SQLite, and `gco introspect` writes them back as
+field names.
 
 ## v0.2.0
 
