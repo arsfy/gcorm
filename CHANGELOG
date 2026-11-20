@@ -1,3 +1,53 @@
+## v0.2.2
+
+### Added
+
+- `migrate.DDLGenerator.AddIndexSQL` renders the `CREATE INDEX` statement for
+  an `AddIndex` change.
+
+### Fixed
+
+- `db push` on PostgreSQL no longer drops and recreates partial and expression
+  indexes on every run when the schema text differs from the form PostgreSQL
+  stores. Index comparison now matches the stored form of:
+  - `IN` / `NOT IN` lists (`= ANY (ARRAY[...])`, `<> ALL (...)`), including
+    single-element lists and varchar columns.
+  - `LIKE`, `ILIKE`, their `NOT` forms, `!=`, `BETWEEN`, `NOT BETWEEN`, and
+    `IS NOT DISTINCT FROM`.
+  - Casts PostgreSQL attaches to constants (`'...'::uuid`, `(0)::bigint`,
+    `'-1'::integer`), type aliases (`int`, `int8`, `timestamptz`, `decimal`,
+    ...), multi-word type names (`double precision`,
+    `timestamp with time zone`), and `CAST(x AS t)`.
+  - Parentheses added for operator precedence (`((a || b) || c)`,
+    `((n + 1) > 0)`, `a OR (b AND c)`), keyword and function-name case
+    (`COALESCE`), operator and comma spacing, and quoted function names such
+    as `"left"(name, 3)`.
+- Definitions whose stored form depends on type resolution or session settings,
+  such as timestamp or jsonb literals and implicit numeric promotions, are
+  compared by creating the target index on an empty temporary copy of the
+  table inside a rolled-back savepoint and comparing `pg_get_indexdef`. This
+  runs only for indexes whose text still differs, and is skipped for tables
+  whose columns change in the same push.
+- Index collations reported as `pg_catalog."C"` now match `collate: ["C"]`.
+- `Json` defaults are compared as JSON values, so jsonb reformatting
+  (`{"a":1}` read back as `{"a": 1}`) no longer rewrites the default on every
+  push.
+- Index comparison no longer misses real changes. Before, these were treated
+  as unchanged:
+  - Changing a length-limiting cast in an expression
+    (`name::varchar(10)` to `name::varchar(20)`).
+  - Regrouping arithmetic (`a - (b - c)` to `a - b - c`).
+  - Adding or removing a text cast on a `char(n)` column in a predicate
+    (`code = 'ab'` to `code::text = 'ab'`).
+  - Changing whitespace inside a string literal (`'a  b'` to `'a b'`).
+
+  Column casts are now removed only when the column type proves them
+  redundant, and constant casts only when they cannot truncate or round.
+- `db push` no longer panics on a partial index predicate that ends with an
+  empty string literal, such as `name <> ''`.
+- Unquoted non-ASCII identifiers in index expressions are no longer split
+  mid-character.
+
 ## v0.2.1
 
 ### Added
