@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/arsfy/gcorm/pkg/schema/ir"
 )
@@ -464,7 +465,7 @@ func compareIndexes(cs *Changeset, model string, oldSchema, newSchema *ir.Schema
 				Details: indexDetails(oi),
 			})
 		default:
-			if indexSignature(oldSchema, oi) != indexSignature(newSchema, ni) {
+			if indexSignature(oldSchema, oldM, oi) != indexSignature(newSchema, newM, ni) {
 				cs.add(Change{
 					Type: DropIndex, Model: model, OldValue: oi.Name,
 					Details: indexDetails(oi),
@@ -503,15 +504,18 @@ func encodeIndexExpressions(expressions []string) string {
 	return string(encoded)
 }
 
-func indexSignature(schema *ir.Schema, idx *ir.Index) string {
+// indexSignature identifies an index definition for diffing. model supplies
+// the column types that decide which casts in expressions and predicates are
+// redundant; it may be nil.
+func indexSignature(schema *ir.Schema, model *ir.Model, idx *ir.Index) string {
 	if idx == nil {
 		return ""
 	}
-	enumTypes := postgresEnumTypeNames(schema)
+	normalizer := newIndexNormalizer(schema, model)
 	cols := effectiveIndexColumns(idx)
 	predicate := strings.TrimSpace(idx.Where)
 	if schema == nil || schema.Datasource == nil || schema.Datasource.Provider != "sqlite" {
-		predicate = normalizeIndexPredicate(predicate)
+		predicate = normalizer.predicate(predicate)
 	}
 	return strings.Join([]string{
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string {
@@ -521,7 +525,7 @@ func indexSignature(schema *ir.Schema, idx *ir.Index) string {
 			return c.Field
 		}), ","),
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string {
-			return normalizeIndexExpressionWithEnums(c.Expression, enumTypes)
+			return normalizer.expression(c.Expression)
 		}), ","),
 		boolStr(idx.IsUnique),
 		predicate,
@@ -530,42 +534,6 @@ func indexSignature(schema *ir.Schema, idx *ir.Index) string {
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexOpClass(c.OpClass) }), ","),
 		strings.Join(indexColumnValues(cols, func(c ir.IndexColumn) string { return normalizeIndexCollation(c.Collation) }), ","),
 	}, "\x00")
-}
-
-func normalizeIndexExpression(expression string) string {
-	return normalizeIndexExpressionWithEnums(expression, nil)
-}
-
-func normalizeIndexExpressionWithEnums(expression string, enumTypes map[string]struct{}) string {
-	expression = strings.TrimSpace(expression)
-	for hasWrappingParens(expression) {
-		expression = strings.TrimSpace(expression[1 : len(expression)-1])
-	}
-	expression = uppercaseSQLKeywords(expression)
-	expression = rewritePostgresOperators(expression)
-	expression = canonicalizePostgresCastTypes(expression)
-	expression = stripPostgresImplicitCaseElseNull(expression)
-	expression = stripPostgresTextCasts(expression)
-	expression = stripPostgresEnumLiteralCasts(expression, enumTypes)
-	expression = stripPostgresLiteralCasts(expression, false)
-	expression = rewritePostgresArrayMembership(expression)
-	for {
-		next := stripPostgresCaseWhenParens(expression)
-		if next == expression {
-			break
-		}
-		expression = next
-	}
-	for {
-		next := stripRedundantIdentifierParens(expression)
-		if next == expression {
-			break
-		}
-		expression = next
-	}
-	expression = stripLeftAssociativeParens(expression)
-	expression = normalizeSQLCommas(expression)
-	return strings.Join(strings.Fields(expression), " ")
 }
 
 func postgresEnumTypeNames(schema *ir.Schema) map[string]struct{} {
@@ -586,33 +554,6 @@ func postgresEnumTypeNames(schema *ir.Schema) map[string]struct{} {
 		}
 	}
 	return types
-}
-
-func stripPostgresEnumLiteralCasts(expression string, enumTypes map[string]struct{}) string {
-	if len(enumTypes) == 0 {
-		return expression
-	}
-	var b strings.Builder
-	for i := 0; i < len(expression); {
-		if expression[i] != '\'' {
-			b.WriteByte(expression[i])
-			i++
-			continue
-		}
-		end := postgresStringLiteralEnd(expression, i)
-		b.WriteString(expression[i:end])
-		i = end
-		if !strings.HasPrefix(expression[i:], "::") {
-			continue
-		}
-		castStart := i + 2
-		castEnd := postgresCastTypeEnd(expression, castStart)
-		if castEnd == castStart || !isPostgresEnumCast(expression[castStart:castEnd], enumTypes) {
-			continue
-		}
-		i = castEnd
-	}
-	return b.String()
 }
 
 func isPostgresEnumCast(castType string, enumTypes map[string]struct{}) bool {
@@ -741,32 +682,6 @@ func isSQLIdentifierByte(ch byte) bool {
 	return ch == '_' || ch == '$' || ch >= '0' && ch <= '9' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z'
 }
 
-func stripPostgresTextCasts(expression string) string {
-	var b strings.Builder
-	for i := 0; i < len(expression); {
-		if expression[i] == '\'' {
-			end := postgresStringLiteralEnd(expression, i)
-			b.WriteString(expression[i:end])
-			i = end
-			continue
-		}
-		if !strings.HasPrefix(expression[i:], "::") {
-			b.WriteByte(expression[i])
-			i++
-			continue
-		}
-		castStart := i + 2
-		castEnd := postgresCastTypeEnd(expression, castStart)
-		if castEnd > castStart && isPostgresTextLikeCast(expression[castStart:castEnd]) {
-			i = castEnd
-			continue
-		}
-		b.WriteString("::")
-		i += 2
-	}
-	return b.String()
-}
-
 func postgresStringLiteralEnd(s string, start int) int {
 	for i := start + 1; i < len(s); i++ {
 		if s[i] != '\'' {
@@ -797,8 +712,9 @@ func stripRedundantIdentifierParens(expression string) string {
 			i = end - 1
 			continue
 		}
-		// Keep function-call parentheses: lower(email) is not lower email.
-		if expression[i] != '(' || (i > 0 && isSQLIdentifierByte(expression[i-1])) {
+		// Keep function-call parentheses (lower(email), "left"(name, 3)) and
+		// lists (IN (a), ANY (tags)).
+		if expression[i] != '(' || (i > 0 && (isSQLIdentifierByte(expression[i-1]) || expression[i-1] == '"')) || precededByListKeyword(expression, i) {
 			b.WriteByte(expression[i])
 			continue
 		}
@@ -808,7 +724,7 @@ func stripRedundantIdentifierParens(expression string) string {
 			continue
 		}
 		inner := strings.TrimSpace(expression[i+1 : end])
-		if !isSimplePostgresIdentifier(inner) {
+		if !isSimplePostgresIdentifier(inner) && !isNumericLiteral(inner) {
 			b.WriteByte(expression[i])
 			continue
 		}
@@ -855,72 +771,6 @@ func isSimplePostgresIdentifier(value string) bool {
 		i++
 	}
 	return true
-}
-
-func normalizeIndexPredicate(where string) string {
-	where = strings.TrimSpace(where)
-	for hasWrappingParens(where) {
-		where = strings.TrimSpace(where[1 : len(where)-1])
-	}
-	where = uppercaseSQLKeywords(where)
-	where = rewritePostgresOperators(where)
-	where = rewritePostgresBetween(where)
-	where = canonicalizePostgresCastTypes(where)
-	where = stripPostgresTextLiteralCasts(where)
-	where = stripPostgresTextCasts(where)
-	where = stripPostgresLiteralCasts(where, true)
-	where = rewritePostgresArrayMembership(where)
-	for {
-		next := stripRedundantIdentifierParens(stripSimplePredicateParens(where))
-		if next == where {
-			break
-		}
-		where = next
-	}
-	where = stripLeftAssociativeParens(where)
-	where = normalizeSQLCommas(where)
-	return strings.Join(strings.Fields(where), " ")
-}
-
-func stripPostgresTextLiteralCasts(s string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); {
-		if s[i] != '\'' {
-			b.WriteByte(s[i])
-			i++
-			continue
-		}
-
-		for {
-			b.WriteByte(s[i])
-			i++
-			if i >= len(s) {
-				return b.String()
-			}
-			if s[i-1] != '\'' {
-				continue
-			}
-			if i < len(s) && s[i] == '\'' {
-				b.WriteByte(s[i])
-				i++
-				continue
-			}
-			break
-		}
-
-		if !strings.HasPrefix(s[i:], "::") {
-			continue
-		}
-		castStart := i + 2
-		castEnd := postgresCastTypeEnd(s, castStart)
-		if castEnd == castStart {
-			continue
-		}
-		if isPostgresTextLikeCast(s[castStart:castEnd]) {
-			i = castEnd
-		}
-	}
-	return b.String()
 }
 
 func postgresCastTypeEnd(s string, start int) int {
@@ -991,13 +841,15 @@ func postgresIdentifierEnd(s string, start int) int {
 		}
 		return start
 	}
+	// Unquoted identifiers may contain non-ASCII letters; decode whole runes
+	// so a multi-byte character is never split.
 	i := start
 	for i < len(s) {
-		r := rune(s[i])
-		if !(r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)) {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if !(r == '_' || r == '$' && i > start || unicode.IsLetter(r) || unicode.IsDigit(r)) {
 			break
 		}
-		i++
+		i += size
 	}
 	return i
 }
@@ -1155,22 +1007,9 @@ func hasWrappingParens(s string) bool {
 	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
 		return false
 	}
-	depth := 0
-	for i, r := range s {
-		switch r {
-		case '(':
-			depth++
-		case ')':
-			depth--
-			if depth == 0 && i != len(s)-1 {
-				return false
-			}
-		}
-		if depth < 0 {
-			return false
-		}
-	}
-	return depth == 0
+	// matchingParenIndex skips string literals, so ('(') AND (')') is not
+	// mistaken for one group.
+	return matchingParenIndex(s, 0) == len(s)-1
 }
 
 func normalizeIndexSort(sort string) string {

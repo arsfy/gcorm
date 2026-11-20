@@ -2,6 +2,14 @@ package migrate
 
 import "testing"
 
+// varcharColumns is the context of a table whose status, email, and code
+// columns are varchar, which PostgreSQL coerces to text in comparisons.
+var varcharColumns = indexNormalizer{columnTypes: map[string]string{
+	"status": "character varying(20)",
+	"email":  "character varying(255)",
+	"code":   "character varying(4)",
+}}
+
 func TestNormalizeIndexPredicateMatchesPostgresDeparse(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -41,7 +49,7 @@ func TestNormalizeIndexPredicateMatchesPostgresDeparse(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, want := normalizeIndexPredicate(tt.database), normalizeIndexPredicate(tt.schema)
+			got, want := varcharColumns.predicate(tt.database), varcharColumns.predicate(tt.schema)
 			if got != want {
 				t.Fatalf("predicate mismatch:\n database: %q\n schema:   %q", got, want)
 			}
@@ -65,8 +73,8 @@ func TestNormalizeIndexExpressionStripsNumericLiteralCasts(t *testing.T) {
 	}
 }
 
-func TestStripPostgresLiteralCastsLeavesIdentifiersAlone(t *testing.T) {
-	got := stripPostgresLiteralCasts(`col1::bigint + t2.x + (-1)::integer + 2.5::numeric + 'a'::uuid`, true)
+func TestStripCastsLeavesUnknownColumnsAlone(t *testing.T) {
+	got := indexNormalizer{}.stripCasts(`col1::bigint + t2.x + (-1)::integer + 2.5::numeric + 'a'::uuid`, true)
 	want := `col1::bigint + t2.x + -1 + 2.5 + 'a'`
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
@@ -101,7 +109,7 @@ func TestNormalizeIndexPredicateMatchesPostgresOperatorDeparse(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.schema, func(t *testing.T) {
-			if got, want := normalizeIndexPredicate(tt.database), normalizeIndexPredicate(tt.schema); got != want {
+			if got, want := varcharColumns.predicate(tt.database), varcharColumns.predicate(tt.schema); got != want {
 				t.Fatalf("predicate mismatch:\n database: %q\n schema:   %q", got, want)
 			}
 		})
@@ -117,7 +125,7 @@ func TestNormalizeIndexExpressionMatchesPostgresDeparse(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.schema, func(t *testing.T) {
-			if got, want := normalizeIndexExpression(tt.database), normalizeIndexExpression(tt.schema); got != want {
+			if got, want := varcharColumns.expression(tt.database), varcharColumns.expression(tt.schema); got != want {
 				t.Fatalf("expression mismatch:\n database: %q\n schema:   %q", got, want)
 			}
 		})

@@ -378,7 +378,7 @@ func TestNormalizeIndexExpressionPreservesNonEnumCastAndCaseElse(t *testing.T) {
 }
 
 func TestNormalizeIndexExpressionPreservesQuotedParentheses(t *testing.T) {
-	got := normalizeIndexExpression(`coalesce((email)::text, '(')`)
+	got := indexNormalizer{columnTypes: map[string]string{"email": "character varying(255)"}}.expression(`coalesce((email)::text, '(')`)
 	want := `COALESCE(email, '(')`
 	if got != want {
 		t.Fatalf("normalized expression = %q, want %q", got, want)
