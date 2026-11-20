@@ -368,10 +368,10 @@ func TestDiffExpressionIndexNormalizesPostgresCaseAndEnumCast(t *testing.T) {
 func TestNormalizeIndexExpressionPreservesNonEnumCastAndCaseElse(t *testing.T) {
 	enumTypes := map[string]struct{}{"AlertStatus": {}}
 	got := normalizeIndexExpressionWithEnums(
-		`CASE WHEN (status = '1'::integer) THEN value ELSE 0 END`,
+		`CASE WHEN (since > '1 day'::interval) THEN value ELSE 0 END`,
 		enumTypes,
 	)
-	want := `CASE WHEN status = '1'::integer THEN value ELSE 0 END`
+	want := `CASE WHEN since > '1 day'::interval THEN value ELSE 0 END`
 	if got != want {
 		t.Fatalf("normalized expression = %q, want %q", got, want)
 	}
@@ -379,7 +379,7 @@ func TestNormalizeIndexExpressionPreservesNonEnumCastAndCaseElse(t *testing.T) {
 
 func TestNormalizeIndexExpressionPreservesQuotedParentheses(t *testing.T) {
 	got := normalizeIndexExpression(`coalesce((email)::text, '(')`)
-	want := `coalesce(email, '(')`
+	want := `COALESCE(email, '(')`
 	if got != want {
 		t.Fatalf("normalized expression = %q, want %q", got, want)
 	}

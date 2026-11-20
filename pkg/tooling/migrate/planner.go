@@ -542,6 +542,8 @@ func normalizeIndexExpressionWithEnums(expression string, enumTypes map[string]s
 		expression = strings.TrimSpace(expression[1 : len(expression)-1])
 	}
 	expression = uppercaseSQLKeywords(expression)
+	expression = rewritePostgresOperators(expression)
+	expression = canonicalizePostgresCastTypes(expression)
 	expression = stripPostgresImplicitCaseElseNull(expression)
 	expression = stripPostgresTextCasts(expression)
 	expression = stripPostgresEnumLiteralCasts(expression, enumTypes)
@@ -561,6 +563,7 @@ func normalizeIndexExpressionWithEnums(expression string, enumTypes map[string]s
 		}
 		expression = next
 	}
+	expression = stripLeftAssociativeParens(expression)
 	expression = normalizeSQLCommas(expression)
 	return strings.Join(strings.Fields(expression), " ")
 }
@@ -794,7 +797,8 @@ func stripRedundantIdentifierParens(expression string) string {
 			i = end - 1
 			continue
 		}
-		if expression[i] != '(' {
+		// Keep function-call parentheses: lower(email) is not lower email.
+		if expression[i] != '(' || (i > 0 && isSQLIdentifierByte(expression[i-1])) {
 			b.WriteByte(expression[i])
 			continue
 		}
@@ -859,17 +863,21 @@ func normalizeIndexPredicate(where string) string {
 		where = strings.TrimSpace(where[1 : len(where)-1])
 	}
 	where = uppercaseSQLKeywords(where)
+	where = rewritePostgresOperators(where)
+	where = rewritePostgresBetween(where)
+	where = canonicalizePostgresCastTypes(where)
 	where = stripPostgresTextLiteralCasts(where)
 	where = stripPostgresTextCasts(where)
 	where = stripPostgresLiteralCasts(where, true)
 	where = rewritePostgresArrayMembership(where)
 	for {
-		next := stripSimplePredicateParens(where)
+		next := stripRedundantIdentifierParens(stripSimplePredicateParens(where))
 		if next == where {
 			break
 		}
 		where = next
 	}
+	where = stripLeftAssociativeParens(where)
 	where = normalizeSQLCommas(where)
 	return strings.Join(strings.Fields(where), " ")
 }
@@ -930,23 +938,37 @@ func postgresCastTypeEnd(s string, start int) int {
 	}
 
 	i := start
+	lastWord := start
 	for {
 		next := postgresIdentifierEnd(s, i)
 		if next == i {
 			break
 		}
+		lastWord = i
 		i = next
 		if i >= len(s) || s[i] != '.' {
 			break
 		}
 		i++
 	}
+	base := strings.ToLower(s[lastWord:i])
+	if base == "double" && hasCaseInsensitivePrefix(s[i:], " precision") && isCastBoundary(s, i+len(" precision")) {
+		i += len(" precision")
+	}
 	if i < len(s) && s[i] == '(' {
 		if end := matchingParenIndex(s, i); end != -1 {
 			i = end + 1
 		}
 	}
-	if strings.HasPrefix(s[i:], "[]") {
+	if base == "timestamp" || base == "time" {
+		for _, zone := range []string{" with time zone", " without time zone"} {
+			if hasCaseInsensitivePrefix(s[i:], zone) && isCastBoundary(s, i+len(zone)) {
+				i += len(zone)
+				break
+			}
+		}
+	}
+	for strings.HasPrefix(s[i:], "[]") {
 		i += 2
 	}
 	return i
@@ -1019,12 +1041,22 @@ func stripSimplePredicateParens(s string) string {
 	var b strings.Builder
 	changed := false
 	for i := 0; i < len(s); i++ {
+		if s[i] == '\'' || s[i] == '"' {
+			end := postgresStringLiteralEnd(s, i)
+			if s[i] == '"' {
+				end = postgresQuotedIdentifierEnd(s, i)
+			}
+			b.WriteString(s[i:end])
+			i = end - 1
+			continue
+		}
 		if s[i] != '(' || (i > 0 && !isPredicateBoundaryByte(s[i-1])) {
 			b.WriteByte(s[i])
 			continue
 		}
 		end := matchingParenIndex(s, i)
-		if end == -1 || (end+1 < len(s) && !isPredicateBoundaryByte(s[end+1])) {
+		if end == -1 || (end+1 < len(s) && !isPredicateBoundaryByte(s[end+1])) ||
+			!startsBooleanOperand(s, i) || !endsBooleanOperand(s, end+1) {
 			b.WriteByte(s[i])
 			continue
 		}
@@ -1042,6 +1074,43 @@ func stripSimplePredicateParens(s string) string {
 		return s
 	}
 	return b.String()
+}
+
+// startsBooleanOperand reports whether a group at i begins a whole boolean
+// operand, so removing its parentheses cannot regroup an arithmetic or
+// comparison expression such as a - (b - c).
+func startsBooleanOperand(s string, i int) bool {
+	j := i - 1
+	for j >= 0 && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') {
+		j--
+	}
+	if j < 0 || s[j] == '(' {
+		return true
+	}
+	end := j + 1
+	for j >= 0 && isSQLIdentifierByte(s[j]) {
+		j--
+	}
+	switch strings.ToUpper(s[j+1 : end]) {
+	case "AND", "OR", "NOT", "WHEN", "THEN", "ELSE":
+		return true
+	}
+	return false
+}
+
+// endsBooleanOperand is the counterpart of startsBooleanOperand for the text
+// following a group.
+func endsBooleanOperand(s string, i int) bool {
+	i = skipSQLSpace(s, i)
+	if i >= len(s) || s[i] == ')' {
+		return true
+	}
+	for _, kw := range []string{"AND", "OR", "THEN", "ELSE", "END"} {
+		if sqlKeywordAt(s, i, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 func matchingParenIndex(s string, start int) int {

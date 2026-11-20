@@ -3,6 +3,8 @@ package dbpush
 import (
 	"strings"
 	"testing"
+
+	"github.com/arsfy/gcorm/pkg/tooling/migrate"
 )
 
 // Each index below is stored by PostgreSQL in a form that differs textually
@@ -83,12 +85,35 @@ func TestPostgresPushStillRebuildsChangedIndexes(t *testing.T) {
 // probe must not hide their rebuild.
 func TestPostgresPushSkipsIndexProbeForAlteredTables(t *testing.T) {
 	p := openPostgresPushDB(t)
-	schema := "model Item {\n  id Int @id\n  qty Int\n  @@index([qty], name: \"idx_qty\", where: \"qty > -1\")\n}\n"
+	// The literal is stored as '2020-01-01 00:00:00'::timestamp..., which only
+	// the probe can match, so the type change exercises the skip.
+	schema := "model Item {\n  id Int @id\n  at DateTime @db.Timestamp(6)\n  @@index([at], name: \"idx_at\", where: \"at > '2020-01-01'\")\n}\n"
 	p.push(schema, false)
-	altered := strings.Replace(schema, "qty Int", "qty BigInt", 1)
+	p.requireNoop(schema)
+	altered := strings.Replace(schema, "@db.Timestamp(6)", "@db.Timestamptz(6)", 1)
 	result := p.push(altered, true)
 	if !strings.Contains(strings.Join(result.AppliedStatements, "\n"), `DROP INDEX`) {
-		t.Fatalf("expected idx_qty to be rebuilt with the type change:\n%s", strings.Join(result.AppliedStatements, "\n"))
+		t.Fatalf("expected idx_at to be rebuilt with the type change:\n%s", strings.Join(result.AppliedStatements, "\n"))
 	}
 	p.requireNoop(altered)
+}
+
+// Text normalization should settle every index without the database probe,
+// except predicates whose stored form depends on session settings.
+func TestPostgresIndexNormalizationLeavesOnlySessionDependentIndexesToProbe(t *testing.T) {
+	p := openPostgresPushDB(t)
+	p.push(postgresDeparsedIndexSchema, false)
+	cs := migrate.Diff(p.introspect(postgresDeparsedIndexSchema), compileTestContent(t, p.content(postgresDeparsedIndexSchema)))
+	var probed []string
+	for _, r := range postgresIndexRebuildCandidates(cs, nil) {
+		probed = append(probed, cs.Changes[r.drop].OldValue)
+	}
+	if got := strings.Join(probed, ","); got != "idx_ts" {
+		t.Fatalf("indexes left to the probe = %q, want only idx_ts (TimeZone-dependent literal)", got)
+	}
+	for _, c := range cs.Changes {
+		if c.Type != migrate.DropIndex && c.Type != migrate.AddIndex {
+			t.Fatalf("unexpected change %s %s", c.Type, c.Field)
+		}
+	}
 }
